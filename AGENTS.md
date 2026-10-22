@@ -15,6 +15,7 @@ Personal work-knowledge MCP server. `Motive_work` is a working title (folder nam
 - **Model download** happens only in one explicit module/command (with SHA256 manifest) or from an offline bundle; the server itself has no other network egress.
 - **Company data never enters git**, test fixtures, docs, logs or issue text. Development and tests use synthetic or public documents. Real company material exists only on the company PC.
 - **No admin rights assumed** on the company PC; user-level Python venv or a portable bundle. Company security software, proxies and blocked downloads are expected.
+- **Clients (confirmed 2026-10-23):** 피터 uses both Claude Code and Codex on the company PC with the same stdio MCP server; snippets a client requests go to that client's provider (Anthropic or OpenAI), accepted by 피터.
 - **Company AI policy** compliance (installing the tool, sending snippets to Claude/Codex) is the user's responsibility; the tool must make what leaves the PC visible (tool responses list exact sources).
 - **Read-only to sources.** The server never modifies, moves or deletes the user's original files.
 - **Evidence binding.** Every returned fact or snippet carries an exact source locator (file, version hash, page/sheet/line or character range). Structured knowledge written through MCP must cite a source locator or be explicitly marked as the user's own note.
