@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workmcp"
+version = "0.0.1"
+description = "Personal local work-knowledge MCP server (stdio, local-only storage)."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mcp==2.2.0",
+]
+
+[project.scripts]
+workmcp = "workmcp.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
