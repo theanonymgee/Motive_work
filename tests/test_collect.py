@@ -549,6 +549,7 @@ def test_failed_file_is_retried_only_when_asked(db, tmp_path, calls):
     ('parse_time', None, True, False),        # the machine was busy: --retry-failed parses it again
     ('parse_time', 'docx-2', False, True),    # and so does --reparse after a parser version change
     ('xml_tree', 'docx-2', False, True),      # a code of the old tree parsers: the stream parsers read the part
+    ('xml_text', 'docx-3', False, True),      # no longer raised: one text node is unit_chars now
 ])
 def test_retryable_too_large_versions_are_parsed_again_in_place(db, tmp_path, code, parser_version, retry_failed,
                                                                  reparse):
@@ -561,8 +562,8 @@ def test_retryable_too_large_versions_are_parsed_again_in_place(db, tmp_path, co
     db.execute("UPDATE versions SET parse_status='too_large', parse_error=?, unit_count=0, text_chars=0, "
                "parser_version=COALESCE(?, parser_version) WHERE document_id=?", (code, parser_version, doc))
     assert scan(db, root)['total']['reparsed'] == 0  # without the flag nothing changes
-    other = scan(db, root, retry_failed=not retry_failed, reparse=not reparse) if code == 'xml_tree' else None
-    assert other is None or other['total']['reparsed'] == 0  # xml_tree is not a --retry-failed case
+    other = scan(db, root, retry_failed=not retry_failed, reparse=not reparse) if code != 'parse_time' else None
+    assert other is None or other['total']['reparsed'] == 0  # xml_tree and xml_text are not --retry-failed cases
     result = scan(db, root, retry_failed=retry_failed, reparse=reparse)
     assert changes(result) == {'reparsed': 1} and result['total']['parsed_ok'] == 1
     [version] = versions(db, doc)

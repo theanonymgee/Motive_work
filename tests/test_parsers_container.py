@@ -125,10 +125,10 @@ def test_stored_members_are_read_too():
 
 
 # XML
-def events(part, limits=None, clock=None) -> list[tuple]:
+def events(part, limits=None, budget=None) -> list[tuple]:
     """``(kind, tag, value)`` of every event of a part, a text run joined (it may come in several events)."""
     found = []
-    for kind, tag, value in _container.XmlStream(part, limits or Limits(), clock):
+    for kind, tag, value in _container.XmlStream(part, limits or Limits(), budget):
         if kind == _container.TEXT and found and found[-1][0] == _container.TEXT:
             found[-1] = (kind, None, found[-1][2] + value)
         else:
@@ -291,8 +291,9 @@ def test_attribute_bomb_is_refused_in_bounded_memory():
 
 def test_markup_limit_bounds_what_expat_holds_for_one_tag_comment_or_instruction():
     """A start tag, comment or processing instruction is buffered whole by expat until it ends; one that
-    is still open after more than ``xml_max_markup_bytes`` is refused (checked between 64 KiB pieces)."""
-    size = 300_000
+    keeps expat from giving any event for more than ``xml_max_markup_bytes`` of fed 64 KiB pieces in a row
+    is refused (400,000 bytes after the root's start tag: five quiet pieces, 327,680 bytes)."""
+    size = 400_000
     limits = Limits(xml_max_markup_bytes=200_000)
     for part in (b'<r><!--' + b'x' * size + b'--></r>', b'<r><?pi ' + b'x' * size + b'?></r>',
                  b'<r a="' + b'x' * size + b'"/>'):
@@ -322,10 +323,10 @@ def test_name_bomb_is_refused_in_bounded_memory():
 
 
 def test_text_node_limit_spans_pieces():
-    limits = Limits(xml_max_text_chars=100_000)
+    limits = Limits(max_unit_chars=100_000)
     assert events(b'<r>' + b'x' * 100_000 + b'<a/>' + b'y' * 100_000 + b'</r>', limits)  # two runs
-    assert failure(lambda: events(b'<r>' + b'x' * 100_001 + b'</r>', limits)) == ('too_large', 'xml_text')
-    assert failure(lambda: events(b'<r><![CDATA[' + b'x' * 100_001 + b']]></r>', limits)) == ('too_large', 'xml_text')
+    assert failure(lambda: events(b'<r>' + b'x' * 100_001 + b'</r>', limits)) == ('too_large', 'unit_chars')
+    assert failure(lambda: events(b'<r><![CDATA[' + b'x' * 100_001 + b']]></r>', limits)) == ('too_large', 'unit_chars')
 
 
 def test_stream_memory_does_not_grow_with_the_part():
@@ -337,43 +338,177 @@ def test_stream_memory_does_not_grow_with_the_part():
     assert result == 2 + 2 * 2**19 and peak < 2 * 2**20
 
 
-class Countdown:
-    """A clock that runs out after ``checks`` calls of ``check``."""
+class Countdown(_container.Budget):
+    """A budget whose clock runs out after ``checks`` reads."""
+    __slots__ = ('left',)
 
-    def __init__(self, checks: int):
+    def __init__(self, checks: int, limits: Limits = Limits()):
+        super().__init__(limits)
         self.left = checks
 
-    def check(self):
+    def clock(self):
         self.left -= 1
         if self.left < 0:
             raise ParseFailure('too_large', 'parse_time')
 
 
 def test_time_limit_is_checked_after_every_piece():
-    part = b'<r>' + b'<a/>' * 100_000 + b'</r>'  # 400 KiB: 7 pieces and the final call
-    assert events(part, clock=Countdown(8))
-    assert failure(lambda: events(part, clock=Countdown(7))) == ('too_large', 'parse_time')
+    part = b'<r>' + b'x' * (6 * _container._FEED_BYTES) + b'</r>'  # 7 pieces and the final call, 4 events
+    assert events(part, budget=Countdown(8))
+    assert failure(lambda: events(part, budget=Countdown(7))) == ('too_large', 'parse_time')
     assert failure(lambda: events(part, Limits(parse_seconds=-1))) == ('too_large', 'parse_time')
 
 
-def test_clock_runs_out_after_parse_seconds(monkeypatch):
-    now = [100.0]
-    monkeypatch.setattr(_container, 'time', types.SimpleNamespace(monotonic=lambda: now[0]))
-    clock = _container.Clock(Limits(parse_seconds=60))
+def test_budget_meters_and_codes(monkeypatch):
+    """R1: each meter stops past its limit with its own code; the clock is read every 4,096 events."""
+    budget = _container.Budget(Limits(max_text_chars=10, max_units=2, max_events=10_000, max_held_bytes=1_000))
+    budget.text(6)
+    budget.text(4)
+    assert failure(lambda: budget.text(1)) == ('too_large', 'limit_chars')
+    budget.unit()
+    budget.unit()
+    assert failure(budget.unit) == ('too_large', 'limit_units')
+    budget.hold(2, 100)  # 2 x 256 + 100 x 4 = 912 bytes of 1,000
+    assert failure(lambda: budget.hold(0, 23)) == ('too_large', 'limit_memory')
+    budget.release(2, 123)
+    budget.hold(3, 0)  # what was given back can be held again
+    budget.event(10_000)
+    assert failure(budget.event) == ('too_large', 'limit_events')
+    now, reads = [100.0], [0]
+
+    def monotonic():
+        reads[0] += 1
+        return now[0]
+    monkeypatch.setattr(_container, 'time', types.SimpleNamespace(monotonic=monotonic))
+    budget = _container.Budget(Limits(parse_seconds=60))
+    reads[0] = 0
+    budget.event(4_095)
+    assert reads[0] == 0
+    budget.event()
+    assert reads[0] == 1
+    budget.event(10_000)  # one charge reads the clock once however many events it brings
+    assert reads[0] == 2
     now[0] = 160.0
-    clock.check()
+    budget.clock()
     now[0] = 160.5
-    assert failure(clock.check) == ('too_large', 'parse_time')
+    assert failure(budget.clock) == ('too_large', 'parse_time')
+    assert failure(lambda: budget.event(4_096)) == ('too_large', 'parse_time')
 
 
-def test_text_budget_stops_at_max_text_chars():
-    budget = _container.TextBudget(Limits(max_text_chars=10))
-    budget.take(6)
-    budget.take(4)
-    assert failure(lambda: budget.take(1)) == ('too_large', 'limit_chars')
+def test_limit_events_is_deterministic_across_clock(monkeypatch):
+    """R21: ``limit_events`` depends on the part only, not on how fast the clock runs."""
+    part = b'<r>' + b'<a/>' * 30_000 + b'</r>'  # 60,002 events
+    limits = Limits(max_events=50_000, parse_seconds=1_000)
+    for step in (0.0, 0.001, 1.0):
+        now = [0.0]
+
+        def monotonic(step=step):
+            now[0] += step
+            return now[0]
+        monkeypatch.setattr(_container, 'time', types.SimpleNamespace(monotonic=monotonic))
+        assert failure(lambda: events(part, limits)) == ('too_large', 'limit_events')
+    assert len(events(part, Limits(max_events=60_002))) == 60_002
+
+
+class NoDeferralSwitch:
+    """An expat parser without ``SetReparseDeferralEnabled`` (Python before 3.12.3)."""
+
+    def __init__(self, parser):
+        object.__setattr__(self, '_parser', parser)
+
+    def __getattr__(self, name):
+        if name == 'SetReparseDeferralEnabled':
+            raise AttributeError(name)
+        return getattr(self._parser, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._parser, name, value)
+
+
+@pytest.mark.parametrize('deferral', ['off', 'on'])
+def test_markup_limit_is_position_independent(monkeypatch, deferral):
+    """R4 (review v3 M1-7): the limit no longer depends on where the markup is. ``fed - CurrentByteIndex``
+    counted the whole part once a piece gave no event (``CurrentByteIndex`` is -1 then), so a 128 KiB
+    attribute 1 MiB into a part was refused. A tag, comment or instruction of 1 MiB - 100 B passes at any
+    position and alignment; one of 1.125 MiB + 100 B is refused in bounded memory. With expat's reparse
+    deferral on (no switch to turn it off) the same two sizes give the same results."""
+    if deferral == 'on':
+        create = _container.expat.ParserCreate
+        monkeypatch.setattr(_container, 'expat', types.SimpleNamespace(
+            ParserCreate=lambda **kwargs: NoDeferralSwitch(create(**kwargs)), ExpatError=_container.expat.ExpatError))
+    piece = _container._FEED_BYTES
+    small, large = 2**20 - 100, 2**20 + 2**17 + 100
+
+    def part(where: int, offset: int, kind: str, size: int) -> bytes:
+        head = b'<r>' + b'x' * (where * piece + offset - 3)  # the token starts at offset in a piece
+        if kind == 'tag':
+            token = b'<a v="' + b'x' * (size - 10) + b'"/>'
+        elif kind == 'comment':
+            token = b'<!--' + b'x' * (size - 7) + b'-->'
+        else:
+            token = b'<?pi ' + b'x' * (size - 7) + b'?>'
+        return head + token + b'<p>after</p></r>'
+    for where in (16, 48):  # about 1 MiB and 3 MiB into the part
+        for offset in (0, 1, piece - 1):
+            for kind in ('tag', 'comment', 'pi'):
+                assert events(part(where, offset, kind, small))[-3] == ('text', None, 'after')
+                data = part(where, offset, kind, large)
+                result, peak = traced(lambda: sum(1 for _ in _container.XmlStream(data, Limits())))
+                assert result == ('too_large', 'xml_markup') and peak < 4 * 2**20, (where, offset, kind)
+
+
+def test_white_space_declaration_and_comments_around_the_root_are_not_markup():
+    """R-M7-5: expat reports white space before and after the root (default handler), the XML declaration,
+    comments and instructions as it reads them, so none of them is held: 8 MiB of white space passes."""
+    space = b' ' * (8 * 2**20)
+    part = b'<?xml version="1.0"?>' + space + b'<!-- c --><?pi x?>' + space + b'<r>x</r>' + space + b'<!-- c -->' + space
+    assert events(part) == [('start', 'r', {}), ('text', None, 'x'), ('end', 'r', None)]
+
+
+def test_namespace_uris_count_as_names_and_are_released_per_part():
+    """R5 (review v3 L15): expat keeps every namespace URI of a part; ``xmlns:p=uri`` is one name, so 50
+    distinct URIs are over 40 names, and long URIs are held memory. Names are given back when a part
+    ends, so many parts that each stay under the limits pass on one budget."""
+    uris = ' '.join(f'xmlns:p{n}="urn:synthetic:{n}"' for n in range(50)).encode()
+    assert failure(lambda: events(b'<r ' + uris + b'/>', Limits(xml_max_names=40))) == ('too_large', 'xml_names')
+    same = b'<r>' + b'<a xmlns:p="urn:same"/>' * 50 + b'</r>'  # one prefix and URI repeated: one name
+    assert events(same, Limits(xml_max_names=3))
+    other = b'<r>' + b''.join(b'<a xmlns="urn:synthetic:%d"/>' % n for n in range(50)) + b'</r>'
+    assert failure(lambda: events(other, Limits(xml_max_names=40))) == ('too_large', 'xml_names')
+    limits = Limits(xml_max_names=40, max_held_bytes=40 * (256 + 4 * 40))
+    budget = _container.Budget(limits)
+    thirty = b'<r ' + ' '.join(f'xmlns:p{n}="urn:{n}"' for n in range(30)).encode() + b'/>'
+    for _ in range(2):
+        assert events(thirty, limits, budget)
+    assert budget.held_left == limits.max_held_bytes  # all given back
+    long_uris = b'<r ' + b' '.join(b'xmlns:p%d="urn:%s"' % (n, b'u' * 5_000) for n in range(10)) + b'/>'
+    assert failure(lambda: events(long_uris, Limits(max_held_bytes=100_000))) == ('too_large', 'limit_memory')
+    stream = _container.XmlStream(long_uris, Limits(max_held_bytes=100_000))
+    with pytest.raises(ParseFailure):
+        list(stream)
+    assert stream.budget.held_left == 100_000  # given back on failure too
 
 
 # OLE
 @pytest.mark.parametrize('data', [b'', b'PK\x03\x04', parsers.OLE_SIGNATURE, parsers.OLE_SIGNATURE + b'\x00' * 2048])
 def test_ole_streams_of_non_ole_or_damaged_data_is_none(data):
     assert _container.ole_streams(data) is None
+
+
+def test_ole_directory_entries_are_counted_before_olefile_opens_the_file():
+    """Probe N11 (design D2): olefile makes an object of about 1.5 KB per directory entry (50,000 entries:
+    +74 MiB, so a 100 MiB file of entries would pass the memory bound). The entries are counted from the
+    header and FAT first; more than ``zip_max_entries`` is ``too_large/ole_entries``."""
+    import olefile
+    from fixtures import cfb, make_hwp
+    data = cfb.write_cfb({'FileHeader': make_hwp.file_header(make_hwp.FLAG_COMPRESSED),
+                          'BodyText/Section0': make_hwp.deflate(make_hwp.section_stream(['text'])),
+                          **{f'S{n:04d}': b'' for n in range(300)}})
+    with olefile.OleFileIO(io.BytesIO(data)) as ole:
+        assert _container.ole_entries(data, 10**6) == len(ole.direntries)
+    assert _container.ole_entries(data, 100) <= 104  # counting stops past the limit
+    assert parsers.parse(data, '.hwp', Limits()).status == 'ok'
+    for ext in ('.hwp', '.docx'):
+        result = parsers.parse(data, ext, Limits(zip_max_entries=100))
+        assert (result.status, result.error) == ('too_large', 'ole_entries')
+    assert _container.ole_entries(parsers.OLE_SIGNATURE + b'\x00' * 2048, 100) is None  # left to olefile

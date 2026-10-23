@@ -178,12 +178,13 @@ class _Scan:
 
     def needs_retry(self, latest: _Latest, current: str) -> bool:
         status, code = latest.parse_status, latest.parse_error
-        # too_large is final except parse_time (depends on the machine's load) and xml_tree (a code of the
-        # old tree parsers, pptx-2/xlsx-2, whose parts the stream parsers now read).
+        # too_large is final except parse_time (depends on the machine's load) and the codes no parser
+        # raises any more: xml_tree (the old tree parsers, pptx-2/xlsx-2, whose parts the stream parsers now
+        # read) and xml_text (one XML text node; the parsers of the resource design use unit_chars).
         if status in ('locked', 'pending') or (self.retry_failed and (
                 status == 'failed' or (status, code) == ('too_large', 'parse_time'))):
             return True
-        retryable = status != 'too_large' or code in ('parse_time', 'xml_tree')
+        retryable = status != 'too_large' or code in ('parse_time', 'xml_tree', 'xml_text')
         return self.reparse and retryable and latest.parser_version != current
 
     # -- versions and units -----------------------------------------------------------------

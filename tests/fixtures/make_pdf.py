@@ -92,6 +92,88 @@ def korean_pdf(pages: list[list[str]]) -> bytes:
     return assemble(objects)
 
 
+# ---- resource cases (parser resource design §4, §6.3) -------------------------------------------
+
+_HELVETICA = b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>'
+
+
+def _flate(body: bytes) -> bytes:
+    import zlib
+    return _stream(zlib.compress(body, 9), ' /Filter /FlateDecode')
+
+
+def form_chain_pdf(levels: int, fanout: int = 10, leaf_chars: int = 900) -> bytes:
+    """One page that draws form 1 ``fanout`` times; form k draws form k + 1 ``fanout`` times and the last
+    form shows ``leaf_chars`` letters: ``leaf_chars * fanout ** levels`` characters of text (review v3 M1-9)."""
+    first_form = 6
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', _pages_tree(4, 1), _HELVETICA,
+               f'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> '
+               f'/XObject << /X {first_form} 0 R >> >> /Contents 5 0 R >>'.encode('ascii'),
+               _stream(b' '.join([b'q /X Do Q'] * fanout))]
+    for level in range(1, levels + 1):
+        if level < levels:
+            body = b' '.join([b'q /X Do Q'] * fanout)
+            inner = f'/XObject << /X {first_form + level} 0 R >> '
+        else:
+            body = b'BT /F1 12 Tf 72 720 Td (' + b'x' * leaf_chars + b') Tj ET'
+            inner = ''
+        objects.append(_stream(body, f' /Type /XObject /Subtype /Form /BBox [0 0 612 792] '
+                                     f'/Resources << /Font << /F1 3 0 R >> {inner}>>'))
+    return assemble(objects)
+
+
+def kids_pdf(references: int, *, count: int = 5) -> bytes:
+    """A page tree whose ``/Kids`` lists one page ``references`` times and claims ``/Count count``."""
+    kids = ' '.join(['4 0 R'] * references)
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', f'<< /Type /Pages /Kids [{kids}] /Count {count} >>'.encode(),
+               _HELVETICA, _page(2, 3, 5), _stream(b'BT /F1 12 Tf 72 720 Td (repeated page) Tj ET')]
+    return assemble(objects)
+
+
+def pages_cycle_pdf() -> bytes:
+    """Two ``/Pages`` nodes that list each other (pypdf only checks a node listing itself)."""
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', b'<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>',
+               _HELVETICA, _page(2, 3, 5), _stream(b'BT /F1 12 Tf 72 720 Td (page) Tj ET'),
+               b'<< /Type /Pages /Kids [2 0 R] /Count 1 >>']
+    return assemble(objects)
+
+
+def parent_loop_pdf(*, in_form: bool = False) -> bytes:
+    """A page (or a form it draws) without ``/Resources`` whose ``/Parent`` links go round in a cycle:
+    pypdf's lookup of inherited resources never ends there. A second, normal page has text."""
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', b'<< /Type /Pages /Kids [4 0 R 8 0 R] /Count 2 >>', _HELVETICA]
+    if in_form:
+        objects.append(b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
+                       b'/Resources << /Font << /F1 3 0 R >> /XObject << /X 10 0 R >> >> /Contents 5 0 R >>')
+    else:
+        objects.append(b'<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>')
+    objects += [_stream(b'q /X Do Q BT /F1 12 Tf 72 720 Td (lost) Tj ET'), b'<< /Parent 7 0 R >>',
+                b'<< /Parent 6 0 R >>', _page(2, 3, 9), _stream(b'BT /F1 12 Tf 72 720 Td (kept page) Tj ET'),
+                _stream(b'BT /F1 12 Tf (form text) Tj ET', ' /Type /XObject /Subtype /Form /BBox [0 0 612 792] '
+                                                          '/Parent 6 0 R')]
+    return assemble(objects)
+
+
+def big_stream_pdf(pages: int, stream_bytes: int, *, text: str = 'page') -> bytes:
+    """``pages`` pages, each with a Flate content stream of ``stream_bytes`` (mostly a comment) and one line."""
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', _pages_tree(4, pages), _HELVETICA]
+    for number in range(pages):
+        body = f'BT /F1 12 Tf 72 720 Td ({text} {number + 1}) Tj ET\n%'.encode('ascii')
+        body += b'x' * (stream_bytes - len(body))
+        objects.append(_page(2, 3, 5 + 2 * number))
+        objects.append(_flate(body))
+    return assemble(objects)
+
+
+def long_page_pdf(chars: int) -> bytes:
+    """One page showing ``chars`` letters in lines of 1,000 (no form XObject)."""
+    lines, rest = divmod(chars, 1000)
+    body = ' 0 -1 Td '.join(['(' + 'y' * 1000 + ') Tj'] * lines + ([f'({"y" * rest}) Tj'] if rest else []))
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', _pages_tree(4, 1), _HELVETICA, _page(2, 3, 5),
+               _flate(f'BT /F1 1 Tf 72 720 Td {body} ET'.encode('ascii'))]
+    return assemble(objects)
+
+
 def cases() -> dict[str, tuple[bytes, Expected]]:
     """``{rel_path: (bytes, Expected)}``: the PDF documents of the synthetic bundle."""
     text_pages = [list(LINES_EN[:3]), [], list(LINES_EN[3:])]

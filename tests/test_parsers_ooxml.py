@@ -126,7 +126,7 @@ def test_docx_structure_limits_reach_the_dispatcher():
     assert outcome(deep, '.docx') == ('too_large', 'xml_depth', 0)
     assert outcome(attributes, '.docx') == ('too_large', 'xml_attributes', 0)
     assert outcome(names, '.docx') == ('too_large', 'xml_names', 0)
-    assert outcome(text, '.docx') == ('too_large', 'xml_text', 0)
+    assert outcome(text, '.docx') == ('too_large', 'unit_chars', 0)
     assert time.perf_counter() - started < 5
     assert traced_peak(deep, '.docx', Limits())[3] <= 2**20
     assert traced_peak(names, '.docx', Limits())[3] <= 6 * 2**20  # expat and the name table hold 10,000 names
@@ -134,8 +134,8 @@ def test_docx_structure_limits_reach_the_dispatcher():
 
 def test_docx_paragraph_text_and_file_text_are_limited_while_reading():
     two_runs = make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run('x' * 600), make_ooxml.w_run('y' * 600)))
-    assert outcome(two_runs, '.docx', Limits(xml_max_text_chars=1200)) == ('ok', None, 1)
-    assert outcome(two_runs, '.docx', Limits(xml_max_text_chars=1199)) == ('too_large', 'xml_text', 0)
+    assert outcome(two_runs, '.docx', Limits(max_unit_chars=1200)) == ('ok', None, 1)
+    assert outcome(two_runs, '.docx', Limits(max_unit_chars=1199)) == ('too_large', 'unit_chars', 0)
     many = make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run('x' * 600)) * 10)
     assert outcome(many, '.docx', Limits(max_text_chars=6000)) == ('ok', None, 10)
     assert outcome(many, '.docx', Limits(max_text_chars=5999)) == ('too_large', 'limit_chars', 0)
@@ -335,19 +335,20 @@ def xlsx_with(sheet_rows: str, shared: str | None = None) -> bytes:
 
 def test_xlsx_shared_strings_count_and_text_limits():
     """Review M1 B12/B13: shared strings are kept for the whole parse. More of them than ``max_units`` is
-    ``limit_units`` (Excel writes only strings its cells use), one longer than ``xml_max_text_chars`` is
-    ``xml_text``, and their characters count towards ``max_text_chars``."""
+    ``limit_units`` (Excel writes only strings its cells use) and one longer than ``max_unit_chars`` is
+    ``unit_chars``. Their characters count towards ``max_text_chars`` through the cells that use them
+    (parser resource design X1, X4): one cell uses 'bc', so 2 characters are text."""
     shared = SST.format('<si><t>a</t></si><si><r><t>b</t></r><r><t>c</t></r></si><si><t>d</t></si>')
     data = xlsx_with('<row r="1"><c r="A1" t="s"><v>1</v></c></row>', shared)
     assert [u.text for u in parsers.parse(data, '.xlsx', Limits()).units] == ['bc']
     assert outcome(data, '.xlsx', Limits(max_units=3)) == ('ok', None, 1)
     assert outcome(data, '.xlsx', Limits(max_units=2)) == ('too_large', 'limit_units', 0)
-    assert outcome(data, '.xlsx', Limits(max_text_chars=4)) == ('ok', None, 1)
-    assert outcome(data, '.xlsx', Limits(max_text_chars=3)) == ('too_large', 'limit_chars', 0)
-    assert outcome(data, '.xlsx', Limits(xml_max_text_chars=2)) == ('ok', None, 1)
-    assert outcome(data, '.xlsx', Limits(xml_max_text_chars=1)) == ('too_large', 'xml_text', 0)
+    assert outcome(data, '.xlsx', Limits(max_text_chars=2)) == ('ok', None, 1)
+    assert outcome(data, '.xlsx', Limits(max_text_chars=1)) == ('too_large', 'limit_chars', 0)
+    assert outcome(data, '.xlsx', Limits(max_unit_chars=2)) == ('ok', None, 1)
+    assert outcome(data, '.xlsx', Limits(max_unit_chars=1)) == ('too_large', 'unit_chars', 0)
     one_huge = xlsx_with('', SST.format('<si><t>' + 'x' * (8 * 2**20 + 1) + '</t></si>'))
-    assert outcome(one_huge, '.xlsx') == ('too_large', 'xml_text', 0)
+    assert outcome(one_huge, '.xlsx') == ('too_large', 'unit_chars', 0)
 
 
 def test_xlsx_cell_text_limit_and_cells_outside_a_row():
@@ -355,7 +356,7 @@ def test_xlsx_cell_text_limit_and_cells_outside_a_row():
                      '<c t="str"><v>' + 'y' * 100 + '</v></c></row><c r="C9" t="str"><v>z</v></c>')
     result = parsers.parse(data, '.xlsx', Limits())
     assert [(u.unit['cell'], len(u.text)) for u in result.units] == [('A2', 100), ('B2', 100), ('C9', 1)]
-    assert outcome(data, '.xlsx', Limits(xml_max_text_chars=99)) == ('too_large', 'xml_text', 0)
+    assert outcome(data, '.xlsx', Limits(max_unit_chars=99)) == ('too_large', 'unit_chars', 0)
 
 
 def test_xlsx_workbook_relationships_keep_only_the_sheets_targets_and_the_clock_spans_every_part(monkeypatch):
@@ -405,7 +406,7 @@ def test_parsers_are_deterministic(rel_path):
 @pytest.mark.parametrize('rel_path', sorted(path for path, (item, _) in CASES.items() if item.status == 'ok' and item.unit_count))
 def test_every_unit_passes_locator_check_unit(rel_path):
     item, data = CASES[rel_path]
-    units, encoding = parsers.parser_for(ext_of(rel_path)).parse(data, Limits())
+    units, encoding = parsers.parser_for(ext_of(rel_path)).parse(data, Limits(), _container.Budget(Limits()))
     assert encoding is None and len(units) == item.unit_count
     for unit in units:
         assert locator.check_unit(unit.unit) == unit.unit
@@ -416,3 +417,106 @@ def test_parser_versions_follow_the_format():
     for ext, name in (('.docx', 'docx'), ('.pptx', 'pptx'), ('.xlsx', 'xlsx')):
         parser = parsers.parser_for(ext)
         assert parser.name == name and re.fullmatch(rf'{name}-[1-9][0-9]*', parser.version)
+
+
+# Parser resource design §3.3, §3.4 (budget charges)
+def test_pptx_table_cells_count_as_units_while_the_table_is_open():
+    """R8 (review v3 L16): table cells waited in the open frame uncounted (1.85 M cells: +797 MiB, 27 s,
+    then limit_units). A cell now counts when it is read: the 101st cell stops the parse, so a table of
+    10,000 cells takes no more memory than one of 1,000."""
+    def table(rows):
+        cells = [[f'칸 {row}-{column}' for column in range(1, 41)] for row in range(1, rows + 1)]
+        return make_ooxml.pptx_package([('rId2', make_ooxml._slide(make_ooxml.p_table(cells)))], ['rId2'])
+    small, large = table(25), table(250)
+    assert outcome(small, '.pptx') == ('ok', None, 1000)
+    peaks = []
+    for data in (small, large):
+        status, error, units, peak = traced_peak(data, '.pptx', Limits(max_units=100))
+        assert (status, error, units) == ('too_large', 'limit_units', 0)
+        peaks.append(peak)
+    assert peaks[1] < peaks[0] + 256 * 2**10  # waiting cells: about 300 B each, 2.7 MB more for the large table
+
+
+def test_pptx_empty_paragraphs_count_as_text():
+    """R9: each ``a:p`` is a list of pieces and a line break in the shape's text, so 10,000 empty ones
+    are over 1,000 characters of one unit."""
+    body = '<a:p/>' * 10_000
+    data = make_ooxml.pptx_package([('rId2', make_ooxml._slide(make_ooxml.p_sp([body])))], ['rId2'])
+    assert outcome(data, '.pptx', Limits(max_unit_chars=1_000)) == ('too_large', 'unit_chars', 0)
+    assert outcome(data, '.pptx', Limits(max_unit_chars=10_000)) == ('ok', None, 0)
+    breaks = make_ooxml.a_p(make_ooxml.a_r('a'), '<a:br/>' * 2_000, make_ooxml.a_r('b'))
+    data = make_ooxml.pptx_package([('rId2', make_ooxml._slide(make_ooxml.p_sp([breaks])))], ['rId2'])
+    assert outcome(data, '.pptx', Limits(max_unit_chars=1_000)) == ('too_large', 'unit_chars', 0)
+    assert outcome(data, '.pptx', Limits(max_text_chars=1_000)) == ('too_large', 'limit_chars', 0)
+
+
+def test_docx_breaks_count_as_text():
+    """R10: tabs and breaks were kept as pieces without being counted (19 M ``w:br`` of a 128 MiB part:
+    about 150 MiB of pieces)."""
+    data = make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run('a'), '<w:r>' + '<w:br/>' * 10_000 + '</w:r>'))
+    assert outcome(data, '.docx', Limits(max_unit_chars=1_000)) == ('too_large', 'unit_chars', 0)
+    assert outcome(data, '.docx', Limits(max_text_chars=1_000)) == ('too_large', 'limit_chars', 0)
+    assert outcome(data, '.docx', Limits(max_unit_chars=10_001)) == ('ok', None, 1)
+
+
+def test_slide_ids_and_targets_are_held_memory():
+    """P1, P2: slide ids and relationship targets are kept until the slides are read (a 50,000-character
+    target is 200,256 bytes in the model)."""
+    data = make_ooxml.pptx_package([('rId2', make_ooxml._slide(make_ooxml.p_sp([make_ooxml.a_p(make_ooxml.a_r('t'))])))],
+                                   ['rId2'])
+    long_target = 'slides/' + 'x' * 50_000 + '/../slide1.xml'
+    data = make_ooxml.zip_bytes({name: (long_target.join(text.split('slides/slide1.xml')) if name.endswith('.rels')
+                                        else text) for name, text in read_members(data).items()})
+    assert outcome(data, '.pptx', Limits(max_held_bytes=400_000)) == ('ok', None, 1)
+    assert outcome(data, '.pptx', Limits(max_held_bytes=150_000)) == ('too_large', 'limit_memory', 0)
+
+
+def read_members(data: bytes) -> dict[str, str]:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        return {name: archive.read(name).decode('utf-8') for name in archive.namelist()}
+
+
+def test_xlsx_shared_string_references_charge_text_per_cell():
+    """R6 (review v3 M1-5): one shared string read by many cells was counted once, so 199,999 cells of one
+    8 Mi-character string made 1.68 T characters of units (and a stripped copy per cell). Each cell now
+    charges its text when it becomes a unit, and the table is stripped once: the 50th cell of 1,000
+    characters is over 50,000 characters, with no copy per cell."""
+    shared = SST.format('<si><t>  ' + 'x' * 1_000 + '  </t></si>')
+    rows = ''.join(f'<row r="{n}"><c r="A{n}" t="s"><v>0</v></c></row>' for n in range(1, 201))
+    data = xlsx_with(rows, shared)
+    assert outcome(data, '.xlsx') == ('ok', None, 200)
+    result = parsers.parse(data, '.xlsx', Limits())
+    assert len({id(unit.text) for unit in result.units}) == 1  # every cell shares the stripped string
+    status, error, units, peak = traced_peak(data, '.xlsx', Limits(max_text_chars=50_000))
+    assert (status, error, units) == ('too_large', 'limit_chars', 0) and peak < 2**20
+    booleans = xlsx_with(''.join(f'<row r="{n}"><c r="A{n}" t="b"><v>1</v></c></row>' for n in range(1, 11)))
+    assert outcome(booleans, '.xlsx', Limits(max_text_chars=40)) == ('ok', None, 10)   # 'TRUE' x 10
+    assert outcome(booleans, '.xlsx', Limits(max_text_chars=39)) == ('too_large', 'limit_chars', 0)
+
+
+def test_xlsx_shared_strings_are_held_memory():
+    """R7: the shared string table is kept for the whole parse, 256 bytes a string and 4 a character in
+    the budget: two strings of 4,000 characters are 32,512 bytes, five are 81,280."""
+    def book(count):
+        shared = SST.format(''.join('<si><t>' + 'v' * 4_000 + '</t></si>' for _ in range(count)))
+        return xlsx_with('<row r="1"><c r="A1" t="s"><v>1</v></c></row>', shared)
+    assert outcome(book(2), '.xlsx', Limits(max_held_bytes=64 * 2**10)) == ('ok', None, 1)
+    assert outcome(book(5), '.xlsx', Limits(max_held_bytes=64 * 2**10)) == ('too_large', 'limit_memory', 0)
+
+
+def test_text_pieces_are_joined_so_memory_follows_the_characters():
+    """Probes N7, N8: a text piece costs a str object (about 50 bytes) and a list slot, so pieces of one
+    character (text split by comments, breaks, empty paragraphs) took more than ten times what the budget
+    counts (10 M empty ``a:p``: +609 MiB). Pieces are joined 4,096 at a time."""
+    split = make_ooxml.docx_package('<w:p><w:r><w:t>' + 'a<!---->' * 200_000 + '</w:t></w:r></w:p>')
+    status, error, units, peak = traced_peak(split, '.docx', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak < 3 * 2**20  # 200,000 pieces of one character
+    assert parsers.parse(split, '.docx', Limits()).units[0].text == 'a' * 200_000
+    empty = make_ooxml.pptx_package([('rId2', make_ooxml._slide(make_ooxml.p_sp(['<a:p/>' * 200_000 + make_ooxml.a_p(
+        make_ooxml.a_r('end'))])))], ['rId2'])
+    status, error, units, peak = traced_peak(empty, '.pptx', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak < 3 * 2**20
+    nested = make_ooxml.pptx_package([('rId2', make_ooxml._slide(make_ooxml.p_sp([
+        '<a:p><a:r><a:t>outer</a:t></a:r><a:p><a:r><a:t>inner</a:t></a:r></a:p><a:r><a:t> tail</a:t></a:r></a:p>'
+        + make_ooxml.a_p(make_ooxml.a_r('next'))])))], ['rId2'])
+    assert [u.text for u in parsers.parse(nested, '.pptx', Limits()).units] == ['outer tail\ninner\nnext']

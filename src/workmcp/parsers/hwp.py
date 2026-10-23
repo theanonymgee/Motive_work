@@ -11,13 +11,16 @@ Both formats give one unit per paragraph, ``{"kind": "section_para", "section": 
   flat with no table coordinates. Headers, footers, footnotes and other streams are not read, and a
   tab (control code 9) is dropped like every other control. A section is inflated and cut into
   records 256 KiB at a time; only an unfinished ``PARA_TEXT`` record is buffered, and its text is cut
-  out of the record bytes and decoded once. A record over ``Limits.hwp_max_para_bytes`` is
-  ``too_large/hwp_para``. One section's decompressed stream is bounded by ``zip_max_part_bytes`` and
-  all of them by ``zip_max_total_bytes``; the parse time by ``parse_seconds`` (checked per 256 KiB).
+  out of the record bytes into one buffer (no list of pieces) and decoded once. A record over
+  ``Limits.hwp_max_para_bytes`` is ``too_large/hwp_para``. One section's decompressed stream is bounded
+  by ``zip_max_part_bytes`` and all of them by ``zip_max_total_bytes``. Every record and every run of
+  control characters is an event of the file's budget (``too_large/limit_events``), the clock is read
+  per 256 KiB piece, and a paragraph's text counts as text and a unit when it is kept.
 - HWPX: ``i`` counts the ``hp:p`` elements of the section in document order, nested ones included.
   A paragraph owns only its own ``hp:t`` text, so a table inside a paragraph is not repeated in it.
-  A section is read as a stream of events (``_container.XmlStream``), never as a tree; one
-  paragraph's text is at most ``xml_max_text_chars`` (``too_large/xml_text``).
+  A section is read as a stream of events (``_container.XmlStream``), never as a tree. A text piece,
+  tab or line break counts as text (``too_large/limit_chars``) and towards its paragraph's
+  ``max_unit_chars`` (``unit_chars``); a paragraph with text counts as a unit when it ends.
 """
 from __future__ import annotations
 
@@ -34,9 +37,9 @@ from . import Limits, ParseFailure, Unit, _container
 from ._container import START, TEXT
 
 NAME = 'hwp'
-VERSION = f'hwp-3/olefile-{importlib.metadata.version("olefile")}'
+VERSION = f'hwp-4/olefile-{importlib.metadata.version("olefile")}'
 HWPX_NAME = 'hwpx'
-HWPX_VERSION = 'hwpx-3'
+HWPX_VERSION = 'hwpx-4'
 
 _SIGNATURE = b'HWP Document File'
 _HEADER_BYTES = 40
@@ -49,34 +52,57 @@ _LONG_CONTROLS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 1
 _HWP_SECTION = re.compile(r'Section(0|[1-9][0-9]{0,8})')
 _HWPX_SECTION = re.compile(r'Contents/section(0|[1-9][0-9]{0,8})\.xml')
 _CONTROL = re.compile(rb'[\x00-\x1f]\x00')  # a WCHAR below 32 when the match starts at an even offset
+_SHORT_CONTROLS = bytes(sorted(set(range(32)) - _LONG_CONTROLS - {10, 13}))
+# A run of controls that give no text, and a run of line breaks, matched from a WCHAR boundary (every
+# alternative is whole WCHARs, so the match never leaves the WCHAR grid). At most 4,096 a match: the
+# regular expression engine keeps state for every repetition of a group until the match ends.
+_SKIPPED = re.compile(rb'(?:[' + re.escape(_SHORT_CONTROLS) + rb']\x00|['
+                      + re.escape(bytes(sorted(_LONG_CONTROLS))) + rb']\x00(?:..){7}){1,4096}', re.S)
+_LINE_BREAKS = re.compile(rb'(?:[\x0a\x0d]\x00){1,4096}')
+_NEWLINES = b'\n\x00' * 4096
+_STEPS = 4096  # steps of the control loop charged to the budget at a time
 _HP = '{http://www.hancom.co.kr/hwpml/2011/paragraph}'
 _P, _T = _HP + 'p', _HP + 't'
 _INLINE = {_HP + 'tab': '\t', _HP + 'lineBreak': '\n'}
 
 
-def _para_text(raw) -> str:
+def _para_text(raw, budget: _container.Budget) -> str:
     """Text of one ``PARA_TEXT`` payload (bytes or memoryview): WCHARs from 32 up, 10 and 13 as a line break.
 
     A control below 32 is one WCHAR, or eight for the codes in ``_LONG_CONTROLS`` (code plus inline data).
+    The text between controls goes straight into one buffer, at most the payload's size. A run of
+    controls is passed in one regular-expression match, so the loop takes one step per run; every step
+    is one event of the budget.
     """
     end = len(raw) - len(raw) % 2
-    pieces, keep, scan = [], 0, 0
+    out, keep, scan, steps = bytearray(), 0, 0, 0
+    search = _CONTROL.search
     while True:
-        match = _CONTROL.search(raw, scan, end)
+        match = search(raw, scan, end)
         if match is None:
-            pieces.append(raw[keep:end])
             break
+        steps += 1
+        if steps == _STEPS:
+            budget.event(steps)
+            steps = 0
         at = match.start()
         if at % 2:  # the high byte of one WCHAR and the low byte of the next
             scan = at + 1
             continue
-        pieces.append(raw[keep:at])
-        code = raw[at]
-        if code in (10, 13):
-            pieces.append(b'\n\x00')
-        keep = scan = min(at + (16 if code in _LONG_CONTROLS else 2), end)
+        out += raw[keep:at]
+        if raw[at] in (10, 13):
+            run = _LINE_BREAKS.match(raw, at, end).end()
+            out += _NEWLINES[:run - at]  # one line break per WCHAR of the run
+        else:
+            run = _SKIPPED.match(raw, at, end)
+            run = run.end() if run else end  # a long control cut short by the end takes the rest
+        keep = scan = run
+    budget.event(steps)
     # Code units are decoded together so that UTF-16 surrogate pairs combine; a lone one becomes U+FFFD.
-    return str(pieces[0] if len(pieces) == 1 else b''.join(pieces), 'utf-16-le', 'replace')
+    if not keep:
+        return str(raw[:end], 'utf-16-le', 'replace')
+    out += raw[keep:end]
+    return str(out, 'utf-16-le', 'replace')
 
 
 def _inflated(raw: bytes, limit: int) -> Iterator[bytes]:
@@ -110,7 +136,7 @@ def _pieces(raw: bytes) -> Iterator[memoryview]:
         yield view[start:start + _PIECE_BYTES]
 
 
-def _para_texts(pieces: Iterable, limits: Limits, clock: _container.Clock, total: list) -> Iterator:
+def _para_texts(pieces: Iterable, limits: Limits, budget: _container.Budget, total: list) -> Iterator:
     """The payload of every ``PARA_TEXT`` record of one section stream, read piece by piece.
 
     A ``PARA_TEXT`` record that runs into the next pieces is gathered into a buffer of its own size;
@@ -118,7 +144,8 @@ def _para_texts(pieces: Iterable, limits: Limits, clock: _container.Clock, total
     so memory is one piece plus one paragraph. A header or size running past the end is
     ``hwp_bad_record``; a ``PARA_TEXT`` over the limit is ``too_large/hwp_para`` once it is complete.
     ``total`` (a one-item list) counts the section bytes of the whole file against
-    ``zip_max_total_bytes``. The clock is checked once per piece.
+    ``zip_max_total_bytes``. Every record header read is one event of the budget; the clock is also
+    read once per piece.
     """
     left = b''                 # an unfinished record header from the previous piece (under 8 bytes)
     skip, oversized = 0, False  # bytes of a skipped record still to come; whether it is an oversized PARA_TEXT
@@ -128,7 +155,7 @@ def _para_texts(pieces: Iterable, limits: Limits, clock: _container.Clock, total
         total[0] += len(data)
         if total[0] > limits.zip_max_total_bytes:
             raise ParseFailure('too_large', 'zip_total')
-        clock.check()
+        budget.clock()
         if skip:
             used = min(skip, len(data))
             skip -= used
@@ -149,6 +176,7 @@ def _para_texts(pieces: Iterable, limits: Limits, clock: _container.Clock, total
             data, left = memoryview(left + bytes(data)), b''
         pos, end = 0, len(data)
         while end - pos >= 4:
+            budget.event()
             word = struct.unpack_from('<I', data, pos)[0]
             tag, size, header = word & 0x3FF, (word >> 20) & 0xFFF, 4
             if size == 0xFFF:
@@ -189,8 +217,7 @@ def _read_stream(ole: olefile.OleFileIO, path: str, limit: int) -> bytes:
         raise ParseFailure('failed', 'hwp_bad_stream') from None
 
 
-def parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
-    clock = _container.Clock(limits)
+def parse(data: bytes, limits: Limits, budget: _container.Budget) -> tuple[list[Unit], str | None]:
     try:
         ole = olefile.OleFileIO(io.BytesIO(data))
     except MemoryError:
@@ -223,61 +250,67 @@ def parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
             raise ParseFailure('too_large', 'hwp_count')
         if not sections:
             raise ParseFailure('failed', 'hwp_bad_stream')
-        units, total, chars = [], [0], 0
+        units, total = [], [0]
         for number, path in sorted(sections):
             raw = _read_stream(ole, path, limits.zip_max_part_bytes)
             pieces = _inflated(raw, limits.zip_max_part_bytes) if flags & _FLAG_COMPRESSED else _pieces(raw)
             index = 0
-            for payload in _para_texts(pieces, limits, clock, total):
+            for payload in _para_texts(pieces, limits, budget, total):
                 index += 1
                 if len(payload) < 2:
                     continue  # an empty paragraph keeps its index
-                text = _para_text(memoryview(payload)).strip()  # slices of a view are not copies
+                text = _para_text(memoryview(payload), budget).strip()  # slices of a view are not copies
                 if text:
+                    if len(text) > limits.max_unit_chars:  # hwp_max_para_bytes keeps it under the default
+                        raise ParseFailure('too_large', 'unit_chars')
+                    budget.text(len(text))
+                    budget.unit()
                     units.append(Unit(0, 'section_para', {'kind': 'section_para', 'section': number + 1,
                                                           'index': index}, text))
-                    chars += len(text)
-                    if len(units) > limits.max_units:
-                        raise ParseFailure('too_large', 'limit_units')
-                    if chars > limits.max_text_chars:
-                        raise ParseFailure('too_large', 'limit_chars')
     return units, None
 
 
-def _section_units(chunks, section: int, units: list, limits: Limits, clock, budget) -> None:
+def _keep(paragraph: list, piece: str, most: int, budget) -> None:
+    """Add a text piece (or a tab or line break) to an open HWPX paragraph, charging it as text."""
+    budget.text(len(piece))
+    paragraph[2] += len(piece)
+    if paragraph[2] > most:
+        raise ParseFailure('too_large', 'unit_chars')
+    if paragraph[1] is None:
+        paragraph[1] = _container.Pieces()
+    paragraph[1].append(piece)
+
+
+def _section_units(chunks, section: int, units: list, limits: Limits, budget) -> None:
     """Units of one HWPX section, from a stream of events.
 
     Each open element has a role towards its closest ``hp:p``: ``walk`` (its children count),
     ``text`` (an ``hp:t``: the text directly in it, and for each child the inline tab or line break)
     or ``skip`` (nothing inside counts, except nested paragraphs, which are their own).
     """
-    stream = _container.XmlStream(chunks, limits, clock)
-    most = limits.xml_max_text_chars
+    stream = _container.XmlStream(chunks, limits, budget)
+    most = limits.max_unit_chars
     found, roles, index = [], [], 0
     for kind, tag, value in stream:
         if kind is TEXT:
             if roles and roles[-1][0] == 'text':
-                paragraph = roles[-1][1]
-                paragraph[1].append(value)
-                paragraph[2] += len(value)
-                if paragraph[2] > most:
-                    raise ParseFailure('too_large', 'xml_text')
-                budget.take(len(value))
+                _keep(roles[-1][1], value, most, budget)
             continue
         if kind is START:
             parent = roles[-1] if roles else None
             if tag == _P:
                 index += 1
-                role = ('walk', [index, [], 0])  # [index, pieces, chars]
+                role = ('walk', [index, None, 0])  # [index, Pieces or None before the first piece, chars]
             elif parent is None or parent[0] == 'skip':
                 role = ('skip', None)
             elif parent[0] == 'text':
-                parent[1][1].append(_INLINE.get(tag, ''))
+                if tag in _INLINE:
+                    _keep(parent[1], _INLINE[tag], most, budget)
                 role = ('skip', None)
             elif tag == _T:  # the parent walks for a paragraph
                 role = ('text', parent[1])
             elif tag in _INLINE:
-                parent[1][1].append(_INLINE[tag])
+                _keep(parent[1], _INLINE[tag], most, budget)
                 role = ('skip', None)
             else:
                 role = ('walk', parent[1])
@@ -286,17 +319,16 @@ def _section_units(chunks, section: int, units: list, limits: Limits, clock, bud
         role = roles.pop()
         if tag == _P:
             number, pieces, _ = role[1]
-            text = ''.join(pieces).strip()
+            text = pieces.text().strip() if pieces else ''
             if text:
+                budget.unit()
                 found.append((number, text))
-                if len(units) + len(found) > limits.max_units:
-                    raise ParseFailure('too_large', 'limit_units')
     found.sort()  # a nested paragraph ends before the one around it
     for number, text in found:
         units.append(Unit(0, 'section_para', {'kind': 'section_para', 'section': section, 'index': number}, text))
 
 
-def parse_hwpx(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
+def parse_hwpx(data: bytes, limits: Limits, budget: _container.Budget) -> tuple[list[Unit], str | None]:
     archive = _container.open_zip(data, limits)
     sections = []
     for name in archive.namelist():
@@ -307,8 +339,7 @@ def parse_hwpx(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
         raise ParseFailure('too_large', 'hwp_count')
     if not sections:
         raise ParseFailure('failed', 'missing_part')
-    clock, budget = _container.Clock(limits), _container.TextBudget(limits)
     units = []
     for number, name in sorted(sections):
-        _section_units(_container.part_chunks(archive, name, limits), number + 1, units, limits, clock, budget)
+        _section_units(_container.part_chunks(archive, name, limits), number + 1, units, limits, budget)
     return units, None

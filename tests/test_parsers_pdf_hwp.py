@@ -26,6 +26,7 @@ from workmcp.parsers import Limits, ParseFailure, _container, hwp, pdf
 
 CASES = {**make_pdf.cases(), **make_hwp.cases()}
 DEFAULT_LIMITS = Limits()
+BUDGET = _container.Budget(Limits(max_events=2**62, parse_seconds=1e9))  # for direct calls of helpers
 
 
 def run(data: bytes, ext: str, limits: Limits = DEFAULT_LIMITS):
@@ -149,9 +150,9 @@ def test_every_unit_passes_locator_check_unit(rel):
 
 
 def test_parser_versions_follow_the_format():
-    assert re.fullmatch(r'pdf-2/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
-    assert re.fullmatch(r'hwp-3/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
-    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-3')
+    assert re.fullmatch(r'pdf-3/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
+    assert re.fullmatch(r'hwp-4/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
+    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-4')
     assert parsers.parser_for('.pdf').version == pdf.VERSION
     assert parsers.parser_for('.hwp').version == hwp.VERSION
     assert parsers.parser_for('.HWPX').version == hwp.HWPX_VERSION
@@ -315,13 +316,13 @@ def reference_para_text(raw: bytes) -> str:
 
 def test_hwp_para_text_matches_the_per_character_rule():
     # U+0400 then U+AC00 is 00 04 00 AC: the bytes 04 00 look like a control when read from an odd offset.
-    assert hwp._para_text('\u0400\uac00'.encode('utf-16-le')) == '\u0400\uac00'
+    assert hwp._para_text('\u0400\uac00'.encode('utf-16-le'), BUDGET) == '\u0400\uac00'
     noise = random.Random(11)
     alphabet = [0, 1, 2, 9, 10, 13, 24, 31, 32, 0x41, 0x400, 0x1F00, 0xAC00, 0xD800, 0xDC00, 0xD83D, 0xDE00, 0xFFFF]
     for _ in range(400):
         raw = struct.pack('<%dH' % (n := noise.randrange(0, 60)), *(noise.choice(alphabet) for _ in range(n)))
         raw += b'\x07' * noise.randrange(0, 2)  # an odd trailing byte is ignored
-        assert hwp._para_text(raw) == reference_para_text(raw) == hwp._para_text(memoryview(raw)), raw
+        assert hwp._para_text(raw, BUDGET) == reference_para_text(raw) == hwp._para_text(memoryview(raw), BUDGET), raw
 
 
 def test_hwp_paragraph_limit_and_early_unit_and_text_limits():
@@ -417,9 +418,10 @@ def test_pdf_time_limit_is_checked_before_each_page(monkeypatch):
     data = make_pdf.latin_pdf([['one'], ['two'], ['three']])
     assert outcome(run(data, '.pdf', Limits(parse_seconds=-1))) == ('too_large', 'parse_time')
     looks = fake_clock(monkeypatch)
-    assert texts(run(data, '.pdf', Limits(parse_seconds=100))) == ['one', 'two', 'three'] and looks[0] == 1 + 3
+    # The budget is made, the clock is read before and after opening the file, then before each page.
+    assert texts(run(data, '.pdf', Limits(parse_seconds=100))) == ['one', 'two', 'three'] and looks[0] == 1 + 2 + 3
     looks[0] = 0
-    assert outcome(run(data, '.pdf', Limits(parse_seconds=2.5))) == ('too_large', 'parse_time')
+    assert outcome(run(data, '.pdf', Limits(parse_seconds=4.5))) == ('too_large', 'parse_time')  # at the third page
 
 
 def test_pdf_text_limit_stops_while_reading():
@@ -448,7 +450,7 @@ def test_hwp_header_checks_bad_signature_version_and_missing_header():
     assert outcome(run(no_header, '.hwp')) == ('unsupported', 'hwp_bad_header')
     assert outcome(run(b'PK\x03\x04 not an ole file', '.hwp')) == ('unsupported', 'hwp_bad_header')
     with pytest.raises(ParseFailure) as caught:
-        hwp.parse(parsers.OLE_SIGNATURE + b'\x00' * 2048, Limits())
+        hwp.parse(parsers.OLE_SIGNATURE + b'\x00' * 2048, Limits(), _container.Budget(Limits()))
     assert (caught.value.status, caught.value.code) == ('failed', 'ole_invalid')
 
 
@@ -545,17 +547,17 @@ def test_hwpx_memory_does_not_grow_with_the_part():
 
 def test_hwpx_structure_text_and_time_limits(monkeypatch):
     """Review M1-3 for HWPX: deep nesting is ``xml_depth`` (hwpx-2 kept every open element and walked the
-    open path after each chunk); one paragraph's text over ``xml_max_text_chars`` is ``xml_text``."""
+    open path after each chunk); one paragraph's text over ``max_unit_chars`` is ``unit_chars``."""
     deep = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p>' * 100_000 + '</hp:p>' * 100_000])])
     started = time.perf_counter()
     status, error, units, peak = traced_peak(deep, '.hwpx', Limits())
     assert (status, error) == ('too_large', 'xml_depth') and peak <= 2**20 and time.perf_counter() - started < 2
     two = make_hwp.hwpx_bytes([make_hwp.hwpx_section([make_hwp.hp_para('x' * 500) + make_hwp.hp_para('y' * 500)])])
-    assert outcome(run(two, '.hwpx', Limits(xml_max_text_chars=500))) == ('ok', None)
+    assert outcome(run(two, '.hwpx', Limits(max_unit_chars=500))) == ('ok', None)
     split = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p><hp:run><hp:t>' + 'x' * 300 + '</hp:t><hp:t>'
                                                           + 'y' * 300 + '</hp:t></hp:run></hp:p>'])])
-    assert outcome(run(split, '.hwpx', Limits(xml_max_text_chars=600))) == ('ok', None)
-    assert outcome(run(split, '.hwpx', Limits(xml_max_text_chars=599))) == ('too_large', 'xml_text')
+    assert outcome(run(split, '.hwpx', Limits(max_unit_chars=600))) == ('ok', None)
+    assert outcome(run(split, '.hwpx', Limits(max_unit_chars=599))) == ('too_large', 'unit_chars')
     assert outcome(run(split, '.hwpx', Limits(max_text_chars=599))) == ('too_large', 'limit_chars')
     sections = hwpx([make_hwp.hp_para('a')], [make_hwp.hp_para('b')], [make_hwp.hp_para('c')])
     looks = fake_clock(monkeypatch)
@@ -593,3 +595,133 @@ def test_unit_text_works_as_a_locator_quote():
     anchor = locator.anchor(unit.text, locator.sentences(unit.text)[0])
     quoted = locator.make(1, 'docs/x.hwpx', '0' * 64, unit.unit, unit.text, [anchor['start'], anchor['end']])
     assert locator.check_text(quoted, unit.text) == unit.text[anchor['start']:anchor['end']]
+
+
+# Parser resource design §3.7, §3.8 (budget charges)
+def test_hwp_control_characters_do_not_make_pieces():
+    """R11 (review v3 M1-6): every control character cut the text into another memoryview piece (a
+    16 MiB paragraph of controls: 8.4 M pieces, +2.3 to +3.0 GiB). The text now goes into one buffer:
+    a 2 MiB paragraph of 'a' and control 31 alternating peaks under 3 times the paragraph."""
+    payload = ('a\x1f' * 2**19).encode('utf-16-le')
+    assert len(payload) == 2 * 2**20
+    raw = make_hwp.record(make_hwp.TAG_PARA_HEADER, 0, bytes(22)) + make_hwp.record(make_hwp.TAG_PARA_TEXT, 1, payload)
+    data = make_hwp.hwp_bytes([['x']], raw_sections={0: raw})
+    status, error, units, peak = traced_peak(data, '.hwp', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak < 3 * len(payload)
+    assert run(data, '.hwp').units[0].text == 'a' * 2**19
+    only_controls = make_hwp.record(make_hwp.TAG_PARA_TEXT, 1, '\x00\x0a'.encode('utf-16-le') * 2**18)
+    result = run(make_hwp.hwp_bytes([['x']], raw_sections={0: only_controls}), '.hwp')
+    assert outcome(result) == ('ok', None) and result.units == ()  # line breaks only: nothing to keep
+    assert outcome(run(data, '.hwp', Limits(max_events=2**18))) == ('too_large', 'limit_events')  # 512 Ki controls
+
+
+def test_hwp_records_are_events():
+    """R12: every record is one event of the file's budget, empty ones included."""
+    raw = make_hwp.record(make_hwp.TAG_PARA_TEXT, 1, b'') * 10_000 + make_hwp.para('끝')
+    data = make_hwp.hwp_bytes([['x']], raw_sections={0: raw})
+    assert outcome(run(data, '.hwp', Limits(max_events=5_000))) == ('too_large', 'limit_events')
+    assert texts(run(data, '.hwp', Limits(max_events=20_000))) == ['끝']
+
+
+def test_hwpx_inline_breaks_count_as_text_and_other_children_are_not_kept():
+    """HX2: a tab or line break is one character of its paragraph; any other child of ``hp:t`` adds no piece."""
+    breaks = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p><hp:run><hp:t>a' + '<hp:lineBreak/>' * 10_000
+                                                         + 'b</hp:t></hp:run></hp:p>'])])
+    assert outcome(run(breaks, '.hwpx', Limits(max_unit_chars=1_000))) == ('too_large', 'unit_chars')
+    assert outcome(run(breaks, '.hwpx', Limits(max_text_chars=1_000))) == ('too_large', 'limit_chars')
+    assert outcome(run(breaks, '.hwpx', Limits(max_unit_chars=10_002))) == ('ok', None)
+    others = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p><hp:run><hp:t>a' + '<hp:x/>' * 10_000
+                                                         + 'b</hp:t></hp:run></hp:p>'])])
+    assert texts(run(others, '.hwpx', Limits(max_unit_chars=2))) == ['ab']
+
+
+# Parser resource design §4 (PDF)
+def readers(monkeypatch) -> list:
+    """The PdfReader objects ``pdf.parse`` makes, kept for inspection."""
+    made = []
+
+    class Reader(pdf.PdfReader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            made.append(self)
+    monkeypatch.setattr(pdf, 'PdfReader', Reader)
+    return made
+
+
+def test_pdf_visitor_stops_nested_forms():
+    """R13 (review v3 M1-9): a form drawn ten times per level, five levels deep, is 90 M characters; pypdf
+    swallows any error inside a form, so the old limit (checked after the page) let it all be built. The
+    visitors stop it once the budget's text runs out, at every level, within two seconds."""
+    data = make_pdf.form_chain_pdf(5)
+    started = time.perf_counter()
+    status, error, units, peak = traced_peak(data, '.pdf', Limits(max_text_chars=10_000))
+    assert (status, error) == ('too_large', 'limit_chars') and time.perf_counter() - started < 2 and peak < 32 * 2**20
+    assert outcome(run(data, '.pdf', Limits(max_unit_chars=10_000))) == ('too_large', 'unit_chars')
+    assert outcome(run(make_pdf.form_chain_pdf(2), '.pdf')) == ('ok', None)
+    assert outcome(run(make_pdf.form_chain_pdf(5), '.pdf', Limits(max_events=1_000))) == ('too_large', 'limit_events')
+
+
+def test_pdf_visitor_failure_at_page_level_is_the_same_code():
+    """R14: a page without forms stops the same way (the visitor's error is not swallowed there)."""
+    data = make_pdf.long_page_pdf(5_000)
+    assert outcome(run(data, '.pdf', Limits(max_unit_chars=100))) == ('too_large', 'unit_chars')
+    assert outcome(run(data, '.pdf', Limits(max_text_chars=100))) == ('too_large', 'limit_chars')
+    assert len(texts(run(data, '.pdf'))[0]) == 5_000 + 4  # the line breaks between the five lines
+
+
+def test_pdf_kids_are_counted_before_flattening(monkeypatch):
+    """R15 (N1): pypdf makes one page object per ``/Kids`` reference and trusts ``/Count``; the tree is
+    counted first, so 50 references to one page are over 10 pages before pypdf flattens anything. A
+    cycle between two ``/Pages`` nodes is a read error."""
+    made = readers(monkeypatch)
+    assert outcome(run(make_pdf.kids_pdf(50), '.pdf', Limits(pdf_max_pages=10))) == ('too_large', 'pdf_count')
+    assert made[-1].flattened_pages is None
+    assert texts(run(make_pdf.kids_pdf(10), '.pdf', Limits(pdf_max_pages=10))) == ['repeated page'] * 10
+    assert outcome(run(make_pdf.pages_cycle_pdf(), '.pdf')) == ('failed', 'pdf_read_error')
+    assert made[-1].flattened_pages is None
+    assert texts(run(make_pdf.kids_pdf(3, count=100_000), '.pdf')) == ['repeated page'] * 3  # N13: /Count ignored
+
+
+def test_pdf_parent_loop_is_skipped():
+    """R16 (N2): pypdf looks for inherited ``/Resources`` up the ``/Parent`` links with no limit; a page,
+    or a form it draws, on a ``/Parent`` cycle is read as a page without text instead of hanging."""
+    for in_form in (False, True):
+        result = run(make_pdf.parent_loop_pdf(in_form=in_form), '.pdf')
+        assert [(u.unit['page'], u.text) for u in result.units] == [(2, 'kept page')]
+
+
+def test_pdf_decoded_cache_is_dropped_between_pages(monkeypatch):
+    """R17 (N3): pypdf keeps the decoded copy of every stream it read for the reader's life (200 pages of
+    20 MiB content streams would keep 4 GiB). After each page its content streams' copies are dropped."""
+    made = readers(monkeypatch)
+    data = make_pdf.big_stream_pdf(3, 2**20)
+    assert texts(run(data, '.pdf')) == ['page 1', 'page 2', 'page 3']
+    reader = made[-1]
+    assert all(page['/Contents'].decoded_self is None for page in reader.pages)
+    status, error, units, peak = traced_peak(data, '.pdf', Limits())
+    one = traced_peak(make_pdf.big_stream_pdf(1, 2**20), '.pdf', Limits())[3]
+    assert (status, error, units) == ('ok', None, 3) and peak < one + 2**20  # flat in the number of pages
+
+
+def test_hwp_control_runs_are_one_step():
+    """Probe hwp_ctrl0_x6: seven 16 MiB paragraphs of control 0 were 58.7 M loop steps (31 s, limit_events).
+    Up to 4,096 controls in a row are passed in one match: one step, one event. A match keeps
+    regular-expression state for every repetition, so it stops at 4,096 (unbounded runs took +2 GiB)."""
+    raw = make_hwp.record(make_hwp.TAG_PARA_HEADER, 0, bytes(22)) + make_hwp.record(
+        make_hwp.TAG_PARA_TEXT, 1, b'\x00\x00' * 2**19 + 'a'.encode('utf-16-le') + b'\x0a\x00' * 2**18 + b'b\x00')
+    data = make_hwp.hwp_bytes([['x']], raw_sections={0: raw})
+    result = run(data, '.hwp', Limits(max_events=1_000))
+    status, error, units, peak = traced_peak(data, '.hwp', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak < 6 * 2**20  # 1.5 MiB payload: buffer and text
+    assert outcome(result) == ('ok', None) and texts(result) == ['a' + '\n' * 2**18 + 'b']
+
+
+def test_pdf_page_tree_objects_are_measured_before_pypdf_parses_them(monkeypatch):
+    """Probe N1: 16 M references in one ``/Kids`` (96 MB) made pypdf build 1.7 GiB of objects before the
+    references were counted. The tree objects' raw sizes are read from the cross-reference table first."""
+    made = readers(monkeypatch)
+    data = make_pdf.kids_pdf(1_000)
+    assert texts(run(data, '.pdf', Limits(pdf_max_pages=1_000))) == ['repeated page'] * 1_000
+    monkeypatch.setattr(pdf, '_TREE_BYTES', 4_000)  # the /Kids object is about 6,000 bytes
+    assert outcome(run(data, '.pdf', Limits(pdf_max_pages=1_000))) == ('too_large', 'pdf_count')
+    assert made[-1].flattened_pages is None and 2 not in {key[1] for key in made[-1].resolved_objects}

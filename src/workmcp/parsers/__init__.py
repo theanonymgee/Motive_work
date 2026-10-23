@@ -6,20 +6,22 @@ Contract of a parser module (``text``, ``eml``, ``docx``, ``pptx``, ``xlsx``, ``
   library decides the output, design §5.5). A module that reads two formats also has
   ``CSV_NAME``/``CSV_VERSION``/``parse_csv`` (``text``) or ``HWPX_NAME``/``HWPX_VERSION``/``parse_hwpx``
   (``hwp``).
-- ``parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]``: the units in document
-  order and the encoding (``None`` when the format declares its own). It gets bytes only, never a
-  path, and raises only ``ParseFailure``. Any other exception becomes ``failed/exception:<Class>``;
-  its message is never stored or logged (it may carry document text).
+- ``parse(data: bytes, limits: Limits, budget: _container.Budget) -> tuple[list[Unit], str | None]``:
+  the units in document order and the encoding (``None`` when the format declares its own). It gets
+  bytes only, never a path, and raises only ``ParseFailure``. It charges ``budget`` for everything it
+  keeps while it reads (parser resource design §2, §3). Any other exception becomes
+  ``failed/exception:<Class>``; its message is never stored or logged (it may carry document text).
 
 ``parse(data, ext, limits)`` here never raises for bad content: it checks the signature
-(``sniff``), calls the module, renumbers ordinals 1..N, checks every unit with
-``locator.check_unit``, refuses two units with the same locator in one version
+(``sniff``), makes the file's budget, calls the module, renumbers ordinals 1..N, checks every unit
+with ``locator.check_unit``, refuses two units with the same locator in one version
 (``failed/unit_duplicate``: binding and locator checks look a unit up by its locator) and applies
-the unit and text limits. Same bytes, same limits and same parser version give the same result
-(binding depends on it).
+the unit and text limits again. The checks after the parser run on the same clock. Same bytes, same
+limits and same parser version give the same result (binding depends on it).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -45,10 +47,13 @@ ERROR_CODES = {
     'unsupported': frozenset({
         'pdf_bad_signature', 'bad_signature', 'legacy_ole', 'hwp_bad_header', 'hwp_version', 'ooxml_strict'}),
     'too_large': frozenset({
-        'file_bytes', 'limit_units', 'limit_chars', 'zip_entries', 'zip_total', 'zip_part', 'hwp_para',
-        'xml_depth', 'xml_attributes', 'xml_markup', 'xml_names', 'xml_text', 'parse_time',
-        'pdf_count', 'pptx_count', 'xlsx_count', 'eml_count', 'hwp_count',
-        'xml_tree'}),  # xml_tree: no longer raised (pptx-2, xlsx-2 trees); kept so stored rows stay valid codes
+        'file_bytes', 'limit_units', 'limit_chars', 'limit_events', 'limit_memory', 'unit_chars',
+        'zip_entries', 'zip_total', 'zip_part', 'hwp_para', 'xml_depth', 'xml_attributes', 'xml_markup',
+        'xml_names', 'parse_time', 'pdf_count', 'pdf_stream', 'pptx_count', 'xlsx_count', 'eml_count',
+        'hwp_count', 'ole_entries',
+        # No longer raised, kept so that stored rows stay valid codes: xml_tree (pptx-2, xlsx-2 trees) and
+        # xml_text (one XML text node; unit_chars in every format now).
+        'xml_tree', 'xml_text'}),
     'encrypted': frozenset({'pdf_encrypted', 'hwp_encrypted', 'ooxml_encrypted'}),
 }
 EXCEPTION_PREFIX = 'exception:'
@@ -62,7 +67,7 @@ def is_error_code(status: str, code: str) -> bool:
     return code in ERROR_CODES[status]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # no per-unit __dict__: up to 200,000 of them are kept
 class Unit:
     ordinal: int  # 1-based document order (the dispatcher renumbers 1..N)
     kind: str     # a locator.UNIT_KINDS key, equal to unit['kind']
@@ -88,17 +93,25 @@ class Limits:
     # Every XML part is streamed (_container.XmlStream, no tree); these bound its structure (design M1 §15):
     # nesting depth (Office and HWPX documents stay well under 100; libxml2 refuses more than 256 by
     # default), attributes plus namespace declarations of one element (a Word root carries about 40), bytes
-    # of one start tag, comment or processing instruction, distinct element and attribute names in one part
-    # (a few hundred in real parts) and characters of one text node, which is also the limit of the text one
-    # XML unit gathers (8 Mi characters, the same as hwp_max_para_bytes).
+    # of one unfinished start tag, comment or processing instruction (1 MiB; measured in 64 KiB pieces, so
+    # one between 1 MiB and 1.125 MiB may pass depending on where it starts) and distinct element,
+    # attribute and namespace names in one part (a few hundred in real parts).
     xml_max_depth: int = 256
     xml_max_attributes: int = 1_000
     xml_max_markup_bytes: int = 2**20
     xml_max_names: int = 10_000
-    xml_max_text_chars: int = 8 * 2**20
+    # The text of one unit in every format (paragraph, cell, shape, page, line) and of one XML text node:
+    # 8 Mi characters (too_large/unit_chars).
+    max_unit_chars: int = 8 * 2**20
     # One HWP PARA_TEXT record (UTF-16LE, 2 bytes per character): 8M characters.
     hwp_max_para_bytes: int = 16 * 2**20
-    # Wall-clock seconds for one file's parse (XML pieces, HWP records, PDF pages); over it is
+    # One file's budget besides text and units (parser resource design §2.3): events (XML events, HWP
+    # records, lines, PDF operators; about 28 s here, so a file is refused by the same code on any
+    # machine before the clock runs out) and the approximate bytes of tables kept until the end of the
+    # parse (shared strings, relationship targets, names).
+    max_events: int = 50_000_000
+    max_held_bytes: int = 128 * 2**20
+    # Wall-clock seconds for one file's parse, the dispatcher's checks included; over it is
     # too_large/parse_time. Unlike every other limit it depends on the machine (see binding 'timeout').
     parse_seconds: float = 60.0
 
@@ -128,7 +141,7 @@ class ParseResult:
 class Parser:
     name: str
     version: str
-    parse: Callable[[bytes, Limits], tuple[list[Unit], str | None]]
+    parse: Callable[..., tuple[list[Unit], str | None]]  # (data, limits, budget)
 
 
 def unit_json(unit: dict) -> str:
@@ -203,23 +216,51 @@ def parse(data: bytes, ext: str, limits: Limits) -> ParseResult:
         return result('ok')  # an empty file is a valid observation with nothing to read
     if len(data) > limits.max_file_bytes:
         return result('too_large', 'file_bytes')
+    from . import _container
+    if (ext.lower() == '.hwp' or ext.lower() in ZIP_EXTENSIONS) and data.startswith(OLE_SIGNATURE):
+        # olefile makes an object per directory entry before anything can be checked: count them first.
+        entries = _container.ole_entries(data, limits.zip_max_entries)
+        if entries is not None and entries > limits.zip_max_entries:
+            return result('too_large', 'ole_entries')
     if mismatch := sniff(data, ext):
         return result(*mismatch)
+    budget = _container.Budget(limits)
     try:
-        units, encoding = parser.parse(data, limits)
+        units, encoding = parser.parse(data, limits, budget)
         units = list(units)
+        problem = _check(units, encoding, limits, budget)
     except ParseFailure as failure:
         return result(failure.status, failure.code)
     except Exception as exc:  # message dropped on purpose: it may quote document text
         return result('failed', EXCEPTION_PREFIX + type(exc).__name__)
-    keys = [_unit_key(unit) for unit in units]
-    if None in keys or not (encoding is None or isinstance(encoding, str)):
-        return result('failed', 'unit_shape_invalid')
-    if len(set(keys)) != len(keys):
-        return result('failed', 'unit_duplicate')
-    if len(units) > limits.max_units:
-        return result('too_large', 'limit_units')
-    if sum(len(unit.text) for unit in units) > limits.max_text_chars:
-        return result('too_large', 'limit_chars')
+    if problem:
+        return result(*problem)
     units = [replace(unit, ordinal=number) for number, unit in enumerate(units, 1)]
     return result('ok', units=units, encoding=encoding)
+
+
+def _check(units: list, encoding, limits: Limits, budget) -> tuple[str, str] | None:
+    """The dispatcher's checks of a parser's result, on the parse's clock (read every 1,024 units).
+    Locators are compared by their digest, so no second copy of every locator is kept."""
+    seen, shape_ok, duplicate, chars = set(), encoding is None or isinstance(encoding, str), False, 0
+    for number, unit in enumerate(units, 1):
+        if not number & 1023:
+            budget.clock()
+        key = _unit_key(unit)
+        if key is None:
+            shape_ok = False
+            continue
+        digest = hashlib.sha256(key.encode('utf-8')).digest()
+        duplicate = duplicate or digest in seen
+        seen.add(digest)
+        chars += len(unit.text)
+    if not shape_ok:
+        return 'failed', 'unit_shape_invalid'
+    if duplicate:
+        return 'failed', 'unit_duplicate'
+    # A second line of defence: every parser charges the budget, so these hold already.
+    if len(units) > limits.max_units:
+        return 'too_large', 'limit_units'
+    if chars > limits.max_text_chars:
+        return 'too_large', 'limit_chars'
+    return None

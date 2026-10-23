@@ -48,7 +48,7 @@ MODULE_IMPORTS = {
     'parsers/_container.py': frozenset({'zipfile', 'xml.parsers.expat', 'olefile', 'time'}),
     'parsers/text.py': frozenset({'csv'}),
     'parsers/eml.py': frozenset({'email.policy', 'email.parser.BytesParser', 'html.parser.HTMLParser'}),
-    'parsers/pdf.py': frozenset({'logging', 'pypdf.PdfReader', 'pypdf.errors.PdfReadError'}),
+    'parsers/pdf.py': frozenset({'logging', 'pypdf.PdfReader', 'pypdf.errors.PdfReadError', 'pypdf.errors.LimitReachedError'}),
     'parsers/hwp.py': frozenset({'struct', 'zlib', 'olefile'}),
 }
 FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'})}  # inside function bodies only

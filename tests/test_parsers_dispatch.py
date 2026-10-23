@@ -18,10 +18,10 @@ from workmcp.parsers import Limits, ParseFailure, Parser, ParseResult, Unit
 PYPDF = importlib.metadata.version('pypdf')
 OLEFILE = importlib.metadata.version('olefile')
 EXPECTED_PARSERS = {
-    '.txt': ('text', 'text-1'), '.md': ('text', 'text-1'), '.csv': ('csv', 'csv-1'),
-    '.pdf': ('pdf', f'pdf-2/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-3'), '.pptx': ('pptx', 'pptx-3'),
-    '.xlsx': ('xlsx', 'xlsx-3'), '.eml': ('eml', 'eml-2'), '.hwp': ('hwp', f'hwp-3/olefile-{OLEFILE}'),
-    '.hwpx': ('hwpx', 'hwpx-3')}
+    '.txt': ('text', 'text-2'), '.md': ('text', 'text-2'), '.csv': ('csv', 'csv-2'),
+    '.pdf': ('pdf', f'pdf-3/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-4'), '.pptx': ('pptx', 'pptx-4'),
+    '.xlsx': ('xlsx', 'xlsx-4'), '.eml': ('eml', 'eml-3'), '.hwp': ('hwp', f'hwp-4/olefile-{OLEFILE}'),
+    '.hwpx': ('hwpx', 'hwpx-4')}
 SIGNED = {'.pdf': b'%PDF-1.4\n', '.docx': b'PK\x03\x04', '.pptx': b'PK\x03\x04', '.xlsx': b'PK\x05\x06',
           '.hwpx': b'PK\x03\x04'}
 
@@ -126,7 +126,7 @@ def test_ooxml_encryption_is_judged_by_the_stream_whatever_the_extension():
 
 def test_signature_mismatch_is_reported_without_calling_the_parser(monkeypatch):
     called = []
-    fake(monkeypatch, lambda data, limits: called.append(1) or ([], None))
+    fake(monkeypatch, lambda data, limits, budget: called.append(1) or ([], None))
     result = parsers.parse(b'not a pdf', '.pdf', Limits())
     assert (result.status, result.error, called) == ('unsupported', 'pdf_bad_signature', [])
 
@@ -140,7 +140,7 @@ def fake(monkeypatch, parse, name='fake', version='fake-1'):
 
 
 def test_ordinals_are_renumbered_and_units_kept(monkeypatch):
-    fake(monkeypatch, lambda data, limits: ([line(7, '첫 줄'), line(9, 'second')], 'utf-8'))
+    fake(monkeypatch, lambda data, limits, budget: ([line(7, '첫 줄'), line(9, 'second')], 'utf-8'))
     result = parsers.parse(b'synthetic', '.txt', Limits())
     assert result.status == 'ok' and result.error is None and result.encoding == 'utf-8'
     assert result.units == (Unit(1, 'line', {'kind': 'line', 'line': 7}, '첫 줄'),
@@ -162,7 +162,7 @@ def test_ordinals_are_renumbered_and_units_kept(monkeypatch):
     ('line', 1, 'not a Unit'),
 ], ids=lambda value: repr(value)[:40])
 def test_bad_units_are_never_returned(monkeypatch, bad):
-    fake(monkeypatch, lambda data, limits: ([line(1, 'good'), bad], None))
+    fake(monkeypatch, lambda data, limits, budget: ([line(1, 'good'), bad], None))
     result = parsers.parse(b'synthetic', '.txt', Limits())
     assert (result.status, result.error, result.units) == ('failed', 'unit_shape_invalid', ())
 
@@ -171,20 +171,55 @@ def test_two_units_with_one_locator_are_refused(monkeypatch):
     """Review M1-L8: binding and the locator check find a unit by its locator, so one version must not repeat one."""
     twice = [Unit(1, 'section_para', {'kind': 'section_para', 'section': 1, 'index': 1}, 'first'),
              Unit(2, 'section_para', {'index': 1, 'section': 1, 'kind': 'section_para'}, 'second')]  # same unit_json
-    fake(monkeypatch, lambda data, limits: (twice, None))
+    fake(monkeypatch, lambda data, limits, budget: (twice, None))
     result = parsers.parse(b'synthetic', '.txt', Limits())
     assert (result.status, result.error, result.units) == ('failed', 'unit_duplicate', ())
-    fake(monkeypatch, lambda data, limits: ([twice[0], replace(twice[1], unit={**twice[1].unit, 'index': 2})], None))
+    fake(monkeypatch, lambda data, limits, budget: ([twice[0], replace(twice[1], unit={**twice[1].unit, 'index': 2})], None))
+    assert parsers.parse(b'synthetic', '.txt', Limits()).status == 'ok'
+
+
+def test_dispatcher_post_processing_is_inside_the_clock(monkeypatch):
+    """R2 (review v3 M1-5): the checks after the parser ran with no clock (250 s for 199,999 units of one
+    huge shared string). Now they read the parse's clock every 1,024 units."""
+    units = [line(n, 'x') for n in range(1, 10_001)]
+    fake(monkeypatch, lambda data, limits, budget: (units, None))
+    assert parsers.parse(b'synthetic', '.txt', Limits()).status == 'ok'
+    reads = []
+
+    def clock(self):
+        reads.append(1)
+        raise ParseFailure('too_large', 'parse_time')
+    monkeypatch.setattr(_container.Budget, 'clock', clock)
+    result = parsers.parse(b'synthetic', '.txt', Limits())
+    assert (result.status, result.error, result.units) == ('too_large', 'parse_time', ()) and reads == [1]
+
+
+def test_dispatcher_dedupes_by_digest(monkeypatch):
+    """R3: duplicate locators are found by their digest; no list or set of locator strings is kept
+    (1,000-column CSV locators are about 5 KB each)."""
+    import tracemalloc
+    columns = list(range(1, 1001))
+    units = [Unit(n, 'cell', {'kind': 'cell', 'row': n, 'columns': columns}, 'x') for n in range(1, 5_001)]
+    fake(monkeypatch, lambda data, limits, budget: (units + [units[0]], None))
+    parsers.parse(b'warm up', '.md', Limits())
+    tracemalloc.start()
+    try:
+        result = parsers.parse(b'synthetic', '.txt', Limits())
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert (result.status, result.error) == ('failed', 'unit_duplicate') and peak < len(units) * 300  # about 200 B a unit, was 5 KB
+    fake(monkeypatch, lambda data, limits, budget: (units, None))
     assert parsers.parse(b'synthetic', '.txt', Limits()).status == 'ok'
 
 
 def test_encoding_must_be_text_or_none(monkeypatch):
-    fake(monkeypatch, lambda data, limits: ([line(1, 'good')], b'utf-8'))
+    fake(monkeypatch, lambda data, limits, budget: ([line(1, 'good')], b'utf-8'))
     assert parsers.parse(b'synthetic', '.txt', Limits()).error == 'unit_shape_invalid'
 
 
 def test_unit_and_text_limits(monkeypatch):
-    fake(monkeypatch, lambda data, limits: ([line(n, 'x' * 10) for n in range(1, 4)], None))
+    fake(monkeypatch, lambda data, limits, budget: ([line(n, 'x' * 10) for n in range(1, 4)], None))
     assert parsers.parse(b'synthetic', '.txt', Limits(max_units=3)).status == 'ok'
     over_units = parsers.parse(b'synthetic', '.txt', Limits(max_units=2))
     over_chars = parsers.parse(b'synthetic', '.txt', Limits(max_text_chars=29))
@@ -194,7 +229,7 @@ def test_unit_and_text_limits(monkeypatch):
 
 
 def test_parse_failure_passes_through(monkeypatch):
-    def parse(data, limits):
+    def parse(data, limits, budget):
         raise ParseFailure('encrypted', 'pdf_encrypted')
     fake(monkeypatch, parse)
     result = parsers.parse(b'%PDF-1.4', '.pdf', Limits())
@@ -203,7 +238,7 @@ def test_parse_failure_passes_through(monkeypatch):
 
 def test_other_exceptions_keep_only_the_class_name(monkeypatch):
     """Library messages may quote document text; only the class name is kept."""
-    def parse(data, limits):
+    def parse(data, limits, budget):
         raise RuntimeError(f'cannot read {SENTINEL} near offset 12')
     fake(monkeypatch, parse)
     result = parsers.parse(b'synthetic', '.txt', Limits())
@@ -212,12 +247,12 @@ def test_other_exceptions_keep_only_the_class_name(monkeypatch):
 
 
 def test_parser_returning_the_wrong_shape_is_a_failure(monkeypatch):
-    fake(monkeypatch, lambda data, limits: [line(1, 'units without encoding')])
+    fake(monkeypatch, lambda data, limits, budget: [line(1, 'units without encoding')])
     assert parsers.parse(b'synthetic', '.txt', Limits()).error.startswith('exception:')
 
 
 def test_dispatch_is_deterministic(monkeypatch):
-    fake(monkeypatch, lambda data, limits: ([line(n, f'{SENTINEL} {n}') for n in (3, 1, 2)], 'cp949'))
+    fake(monkeypatch, lambda data, limits, budget: ([line(n, f'{SENTINEL} {n}') for n in (3, 1, 2)], 'cp949'))
     first, second = (parsers.parse(b'synthetic', '.txt', Limits()) for _ in range(2))
     assert first == second
 
@@ -257,8 +292,9 @@ def test_limits_defaults_follow_the_design():
                               xlsx_max_sheets=1_000, eml_max_parts=1_000, hwp_max_sections=1_000,
                               zip_max_entries=10_000, zip_max_part_bytes=128 * 2**20,
                               zip_max_total_bytes=512 * 2**20, xml_max_depth=256, xml_max_attributes=1_000,
-                              xml_max_markup_bytes=2**20, xml_max_names=10_000, xml_max_text_chars=8 * 2**20,
-                              hwp_max_para_bytes=16 * 2**20, parse_seconds=60.0)
-    assert Limits().xml_max_text_chars == Limits().hwp_max_para_bytes // 2  # one unit's text, the same in every format
+                              xml_max_markup_bytes=2**20, xml_max_names=10_000, max_unit_chars=8 * 2**20,
+                              hwp_max_para_bytes=16 * 2**20, max_events=50_000_000,
+                              max_held_bytes=128 * 2**20, parse_seconds=60.0)
+    assert Limits().max_unit_chars == Limits().hwp_max_para_bytes // 2  # one unit's text, the same in every format
     with pytest.raises(AttributeError):
         Limits().max_units = 1  # frozen

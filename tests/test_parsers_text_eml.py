@@ -1,5 +1,10 @@
 """TXT/MD/CSV and EML parsers (design M1 §5.7, §5.8, §11 ③). Documents are generated, never committed."""
+import csv
+import gc
+import io
+import random
 import re
+import tracemalloc
 from email import policy
 from email.parser import BytesParser
 
@@ -7,7 +12,7 @@ import pytest
 
 from fixtures import LINES_KO, RESERVED_DOMAINS, SENTINEL, SENTINEL_ASCII, Expected, make_eml, make_text
 from workmcp import locator, parsers
-from workmcp.parsers import Limits, eml, text
+from workmcp.parsers import Limits, _container, eml, text
 
 TEXT_CASES = {item.rel_path: (item, data) for item, data in make_text.build()}
 EML_CASES = {item.rel_path: (item, data) for item, data in make_eml.build()}
@@ -208,7 +213,7 @@ def test_parsers_are_deterministic(rel_path):
 @pytest.mark.parametrize('rel_path', sorted(path for path, (item, _) in ALL_CASES.items() if item.status == 'ok'))
 def test_every_unit_passes_locator_check_unit(rel_path):
     item, data = ALL_CASES[rel_path]
-    units, _ = parsers.parser_for(ext_of(rel_path)).parse(data, Limits()) if data else ([], None)
+    units, _ = parsers.parser_for(ext_of(rel_path)).parse(data, Limits(), _container.Budget(Limits())) if data else ([], None)
     assert len(units) == item.unit_count
     for unit in units:
         assert locator.check_unit(unit.unit) == unit.unit
@@ -219,3 +224,116 @@ def test_parser_versions_follow_the_format():
     for ext, name in (('.txt', 'text'), ('.md', 'text'), ('.csv', 'csv'), ('.eml', 'eml')):
         parser = parsers.parser_for(ext)
         assert parser.name == name and re.fullmatch(rf'{name}-[1-9][0-9]*', parser.version)
+
+
+# Parser resource design §3.9, §3.10 (budget charges)
+def peak_of(data: bytes, ext: str, limits: Limits):
+    parsers.parse(b'warm up', '.txt', Limits())
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = parsers.parse(data, ext, limits)
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_lines_are_the_same_as_splitting_the_whole_text():
+    """The block reader gives exactly the lines of one split, line breaks of every kind across block cuts."""
+    noise = random.Random(5)
+    budget = _container.Budget(Limits())
+    for _ in range(30):
+        pieces = []
+        while sum(map(len, pieces)) < 300_000:
+            pieces.append('x' * noise.choice([0, 1, 5, 70_000, 140_000]) + noise.choice(['\n', '\r', '\r\n', '']))
+        body = ''.join(pieces)
+        assert list(text.lines(body, Limits(), budget)) == list(enumerate(re.split(r'\r\n|\r|\n', body), 1))
+        with_ends = list(text._lines_with_ends(body, Limits(), budget, [0]))
+        assert ''.join(with_ends) == body and with_ends == list(io.StringIO(body, newline=''))
+    assert list(text.lines('', Limits(), budget)) == [(1, '')]
+
+
+def test_csv_rows_are_the_same_as_reading_the_whole_text():
+    noise = random.Random(7)
+    cells = ['a', '', ' b ', '"q"', 'x,y', 'line\nbreak', 'cr\rbreak', 'crlf\r\nbreak', '가나다', 'z' * 70_000]
+    for _ in range(20):
+        rows = [[noise.choice(cells) for _ in range(noise.randrange(1, 6))] for _ in range(noise.randrange(1, 40))]
+        out = io.StringIO()
+        csv.writer(out, lineterminator=noise.choice(['\n', '\r\n', '\r'])).writerows(rows)
+        body = out.getvalue()
+        lines = text._lines_with_ends(body, Limits(), _container.Budget(Limits()), [0])
+        assert list(csv.reader(lines)) == list(csv.reader(io.StringIO(body, newline='')))
+
+
+def test_text_lines_are_lazy():
+    """R18 (N4): every line was split into one list before the unit limit was checked (100 MiB of line
+    breaks: 100 M list entries, 800 MiB). Lines are now read 64 Ki characters at a time and are events:
+    1 M empty lines stop at 1,000 events with a peak of about the decoded text."""
+    data = b'\n' * 2**20
+    result, peak = peak_of(data, '.txt', Limits(max_events=1_000))
+    assert (result.status, result.error) == ('too_large', 'limit_events') and peak < 2 * 2**20
+    assert parsers.parse(data, '.txt', Limits()).status == 'ok'
+    long_line = b'a' * 3_000 + b'\n' + b'b' * 100
+    assert outcome(long_line, '.txt', Limits(max_unit_chars=2_999)) == ('too_large', 'unit_chars')
+    assert outcome(long_line, '.txt', Limits(max_unit_chars=3_000)) == ('ok', None)
+    huge = b'c' * (2**16 + 10_000)  # a line that runs past the first block cut
+    assert outcome(huge, '.txt', Limits(max_unit_chars=5_000)) == ('too_large', 'unit_chars')
+    assert outcome(huge, '.txt', Limits(max_text_chars=5_000)) == ('too_large', 'limit_chars')
+
+
+def test_csv_columns_are_shared_and_rows_feed_lazily():
+    """R19 (N6, N21): every row made its own ``list(range(1, k + 1))`` (1,000 columns: 29 KB a unit) and
+    the whole text was copied into a StringIO. Rows of one width now share one list; the locators are the
+    same JSON as before."""
+    row = ','.join(f'v{n}' for n in range(100))
+    data = ('\n'.join([row] * 1_000) + '\n').encode()
+    result = parsers.parse(data, '.csv', Limits())
+    assert result.status == 'ok' and len(result.units) == 1_000
+    assert len({id(unit.unit['columns']) for unit in result.units}) == 1
+    assert parsers.unit_json(result.units[5].unit) == parsers.unit_json(
+        {'kind': 'cell', 'row': 6, 'columns': list(range(1, 101))})
+    assert outcome(data, '.csv', Limits(max_events=500)) == ('too_large', 'limit_events')
+    quoted = ('"' + 'x\n' * 3_000 + '",b\n').encode()  # one row gathered from 3,001 lines
+    assert outcome(quoted, '.csv', Limits(max_unit_chars=5_000)) == ('too_large', 'unit_chars')
+    assert outcome(quoted, '.csv', Limits(max_unit_chars=7_000)) == ('ok', None)
+
+
+def test_eml_lines_and_html_are_charged():
+    """R20 (N5, N19): mail lines are TXT lines (events, units charged as they are made), and the text the
+    HTML stripper keeps is one event a piece."""
+    lines = ('x\n' * 10_000).encode()
+    message = b'From: a@example.com\nSubject: s\nContent-Type: text/plain\n\n' + lines
+    assert outcome(message, '.eml', Limits(max_units=100)) == ('too_large', 'limit_units')
+    assert outcome(message, '.eml', Limits(max_events=1_000)) == ('too_large', 'limit_events')
+    html = b'From: a@example.com\nSubject: s\nContent-Type: text/html\n\n' + b'<p></p>' * 10_000
+    result = parsers.parse(html, '.eml', Limits())
+    assert result.status == 'ok' and [u.kind for u in result.units] == ['mail_header']
+    assert outcome(html, '.eml', Limits(max_events=5_000)) == ('too_large', 'limit_events')
+    split = b'From: a@example.com\nSubject: s\nContent-Type: text/html\n\n' + b'<p>a &amp; b</p>' * 100_000
+    assert len(split) > 2**20
+    assert parsers.parse(split, '.eml', Limits()).units[1].text == 'a & b'  # fed in pieces, same text
+
+
+def outcome(data: bytes, ext: str, limits: Limits):
+    result = parsers.parse(data, ext, limits)
+    return result.status, result.error
+
+
+def test_eml_lines_are_held_memory_and_the_parser_reads_on_the_clock(monkeypatch):
+    """Probe N5: the message parser keeps every line of a part as a str (100 MiB of one-character lines:
+    +2.5 GiB). The lines are held memory, 64 bytes each, before the message is parsed; the parser reads
+    8 KiB at a time with the clock read on every read."""
+    message = b'From: a@example.com\nSubject: s\nContent-Type: text/plain\n\n' + b'x\r\n' * 4_000
+    assert outcome(message, '.eml', Limits(max_held_bytes=200_000)) == ('too_large', 'limit_memory')
+    assert outcome(message, '.eml', Limits(max_held_bytes=400_000)) == ('ok', None)
+    reads = []
+    original = eml._Reader.read1
+
+    def read1(self, size=-1):
+        reads.append(size)
+        return original(self, size)
+    monkeypatch.setattr(eml._Reader, 'read1', read1)
+    big = message + b'y' * 100_000 + b'\n'
+    assert outcome(big, '.eml', Limits()) == ('ok', None) and len(reads) > 5
+    assert outcome(big, '.eml', Limits(max_unit_chars=99_999)) == ('too_large', 'unit_chars')  # one raw line
+    assert outcome(message, '.eml', Limits(max_events=4_000)) == ('too_large', 'limit_events')
