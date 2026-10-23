@@ -16,6 +16,8 @@
 - Install (uv, Python 3.12 user-level): `uv venv --python 3.12` then `uv sync --frozen`
 - Tests: `uv run pytest -q`
 - Environment check: `uv run workmcp doctor` (data home rules, Python, mcp, SQLite/FTS5, model files)
+- Collect: `uv run workmcp scan [--root PATH ...] [--retry-failed] [--reparse] [--rehash]` (roots from `<home>\config.toml` `[[sources]]`, or `--root` once; exit 0 done, 2 data home, 3 scan lock held, 4 sources/settings). In development only tmp folders of synthetic files, never a real document folder.
+- Binding check: `uv run workmcp verify [--root PATH ...] [--doc ID ...]` (exit 0 ok, 1 failures); roots and their state: `uv run workmcp sources`
 - Run the stdio MCP server: `uv run workmcp serve` (or `.venv\Scripts\python.exe -m workmcp serve`)
 - Pip alternative (no uv): `python -m venv .venv`, `.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock.txt`, then `.venv\Scripts\python.exe -m pip install --no-deps -e .` (offline, e.g. the company PC: add `--no-build-isolation` after installing the pinned `setuptools` wheel)
 - After changing dependencies: `uv lock`, `uv sync --frozen`, `uv export --format requirements-txt --hashes --no-emit-project -o requirements.lock.txt`

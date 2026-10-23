@@ -7,10 +7,8 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT
 - ``probe``: positive control. Tries a non-loopback connect, a name lookup and a process start
   (all blocked by the hook before they happen) and one loopback socket pair (allowed); then,
   with a probe folder as the source root, a write and a delete inside it (both blocked).
-- ``scan ROOT``: source-read audit with ROOT as the source root. Stage-0 body (the collector
-  does not exist yet): read every file under ROOT once and pass it to ``parsers.parse``. M1
-  stage 1 replaces the body with ``config.validate_root`` -> ``collect.scan`` ->
-  ``binding.verify`` -> a second ``collect.scan``; the hook and the judgement stay as they are.
+- ``scan ROOT``: source-read audit with ROOT as the source root: ``config.validate_root`` ->
+  ``collect.scan`` -> ``binding.verify`` -> a second ``collect.scan`` (must be all unchanged).
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
 ::1), no name resolution and no process creation. Loopback is allowed only because the
@@ -196,20 +194,32 @@ def probe() -> dict:
 
 
 def scan(root: Path) -> dict:
-    """Stage-0 body: read each file under ``root`` once ('rb') and dispatch it to the parsers."""
-    from workmcp import parsers
-    statuses: dict[str, int] = {}
-    files = 0
-    for path in sorted(root.rglob('*')):
-        if not path.is_file() or path.suffix.lower() not in parsers.SUPPORTED_EXTENSIONS:
-            continue
-        with open(path, 'rb') as handle:
-            data = handle.read()
-        result = parsers.parse(data, path.suffix, parsers.Limits())
-        key = f'{result.status}/{result.error}' if result.error else result.status
-        statuses[key] = statuses.get(key, 0) + 1
-        files += 1
-    return {'root': str(root), 'files': files, 'statuses': statuses}
+    """``config.validate_root`` -> ``collect.scan`` -> ``binding.verify`` -> a second ``collect.scan``.
+
+    The data home (``WORKMCP_HOME``) is outside ``root``, so store and lock writes are not source
+    writes. Returns the two scans' totals and the binding summary (counts only, no text).
+    """
+    from workmcp import binding, collect, config, paths, store
+    home = paths.ensure_home(paths.resolve_home())
+    settings = config.load(home).scan
+    path, warnings = config.validate_root(str(root), home, paths.find_repo_root())
+    spec = config.RootSpec(path, str(root), warnings=warnings)
+    lock, _ = store.acquire_scan_lock(home)
+    try:
+        db = store.open_home(home)
+        try:
+            ids = config.sync_roots(db, [spec], from_config=False)
+            first = collect.scan(db, [(ids[spec.key], spec)], settings, partial=True)
+            report = binding.verify(db, limits=settings.limits)
+            second = collect.scan(db, [(ids[spec.key], spec)], settings, partial=True)
+            statuses = dict(db.execute("SELECT parse_status || COALESCE('/' || parse_error, ''), COUNT(*) "
+                                       "FROM versions GROUP BY 1").fetchall())
+        finally:
+            db.close()
+    finally:
+        store.release_scan_lock(lock)
+    return {'root': str(root), 'first': first['total'], 'second': second['total'], 'statuses': statuses,
+            'verify': {'ok': report['ok'], 'versions': report['versions'], 'units': report['units']}}
 
 
 def main(argv) -> int:

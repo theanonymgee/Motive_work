@@ -40,6 +40,9 @@ COMMON_IMPORTS = frozenset({'__future__', 'argparse', 'collections.abc', 'datacl
 # M1 parsers: the exact import lines of design M1 §8.1 (zip/XML/OLE/PDF/mail only where they are read).
 MODULE_IMPORTS = {
     'server.py': frozenset({'mcp.server.MCPServer'}),
+    'config.py': frozenset({'tomllib'}),
+    'collect.py': frozenset({'fnmatch'}),
+    'cli.py': frozenset({'logging'}),
     'parsers/_container.py': frozenset({'zipfile', 'xml.etree.ElementTree', 'olefile'}),
     'parsers/text.py': frozenset({'csv'}),
     'parsers/eml.py': frozenset({'email.policy', 'email.parser.BytesParser', 'html.parser.HTMLParser'}),
@@ -263,7 +266,8 @@ def test_package_has_sources():
     assert {rel(p) for p in package_sources()} >= {
         '__init__.py', '__main__.py', 'cli.py', 'paths.py', 'store.py', 'locator.py', 'models.py', 'tools.py',
         'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
-        'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py'}
+        'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py',
+        'config.py', 'collect.py', 'binding.py'}
 
 
 # 1
@@ -452,6 +456,18 @@ def test_parser_libraries_are_allowed_only_in_their_modules():
     assert violations('parsers/eml.py', 'import email.utils\nemail.utils.make_msgid()\n')
 
 
+def test_m1_collector_imports_are_allowed_only_in_their_modules():
+    assert violations('config.py', 'import tomllib\n') == []
+    assert violations('collect.py', 'import fnmatch\n') == []
+    assert violations('cli.py', 'import logging\nlogging.FileHandler("x.log", encoding="utf-8")\n') == []
+    assert violations('collect.py', 'import tomllib\n')
+    assert violations('binding.py', 'import fnmatch\n')
+    assert violations('collect.py', 'import logging\n')  # events go to a callback; the CLI logs
+    assert violations('cli.py', 'import logging.handlers\n')
+    assert violations('collect.py', 'import shutil\n')
+    assert violations('binding.py', 'import tempfile\n')
+
+
 def test_server_may_use_mcp_but_not_other_transports():
     assert violations('server.py', 'from mcp.server import MCPServer\nserver.run(transport="stdio")\n') == []
     assert violations('server.py', 'server.run(transport="sse")')
@@ -486,7 +502,8 @@ def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
     _, report = run_wrapper(tmp_path, 'imports')
     assert {'workmcp.server', 'workmcp.models', 'workmcp.tools', 'workmcp.parsers', 'workmcp.parsers._container',
             'workmcp.parsers.text', 'workmcp.parsers.eml', 'workmcp.parsers.docx', 'workmcp.parsers.pptx',
-            'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp'} <= set(report['modules'])
+            'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp', 'workmcp.config', 'workmcp.collect',
+            'workmcp.binding'} <= set(report['modules'])
     # the parser libraries really were imported under the hook (their import side effects are audited)
     assert {'pypdf', 'olefile', 'xml.etree.ElementTree', 'zipfile', 'email.parser'} <= set(report['loaded'])
     assert [e for e in report['events'] if e['violation']] == []

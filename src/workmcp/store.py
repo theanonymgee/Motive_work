@@ -14,8 +14,10 @@ change is a new migration.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .paths import db_path
@@ -163,6 +165,11 @@ CREATE TABLE scans(id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at
 # (version, name, sql). Never edit an applied entry; append a new one.
 MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1)]
 
+LOCK_NAME = 'scan.lock'
+STALE_LOCK_AGE = timedelta(hours=24)
+DEV_SCHEMA_HINT = ('development schema change: delete {db} and scan again (only before the first real install, '
+                   'design M1 §10.1)')
+
 FTS_SQL = ("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
            "text, content='chunks', content_rowid='id', tokenize='trigram')")
 
@@ -248,3 +255,81 @@ def open_read(home: Path) -> sqlite3.Connection:
     db = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True, isolation_level=None)
     db.execute('PRAGMA busy_timeout=5000')
     return db
+
+
+def migration_checksum(version: int) -> str:
+    sql = next(sql for number, _, sql in MIGRATIONS if number == version)
+    return hashlib.sha256(sql.encode('utf-8')).hexdigest()
+
+
+def schema_changed(error: Exception) -> bool:
+    """The migration refused a store made from an earlier edit of schema v1."""
+    return isinstance(error, RuntimeError) and 'checksum changed' in str(error)
+
+
+class ScanLocked(Exception):
+    """Another scan holds ``scan.lock`` (exit code 3)."""
+
+
+def scan_lock_path(home: Path) -> Path:
+    return Path(home)/LOCK_NAME
+
+
+def _lock_started(path: Path) -> datetime | None:
+    """Start time written in the lock, or the file time when the content is unreadable."""
+    try:
+        started = datetime.fromisoformat(json.loads(path.read_text(encoding='utf-8'))['started_at'])
+        return started if started.tzinfo else started.astimezone()
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        return datetime.fromtimestamp(os.stat(path).st_mtime).astimezone()
+    except OSError:
+        return None
+
+
+def acquire_scan_lock(home: Path, at: datetime | None = None) -> tuple[Path, str | None]:
+    """Create ``<home>/scan.lock`` exclusively; ``(path, warning)``. A lock older than 24 hours is
+    removed with a warning; a newer one raises ``ScanLocked``. The process id is recorded but
+    never probed (on Windows ``os.kill(pid, 0)`` terminates the process)."""
+    path = scan_lock_path(home)
+    at = at or datetime.now().astimezone()
+    warning = None
+    for attempt in (1, 2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            started = _lock_started(path)
+            if attempt == 1 and started is not None and at - started > STALE_LOCK_AGE:
+                info = path.read_text(encoding='utf-8', errors='replace')[:200]
+                os.remove(path)
+                warning = f'warning: removed a stale scan lock older than 24 hours ({info.strip()})'
+                continue
+            try:
+                info = json.loads(path.read_text(encoding='utf-8'))
+                holder = f"pid {info.get('pid')}, since {info.get('started_at')}"
+            except (OSError, ValueError, AttributeError):
+                holder = 'unknown holder'
+            raise ScanLocked(f'another scan is running ({holder}); if not, delete {path}') from None
+        try:
+            os.write(fd, json.dumps({'pid': os.getpid(), 'started_at': at.isoformat(timespec='seconds')}).encode())
+        finally:
+            os.close(fd)
+        return path, warning
+    raise ScanLocked(f'cannot take the scan lock {path}')
+
+
+def release_scan_lock(path: Path) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def last_scan(db: sqlite3.Connection) -> dict | None:
+    """Last finished scan for ``status``: ``{at, added, changed, deleted, failed}`` or None."""
+    row = db.execute("SELECT finished_at, counts_json FROM scans WHERE status='done' ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    counts = json.loads(row[1] or '{}').get('total', {})
+    return {'at': row[0], **{key: counts.get(key, 0) for key in ('added', 'changed', 'deleted', 'failed')}}

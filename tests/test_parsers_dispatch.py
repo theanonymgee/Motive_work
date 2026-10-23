@@ -1,7 +1,7 @@
 """Parser dispatch, shared types and the fixed status/code sets (design M1 §5.1-§5.6).
 
-Real parsers come in M1 stage 1; here a fake parser stands in to check what the dispatcher
-guarantees for every format.
+The format parsers are tested by their own files (``test_parsers_*.py``); here only the
+dispatcher contract is checked, with a fake parser standing in where a case needs one.
 """
 import importlib.metadata
 import re
@@ -38,11 +38,15 @@ def test_unsupported_extension_is_a_caller_error(ext):
         parsers.parser_for(ext)
 
 
-@pytest.mark.parametrize('ext', sorted(set(EXPECTED_PARSERS) - {'.hwp'}))
-def test_stubs_report_not_implemented(ext):
-    result = parsers.parse(SIGNED.get(ext, b'synthetic'), ext, Limits())
+@pytest.mark.parametrize('ext', sorted(EXPECTED_PARSERS))
+def test_every_parser_turns_junk_into_a_fixed_status(ext):
+    """Signed but truncated or random bytes: a ParseResult with a fixed code, never an exception."""
+    result = parsers.parse(SIGNED.get(ext, b'synthetic \xff\xfe junk'), ext, Limits())
     name, version = EXPECTED_PARSERS[ext]
-    assert result == ParseResult(name, version, None, 'failed', 'not_implemented', ())
+    assert (result.parser, result.parser_version) == (name, version)
+    assert result.status in parsers.PARSE_STATUSES
+    assert result.error is None if result.status == 'ok' else parsers.is_error_code(result.status, result.error)
+    assert result.error != 'not_implemented'
 
 
 @pytest.mark.parametrize('ext', sorted(EXPECTED_PARSERS))
@@ -54,7 +58,8 @@ def test_empty_file_is_ok_with_no_units(ext):
 def test_file_size_limit():
     result = parsers.parse(b'12345', '.txt', Limits(max_file_bytes=4))
     assert (result.status, result.error, result.units) == ('too_large', 'file_bytes', ())
-    assert parsers.parse(b'1234', '.txt', Limits(max_file_bytes=4)).error == 'not_implemented'
+    at_limit = parsers.parse(b'1234', '.txt', Limits(max_file_bytes=4))
+    assert (at_limit.status, [unit.text for unit in at_limit.units]) == ('ok', ['1234'])
 
 
 OLE_JUNK = parsers.OLE_SIGNATURE + b'\x00' * 1024

@@ -1,9 +1,10 @@
-"""Sources stay read-only (design M1 §4). Stage 0: the source-write judgement and its positive
-controls, the ``scan`` audit mode skeleton, and the expat amplification guard.
+"""Sources stay read-only (design M1 §4).
 
-M1 stage 1 adds ``test_scan_and_verify_never_write_to_sources`` (the collector under the hook)
-and ``test_collector_and_parsers_have_no_write_api`` (static check) here.
+Runtime: the source-write judgement with its positive controls, and the real collector, binding
+check and a second (incremental) scan under the audit hook. Static: no write API in the modules
+that touch sources. Plus the expat amplification guard.
 """
+import ast
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import pyexpat
 import pytest
 
 import _audited_server
-from fixtures import LINES_EN, LINES_KO, SENTINEL
+from fixtures import SENTINEL, make_text
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = Path(__file__).resolve().parent/'_audited_server.py'
@@ -90,45 +91,155 @@ def fingerprint(root: Path) -> dict:
     return state
 
 
-def write_synthetic_sources(root: Path) -> None:
-    (root/'docs').mkdir(parents=True)
-    (root/'docs'/'notes.txt').write_bytes('\n'.join(LINES_KO).encode('utf-8'))
-    (root/'docs'/'readme.md').write_bytes('\r\n'.join(LINES_EN).encode('utf-8'))
-    (root/'docs'/'table.csv').write_bytes(f'항목,값\n{SENTINEL},1\n'.encode('cp949'))
-    (root/'docs'/'paper.pdf').write_bytes(b'%PDF-1.4\n%synthetic\n')
-    (root/'docs'/'renamed.docx').write_bytes(b'not a zip')
-    (root/'docs'/'ignored.png').write_bytes(b'\x89PNG synthetic')
+def write_synthetic_sources(root: Path) -> list:
+    """TXT/CSV bundle (stage 1) plus files the collector must leave alone."""
+    expected = make_text.write(root)
+    (root/'node_modules').mkdir()
+    (root/'node_modules'/'x.txt').write_bytes(SENTINEL.encode('utf-8'))
+    (root/'docs'/'~$lock.docx').write_bytes(b'synthetic office lock')
+    (root/'docs'/'image.png').write_bytes(b'\x89PNG synthetic')
+    return expected
 
 
-def test_scan_mode_reads_sources_without_writing(tmp_path):
-    """Stage-0 skeleton: the hook sees every source read as mode 'r' and nothing else under the root."""
+def test_scan_and_verify_never_write_to_sources(tmp_path):
+    """Design §4.3 (a)-(f): the collector, the binding check and a second scan under the audit hook."""
     source = tmp_path/'src'
-    write_synthetic_sources(source)
+    expected = write_synthetic_sources(source)                                      # (a)
     files = [p for p in source.rglob('*') if p.is_file()]
     for path in files:
         os.chmod(path, stat.S_IREAD)  # extra belt: any write would also fail at the OS level
     try:
-        before = fingerprint(source)
+        before = fingerprint(source)                                                # (b)
         log = tmp_path/'audit-scan.json'
         env = {**os.environ, 'WORKMCP_HOME': str(tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
         run = subprocess.run([sys.executable, str(WRAPPER), str(log), 'scan', str(source)], env=env, cwd=tmp_path,
                              capture_output=True, text=True, encoding='utf-8', timeout=120)
-        assert run.returncode == 0, run.stderr
+        assert run.returncode == 0, run.stderr                                      # (c)
         report = json.loads(log.read_text(encoding='utf-8'))
-        assert fingerprint(source) == before
+        assert fingerprint(source) == before                                        # (e)
     finally:
         for path in files:
             os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
     assert report['completed'] is True
-    assert report['files'] == 5  # .png is not a supported extension
-    assert report['statuses'] == {'failed/not_implemented': 4, 'unsupported/bad_signature': 1}
+    supported = len(expected)
+    first, second = report['first'], report['second']
+    assert (first['seen'], first['added'], first['excluded'], first['ignored']) == (supported, supported, 2, 1)
+    assert second['seen'] == second['unchanged'] == supported                       # incremental: nothing re-read
+    assert all(second[key] == 0 for key in ('added', 'changed', 'touched', 'restored', 'deleted', 'unstable',
+                                            'reparsed', 'new_versions', 'units'))
+    oks = sum(1 for item in expected if item.status == 'ok')
+    assert report['statuses'] == {'ok': oks, 'failed/binary_content': 1, 'failed/encoding_unknown': 1}
+    verify = report['verify']
+    assert verify['ok'] and verify['versions']['ok'] == oks
+    assert verify['units']['bound'] == verify['units']['total'] == sum(item.unit_count for item in expected) > 0
     events = report['events']
-    assert [e for e in events if e['violation']] == []
+    assert [e for e in events if e['violation']] == []                              # (d) no write was attempted
     reads = [e for e in events if e.get('source') and e['event'] == 'open']
-    assert len(reads) >= 5
+    assert len(reads) >= supported + oks                                            # the hook really saw the reads
     assert all(", 'r', " in e['detail'] for e in reads), reads
-    assert not [e for e in events if e['event'].startswith(_audited_server.PROCESS_EVENTS)]
+    assert not [e for e in events if 'node_modules' in e['detail'] or '~$lock' in e['detail']]
+    assert not [e for e in events if e['event'].startswith(_audited_server.PROCESS_EVENTS)]   # (f)
+    assert not [e for e in events if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
     assert SENTINEL not in run.stdout + run.stderr
+
+
+# Static layer (design §4.2): no write API in the modules that touch sources.
+READONLY_MODULES = ('collect.py', 'binding.py', 'parsers')
+WRITE_NAMES = frozenset({'write_text', 'write_bytes', 'touch', 'unlink', 'rename', 'rmdir', 'mkdir', 'makedirs',
+                         'removedirs', 'chmod', 'utime', 'truncate', 'link', 'symlink', 'copyfile', 'copy2',
+                         'copytree', 'move', 'rmtree', 'mkstemp', 'mkdtemp', 'NamedTemporaryFile', 'TemporaryFile',
+                         'write', 'fdopen', 'FileIO'})
+OS_WRITE_CALLS = frozenset({'os.remove', 'os.replace', 'os.open', 'os.renames', 'os.lchmod', 'os.chown', 'os.lchown',
+                            'os.chflags', 'os.mkfifo', 'os.mknod', 'os.ftruncate', 'os.write', 'os.startfile'})
+BANNED_IMPORTS = ('shutil', 'tempfile')
+
+
+def _qualify(node, bound):
+    if isinstance(node, ast.Name):
+        return bound.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        base = _qualify(node.value, bound)
+        return f'{base}.{node.attr}' if base else None
+    return None
+
+
+def _open_mode(call: ast.Call):
+    for keyword in call.keywords:
+        if keyword.arg == 'mode':
+            return keyword.value
+    if isinstance(call.func, ast.Name) or len(call.args) > 1:  # open(path, mode), zip.open(name, mode)
+        return call.args[1] if len(call.args) > 1 else None
+    return call.args[0] if call.args else None                  # Path(p).open(mode)
+
+
+def write_api_violations(name: str, source: str) -> list[str]:
+    """``name`` is the path relative to the package (``collect.py``, ``parsers/_container.py``)."""
+    tree = ast.parse(source)
+    allowed_modes = {'rb', 'r'} if name == 'parsers/_container.py' else {'rb'}
+    bound, found = {}, []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split('.')[0]
+                bound[alias.asname or top] = alias.name if alias.asname else top
+                if top in BANNED_IMPORTS:
+                    found.append(f'import {alias.name}')
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                bound[alias.asname or alias.name] = f'{node.module}.{alias.name}'
+                if node.level == 0 and (node.module.split('.')[0] in BANNED_IMPORTS
+                                        or f'{node.module}.{alias.name}' in OS_WRITE_CALLS):
+                    found.append(f'from {node.module} import {alias.name}')
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            is_open = (isinstance(func, ast.Name) and func.id == 'open') or (
+                isinstance(func, ast.Attribute) and func.attr == 'open')
+            if is_open and _qualify(func, bound) != 'os.open':  # os.open is reported as an os write call
+                mode = _open_mode(node)
+                if not (isinstance(mode, ast.Constant) and mode.value in allowed_modes):
+                    found.append(f'open without a read-only mode at line {node.lineno}')
+        elif isinstance(node, ast.Attribute):
+            if node.attr in WRITE_NAMES:
+                found.append(f'write API .{node.attr} at line {node.lineno}')
+            elif _qualify(node, bound) in OS_WRITE_CALLS:
+                found.append(f'{_qualify(node, bound)} at line {node.lineno}')
+        elif isinstance(node, ast.Name) and node.id in WRITE_NAMES:
+            found.append(f'write API {node.id} at line {node.lineno}')
+    return found
+
+
+def readonly_sources():
+    package = ROOT/'src'/'workmcp'
+    return sorted(p for p in package.rglob('*.py') if p.relative_to(package).parts[0] in READONLY_MODULES)
+
+
+def test_collector_and_parsers_have_no_write_api():
+    package = ROOT/'src'/'workmcp'
+    names = {p.relative_to(package).as_posix() for p in readonly_sources()}
+    assert {'collect.py', 'binding.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py',
+            'parsers/pdf.py', 'parsers/hwp.py'} <= names
+    offenders = {name: v for p in readonly_sources()
+                 if (v := write_api_violations(name := p.relative_to(package).as_posix(), p.read_text(encoding='utf-8')))}
+    assert offenders == {}
+
+
+@pytest.mark.parametrize('snippet', [
+    'open(p)', "open(p, 'r')", "open(p, 'rb+')", "Path(p).write_bytes(b'')", 'os.remove(p)', 'os.replace(a, b)',
+    'os.open(p, os.O_RDONLY)', 'import shutil',
+    "open(p, mode='w')", "io.open(p, 'wb')", "Path(p).open('a')", 'Path(p).open()', 'p.unlink()', 'p.touch()',
+    'os.utime(p)', 'os.chmod(p, 0o444)', 'import tempfile', 'from os import remove', 'from shutil import copyfile',
+    'handle.write(b"x")', "z.open(name, 'w')", 'mode = "rb"\nopen(p, mode)'])
+def test_write_api_check_flags_every_form(snippet):
+    assert write_api_violations('collect.py', 'import io\nimport os\nfrom pathlib import Path\n' + snippet)
+
+
+def test_write_api_check_accepts_read_only_forms():
+    clean = ("import os\nwith open(p, 'rb') as f:\n    f.read()\nos.stat(p)\nos.scandir(p)\n"
+             "'a'.replace('a', 'b')\n[1].remove(1)\nos.path.join(a, b)\n")
+    assert write_api_violations('collect.py', clean) == []
+    assert write_api_violations('parsers/_container.py', "z.open(info, 'r')\n") == []
+    assert write_api_violations('parsers/docx.py', "z.open(info, 'r')\n")  # 'r' only inside _container
 
 
 def test_expat_has_amplification_protection():

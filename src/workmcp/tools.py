@@ -20,7 +20,7 @@ def error(code: str, message: str, *, retryable: bool = False) -> dict:
 
 
 def status(home: Path) -> dict:
-    """Data home, store counts, model availability and FTS5 support; no source text."""
+    """Data home, store counts, last finished scan, model availability and FTS5 support; no source text."""
     try:
         db = store.open_read(home)
     except FileNotFoundError as exc:
@@ -29,6 +29,7 @@ def status(home: Path) -> dict:
         count = {table: db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
                  for table in ('documents', 'versions', 'chunks', 'chunk_vectors', 'deliveries')}
         schema = db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]
+        last_scan = store.last_scan(db)
     finally:
         db.close()
     result = {
@@ -38,7 +39,7 @@ def status(home: Path) -> dict:
                'vectors': count['chunk_vectors']},
         'model': models.quick_status(models.DEFAULT_MODEL, home),
         'fts5': store.fts5_available(),
-        'last_scan': None,
+        'last_scan': last_scan,
         'delivery_log_count': count['deliveries'],
     }
     return ok(result, notice=['아직 수집(scan)한 적이 없습니다.'] if result['last_scan'] is None else [])
