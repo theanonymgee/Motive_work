@@ -545,6 +545,45 @@ def test_failed_file_is_retried_only_when_asked(db, tmp_path, calls):
     assert len(versions(db, document(db, path)[0])) == 1
 
 
+@pytest.mark.parametrize('code, parser_version, retry_failed, reparse', [
+    ('parse_time', None, True, False),        # the machine was busy: --retry-failed parses it again
+    ('parse_time', 'docx-2', False, True),    # and so does --reparse after a parser version change
+    ('xml_tree', 'docx-2', False, True),      # a code of the old tree parsers: the stream parsers read the part
+])
+def test_retryable_too_large_versions_are_parsed_again_in_place(db, tmp_path, code, parser_version, retry_failed,
+                                                                 reparse):
+    root = add_root(db, tmp_path/'src')
+    path = tmp_path/'src'/'report.docx'
+    path.write_bytes(make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run(SENTINEL))))
+    scan(db, root)
+    doc = document(db, path)[0]
+    db.execute('DELETE FROM units')
+    db.execute("UPDATE versions SET parse_status='too_large', parse_error=?, unit_count=0, text_chars=0, "
+               "parser_version=COALESCE(?, parser_version) WHERE document_id=?", (code, parser_version, doc))
+    assert scan(db, root)['total']['reparsed'] == 0  # without the flag nothing changes
+    other = scan(db, root, retry_failed=not retry_failed, reparse=not reparse) if code == 'xml_tree' else None
+    assert other is None or other['total']['reparsed'] == 0  # xml_tree is not a --retry-failed case
+    result = scan(db, root, retry_failed=retry_failed, reparse=reparse)
+    assert changes(result) == {'reparsed': 1} and result['total']['parsed_ok'] == 1
+    [version] = versions(db, doc)
+    assert version[6:9] == ('ok', None, 1)  # parsed again in place, no new version
+
+
+def test_other_too_large_versions_are_not_parsed_again(db, tmp_path, calls):
+    root = add_root(db, tmp_path/'src')
+    path = tmp_path/'src'/'report.docx'
+    path.write_bytes(make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run(SENTINEL))))
+    scan(db, root)
+    doc = document(db, path)[0]
+    db.execute('DELETE FROM units')
+    db.execute("UPDATE versions SET parse_status='too_large', parse_error='zip_part', unit_count=0, text_chars=0, "
+               "parser_version='docx-2' WHERE document_id=?", (doc,))
+    calls.update(parse=0)
+    result = scan(db, root, retry_failed=True, reparse=True)
+    assert result['total']['reparsed'] == 0 and calls['parse'] == 0
+    assert versions(db, doc)[0][6:9] == ('too_large', 'zip_part', 0)
+
+
 def test_rehash_finds_content_changed_under_the_same_size_and_mtime(db, tmp_path):
     root = text_root(db, tmp_path, lines=['synthetic AAAA'])
     path = tmp_path/'src'/'a.txt'

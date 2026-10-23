@@ -218,7 +218,7 @@ def verify_lines(report: dict) -> list[str]:
         f"verify {report['checked_at']}  versions {v['total']} checked {v['checked']} ok {v['ok']} "
         f"failed {v['failed']}  unverifiable {sum(un.values())} (stale {un['stale']}, missing {un['missing']}, "
         f"locked {un['locked']}, unstable {un['unstable']}, parser {un['parser_version_mismatch']}, "
-        f"not_ok {un['skipped_not_ok']}, placeholder {un['placeholder']})",
+        f"not_ok {un['skipped_not_ok']}, placeholder {un['placeholder']}, timeout {un['timeout']})",
         f"units {u['bound']}/{u['total']} bound ({u['rate'] * 100:.1f}%)  chunks {report['chunks_checked']}  "
         f"evidence {report['evidence_checked']}",
         *report['notice'],

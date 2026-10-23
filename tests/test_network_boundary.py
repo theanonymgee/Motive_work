@@ -45,7 +45,7 @@ MODULE_IMPORTS = {
     'config.py': frozenset({'tomllib'}),
     'collect.py': frozenset({'fnmatch'}),
     'cli.py': frozenset({'logging'}),
-    'parsers/_container.py': frozenset({'zipfile', 'xml.etree.ElementTree', 'olefile'}),
+    'parsers/_container.py': frozenset({'zipfile', 'xml.parsers.expat', 'olefile', 'time'}),
     'parsers/text.py': frozenset({'csv'}),
     'parsers/eml.py': frozenset({'email.policy', 'email.parser.BytesParser', 'html.parser.HTMLParser'}),
     'parsers/pdf.py': frozenset({'logging', 'pypdf.PdfReader', 'pypdf.errors.PdfReadError'}),
@@ -603,7 +603,7 @@ def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
             'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp', 'workmcp.config', 'workmcp.collect',
             'workmcp.binding'} <= set(report['modules'])
     # the parser libraries really were imported under the hook (their import side effects are audited)
-    assert {'pypdf', 'olefile', 'xml.etree.ElementTree', 'zipfile', 'email.parser'} <= set(report['loaded'])
+    assert {'pypdf', 'olefile', 'xml.parsers.expat', 'zipfile', 'email.parser'} <= set(report['loaded'])
     assert [e for e in report['events'] if e['violation']] == []
     assert not [e for e in report['events'] if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
 

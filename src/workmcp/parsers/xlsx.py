@@ -4,20 +4,22 @@ Sheets come in ``xl/workbook.xml`` order (hidden ones too), found through
 ``xl/_rels/workbook.xml.rels``. A cell is one ``sheet_cell`` unit: shared and inline strings are read
 without phonetic runs (``rPh``), numbers, errors and formula results as the stored ``v`` text (no
 number formats: a date stays its serial number), booleans as ``TRUE``/``FALSE``. A formula without a
-cached value and an empty cell give no unit. Sheets and shared strings are read as a stream of element
-events (``_container.iter_xml``) that keeps only the text it needs, so a large sheet never becomes a
-tree. Two sheets with one name or two cells with one address in a sheet would give two units with
-the same locator: such a damaged workbook is ``failed/unit_duplicate``. A Strict Open XML workbook is
-``unsupported/ooxml_strict``.
+cached value and an empty cell give no unit. Every part (workbook, relationships, shared strings,
+sheets) is read as a stream of events (``_container.XmlStream``) that keeps only the text it needs, so
+no part becomes a tree or is held whole; one cell's or shared string's text is at most
+``xml_max_text_chars`` (``too_large/xml_text``). Two sheets with one name or two cells with one address
+in a sheet would give two units with the same locator: such a damaged workbook is
+``failed/unit_duplicate``. A Strict Open XML workbook is ``unsupported/ooxml_strict``.
 """
 from __future__ import annotations
 
 import re
 
 from . import Limits, ParseFailure, Unit, _container
+from ._container import START, TEXT
 
 NAME = 'xlsx'
-VERSION = 'xlsx-2'
+VERSION = 'xlsx-3'
 
 _S = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 _R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
@@ -59,67 +61,93 @@ def _column(letters: str) -> int:
     return number
 
 
-def _rich_owner(path: list):
-    """The ``si``/``is`` whose text a ``t`` with this ``path`` belongs to: its parent, or the parent of its run.
-
-    The ``t`` of a phonetic run (``rPh``) or of anything else has no owner.
-    """
-    parent = path[-1] if path else None
-    if parent is not None and parent.tag in (_SI, _IS):
-        return parent
-    if parent is not None and parent.tag == _RUN and len(path) > 1 and path[-2].tag in (_SI, _IS):
-        return path[-2]
+def _rich_owner(path: list) -> int | None:
+    """Position in ``path`` of the ``si``/``is`` that owns the text of the ``t`` ending ``path``: the
+    ``t``'s parent, or the parent of its run. The ``t`` of a phonetic run (``rPh``) or of anything else
+    has no owner."""
+    if len(path) > 1 and path[-2] in (_SI, _IS):
+        return len(path) - 2
+    if len(path) > 2 and path[-2] == _RUN and path[-3] in (_SI, _IS):
+        return len(path) - 3
     return None
 
 
-def _shared_strings(archive, limits: Limits) -> list[str]:
-    part = _container.read_part(archive, 'xl/sharedStrings.xml', limits, required=False)
+def _shared_strings(archive, limits: Limits, clock, budget) -> list[str]:
+    """Shared strings in order. More of them than ``max_units`` is ``too_large/limit_units`` (Excel keeps
+    only the strings its cells use, so each would be at least one cell unit); their characters count
+    towards ``max_text_chars``."""
+    chunks = _container.part_chunks(archive, 'xl/sharedStrings.xml', limits, required=False)
     strings = []
-    if part is None:
+    if chunks is None:
         return strings
-    texts = {}  # open si -> its text pieces
-    for event, element, path in _container.iter_xml(part):
-        tag = element.tag
-        if event == 'start':
+    stream = _container.XmlStream(chunks, limits, clock)
+    path, most = stream.path, limits.xml_max_text_chars
+    items = []  # open si: [position in path, pieces, chars]
+    for kind, tag, value in stream:
+        if kind is TEXT:
+            if path[-1] == _T and items and _rich_owner(path) == items[-1][0]:
+                item = items[-1]
+                item[1].append(value)
+                item[2] += len(value)
+                if item[2] > most:
+                    raise ParseFailure('too_large', 'xml_text')
+                budget.take(len(value))
+        elif kind is START:
             if tag == _SI:
-                texts[element] = []
+                items.append([len(path), [], 0])
         elif tag == _SI:
-            strings.append(''.join(texts.pop(element)))
-        elif tag == _T:
-            owner = _rich_owner(path)
-            if owner in texts:
-                texts[owner].append(element.text or '')
+            strings.append(''.join(items.pop()[1]))
+            if len(strings) > limits.max_units:
+                raise ParseFailure('too_large', 'limit_units')
     return strings
 
 
-def _sheets(archive, limits: Limits) -> list[tuple[str, str]]:
-    root = _container.parse_xml(_container.read_part(archive, 'xl/workbook.xml', limits), limits)
-    _container.check_root(root, _S + 'workbook')
-    rels = _container.parse_xml(_container.read_part(archive, 'xl/_rels/workbook.xml.rels', limits), limits)
-    targets = {rel.get('Id'): rel.get('Target') for rel in rels.iter(_REL + 'Relationship')}
+def _sheets(archive, limits: Limits, clock) -> list[tuple[str, str]]:
+    """``(name, member)`` of every sheet in workbook order. The relationships part is read after the
+    workbook and keeps only the targets of those sheets."""
+    found, first = [], True
+    for kind, tag, value in _container.XmlStream(_container.part_chunks(archive, 'xl/workbook.xml', limits),
+                                                 limits, clock):
+        if kind is START:
+            if first:
+                _container.check_root(tag, _S + 'workbook')
+                first = False
+            if tag == _S + 'sheet':
+                found.append((value.get('name'), value.get(_R + 'id')))
+                if len(found) > limits.xlsx_max_sheets:
+                    raise ParseFailure('too_large', 'xlsx_count')
+    wanted = {rel_id for _, rel_id in found}
+    targets = {}
+    for kind, tag, value in _container.XmlStream(
+            _container.part_chunks(archive, 'xl/_rels/workbook.xml.rels', limits), limits, clock):
+        if kind is START and tag == _REL + 'Relationship' and value.get('Id') in wanted:
+            targets[value.get('Id')] = value.get('Target')  # a repeated Id: the last one wins
     sheets = []
-    for sheet in root.iter(_S + 'sheet'):
-        target = targets.get(sheet.get(_R + 'id'))
-        if target is None or not sheet.get('name'):
+    for name, rel_id in found:
+        target = targets.get(rel_id)
+        if target is None or not name:
             raise ParseFailure('failed', 'missing_part')
-        sheets.append((sheet.get('name'), _resolve('xl', target)))
+        sheets.append((name, _resolve('xl', target)))
     if len({name for name, _ in sheets}) != len(sheets):
         raise ParseFailure('failed', 'unit_duplicate')
     return sheets
 
 
 class _Cell:
-    """What a ``c`` element gives while it is open: its attributes, first ``v`` and first ``is``."""
-    __slots__ = ('element', 'address', 'kind', 'value', 'inline', 'inline_element')
+    """What a ``c`` element gives while it is open: its attributes, first ``v`` and first ``is``.
 
-    def __init__(self, element):
-        self.element, self.address, self.kind = element, element.get('r'), element.get('t', 'n')
-        self.value, self.inline, self.inline_element = None, None, None
+    ``value_at``/``inline_at`` are the path positions of that ``v``/``is`` while it is open."""
+    __slots__ = ('address', 'kind', 'value', 'value_at', 'inline', 'inline_at', 'chars')
+
+    def __init__(self, attributes):
+        self.address, self.kind = attributes.get('r'), attributes.get('t', 'n')
+        self.value = self.value_at = self.inline = self.inline_at = None
+        self.chars = 0
 
     def text(self, strings: list[str]) -> str:
         if self.kind == 'inlineStr':
             return ''.join(self.inline) if self.inline is not None else ''
-        value = self.value or ''
+        value = ''.join(self.value) if self.value is not None else ''
         if self.kind == 's':
             return strings[int(value)] if value.strip().isdigit() and int(value) < len(strings) else ''
         if self.kind == 'b':
@@ -127,56 +155,73 @@ class _Cell:
         return value
 
 
-def _sheet_units(part, name: str, strings: list[str], units: list, limits: Limits) -> None:
-    pending, row_number, cells, seen = [], 0, [], set()
-    for event, element, path in _container.iter_xml(part):
-        tag = element.tag
-        parent = path[-1] if path else None
+def _sheet_units(chunks, name: str, strings: list[str], units: list, limits: Limits, clock, budget) -> None:
+    stream = _container.XmlStream(chunks, limits, clock)
+    path, most = stream.path, limits.xml_max_text_chars
+    row_number, column, cells, seen = 0, 0, [], set()
+    for kind, tag, value in stream:
         cell = cells[-1] if cells else None
-        if event == 'start':
+        if kind is TEXT:
+            if cell is None:
+                continue
+            if len(path) - 1 == cell.value_at:
+                target = cell.value
+            elif path[-1] == _T and cell.inline_at is not None and _rich_owner(path) == cell.inline_at:
+                target = cell.inline
+            else:
+                continue
+            target.append(value)
+            cell.chars += len(value)
+            if cell.chars > most:
+                raise ParseFailure('too_large', 'xml_text')
+            if cell.kind not in ('s', 'b'):  # a shared string index or a boolean is not kept as text
+                budget.take(len(value))
+            continue
+        parent = path[-1] if path else None
+        if kind is START:
             if tag == _C:
-                cells.append(_Cell(element))
-            elif tag == _IS and cell is not None and parent is cell.element and cell.inline is None:
-                cell.inline, cell.inline_element = [], element
+                cells.append(_Cell(value))
+            elif tag == _ROW:
+                row = value.get('r')
+                row_number = int(row) if row and row.isdigit() else row_number + 1
+                column = 0
+            elif cell is not None and parent == _C:  # a direct child of the innermost open cell
+                if tag == _V and cell.value is None:
+                    cell.value, cell.value_at = [], len(path)
+                elif tag == _IS and cell.inline is None:
+                    cell.inline, cell.inline_at = [], len(path)
             continue
         if tag == _C:
+            # A cell becomes a unit when it ends; one without an address takes the next column of the
+            # current row (the last row started), one with a malformed address gives none.
             cells.pop()
-            pending.append((cell.address, cell.text(strings).strip()))
-        elif tag == _V:
-            if cell is not None and parent is cell.element and cell.value is None:
-                cell.value = element.text or ''
-        elif tag == _T:
-            if cell is not None and cell.inline_element is not None and _rich_owner(path) is cell.inline_element:
-                cell.inline.append(element.text or '')
-        elif tag == _ROW:
-            row = element.get('r')
-            row_number = int(row) if row and row.isdigit() else row_number + 1
-            column = 0
-            for address, text in pending:
-                match = _CELL.fullmatch(address) if address else None
-                if match:
-                    column = _column(match[1])
-                else:
-                    column += 1
-                    match = _CELL.fullmatch(f'{_letters(column)}{row_number}') if address is None else None
-                if text and match:
-                    if match[0] in seen:
-                        raise ParseFailure('failed', 'unit_duplicate')
-                    seen.add(match[0])
-                    unit = {'kind': 'sheet_cell', 'sheet': name, 'cell': match[0]}
-                    units.append(Unit(len(units) + 1, 'sheet_cell', unit, text))
-                    if len(units) > limits.max_units:
-                        raise ParseFailure('too_large', 'limit_units')
-            pending.clear()
+            address, text = cell.address, cell.text(strings).strip()
+            match = _CELL.fullmatch(address) if address else None
+            if match:
+                column = _column(match[1])
+            else:
+                column += 1
+                match = _CELL.fullmatch(f'{_letters(column)}{row_number}') if address is None else None
+            if text and match:
+                if match[0] in seen:
+                    raise ParseFailure('failed', 'unit_duplicate')
+                seen.add(match[0])
+                units.append(Unit(len(units) + 1, 'sheet_cell', {'kind': 'sheet_cell', 'sheet': name,
+                                                                 'cell': match[0]}, text))
+                if len(units) > limits.max_units:
+                    raise ParseFailure('too_large', 'limit_units')
+        elif tag == _V and cell is not None and cell.value_at == len(path):
+            cell.value_at = None
+        elif tag == _IS and cell is not None and cell.inline_at == len(path):
+            cell.inline_at = None
 
 
 def parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
     archive = _container.open_zip(data, limits)
-    sheets = _sheets(archive, limits)
-    if len(sheets) > limits.xlsx_max_sheets:
-        raise ParseFailure('too_large', 'xlsx_count')
-    strings = _shared_strings(archive, limits)
+    clock, budget = _container.Clock(limits), _container.TextBudget(limits)
+    sheets = _sheets(archive, limits, clock)
+    strings = _shared_strings(archive, limits, clock, budget)
     units = []
     for name, member in sheets:
-        _sheet_units(_container.read_part(archive, member, limits), name, strings, units, limits)
+        _sheet_units(_container.part_chunks(archive, member, limits), name, strings, units, limits, clock, budget)
     return units, None

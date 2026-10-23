@@ -161,7 +161,7 @@ def test_verify_cli_output_and_exit_codes(home, tmp_path, capsys):
     assert (code, err) == (0, '')
     lines = out.splitlines()
     assert re.fullmatch(rf'verify \S+  versions {len(expected)} checked {oks} ok {oks} failed 0  unverifiable {not_ok} '
-                        rf'\(stale 0, missing 0, locked 0, unstable 0, parser 0, not_ok {not_ok}, placeholder 0\)',
+                        rf'\(stale 0, missing 0, locked 0, unstable 0, parser 0, not_ok {not_ok}, placeholder 0, timeout 0\)',
                         lines[0])
     assert lines[1:] == [f'units {units}/{units} bound (100.0%)  chunks 0  evidence 0', 'binding ok']
     assert run(capsys, 'verify', '--root', str(src))[0] == 0
@@ -196,6 +196,26 @@ def test_verify_cli_says_when_nothing_was_verified(home, tmp_path, capsys):
     assert code == 0 and out.splitlines()[-1] == 'binding ok'
 
 
+def test_verify_cli_points_to_reparse_after_a_parser_version_change(home, tmp_path, capsys):
+    """Review M1-L13: versions stored by another parser version are not checked, and verify says how to fix it."""
+    src = tmp_path/'src'
+    (src/'docs').mkdir(parents=True)
+    (src/'docs'/'a.txt').write_bytes(b'synthetic line one\nsynthetic line two\n')
+    assert run(capsys, 'scan', '--root', str(src))[0] == 0
+    db = store.open_home(home)
+    try:
+        db.execute("UPDATE versions SET parser_version='text-0'")
+    finally:
+        db.close()
+    code, out, _ = run(capsys, 'verify')
+    lines = out.splitlines()
+    assert code == 0 and ' parser 1, ' in lines[0] and lines[-1] == 'binding ok (nothing verified)'
+    assert lines[2] == '1개 버전이 다른 파서 버전으로 저장됨 — `workmcp scan --reparse`로 다시 파싱'
+    assert run(capsys, 'scan', '--root', str(src), '--reparse')[0] == 0
+    code, out, _ = run(capsys, 'verify')
+    assert code == 0 and '--reparse' not in out and out.splitlines()[-1] == 'binding ok'
+
+
 def test_verify_cli_passes_read_cloud_placeholders(home, tmp_path, capsys, monkeypatch):
     """Review M1-2: ``verify`` follows ``[scan] read_cloud_placeholders`` (default false: no read)."""
     from workmcp import binding, collect
@@ -210,11 +230,11 @@ def test_verify_cli_passes_read_cloud_placeholders(home, tmp_path, capsys, monke
     monkeypatch.setattr(collect, 'read_source', lambda p: reads.append(p) or real_read(p))
     assert binding.collect is collect
     code, out, _ = run(capsys, 'verify')
-    assert code == 0 and reads == [] and 'placeholder 1)' in out
+    assert code == 0 and reads == [] and 'placeholder 1, timeout 0)' in out
     assert out.splitlines()[-1] == 'binding ok (nothing verified)'
     config.config_file(home).write_text('[scan]\nread_cloud_placeholders = true\n', encoding='utf-8')
     code, out, _ = run(capsys, 'verify')
-    assert code == 0 and len(reads) == 1 and 'placeholder 0)' in out and out.splitlines()[-1] == 'binding ok'
+    assert code == 0 and len(reads) == 1 and 'placeholder 0, timeout 0)' in out and out.splitlines()[-1] == 'binding ok'
 
 
 def db_doc_id(home, name):

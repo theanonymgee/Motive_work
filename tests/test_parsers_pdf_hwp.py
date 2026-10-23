@@ -9,7 +9,9 @@ import logging
 import random
 import re
 import struct
+import time
 import tracemalloc
+import types
 import warnings
 import zipfile
 from pathlib import Path
@@ -147,9 +149,9 @@ def test_every_unit_passes_locator_check_unit(rel):
 
 
 def test_parser_versions_follow_the_format():
-    assert re.fullmatch(r'pdf-1/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
-    assert re.fullmatch(r'hwp-2/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
-    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-2')
+    assert re.fullmatch(r'pdf-2/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
+    assert re.fullmatch(r'hwp-3/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
+    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-3')
     assert parsers.parser_for('.pdf').version == pdf.VERSION
     assert parsers.parser_for('.hwp').version == hwp.VERSION
     assert parsers.parser_for('.HWPX').version == hwp.HWPX_VERSION
@@ -334,9 +336,10 @@ def test_hwp_paragraph_limit_and_early_unit_and_text_limits():
 
 def test_hwp_memory_is_bounded_by_the_section_and_paragraph_limits():
     """Review M1-1 (P4): hwp-1 turned a paragraph into one Python integer per character (about 35 times its
-    size). A 1 MiB paragraph (a few KiB compressed) now takes <= 5 x its size (k = 5, about 3.5 measured:
-    the inflated section, the cut-out text and the decoded string). A 4 MiB paragraph over
-    ``hwp_max_para_bytes`` is refused before decoding: peak <= 3 x the inflated 4 MiB section."""
+    size). A 1 MiB paragraph (a few KiB compressed) now takes <= 5 x its size (k = 5, about 3.6 measured:
+    the gathered record, the decoded string and the dispatcher's UTF-8 check). A 4 MiB paragraph over
+    ``hwp_max_para_bytes`` is skipped without being kept, then refused: peak <= 2 MiB (hwp-2: 3 x the
+    inflated section)."""
     size = 2**20
     data = make_hwp.hwp_bytes([['가' * (size // 2)]])
     assert len(data) < 16 * 2**10
@@ -344,7 +347,85 @@ def test_hwp_memory_is_bounded_by_the_section_and_paragraph_limits():
     assert (status, error, units) == ('ok', None, 1) and peak <= 5 * size
     big = make_hwp.hwp_bytes([['가' * (2 * size)]])
     status, error, units, peak = traced_peak(big, '.hwp', Limits(hwp_max_para_bytes=size // 4))
-    assert (status, error) == ('too_large', 'hwp_para') and peak <= 3 * 4 * size
+    assert (status, error) == ('too_large', 'hwp_para') and peak <= 2 * size
+
+
+def fake_clock(monkeypatch) -> list:
+    """Every look at the parse clock is one second later; returns the counter."""
+    looks = [0]
+
+    def monotonic():
+        looks[0] += 1
+        return float(looks[0])
+    monkeypatch.setattr(_container, 'time', types.SimpleNamespace(monotonic=monotonic))
+    return looks
+
+
+PIECE = 2**18  # hwp._PIECE_BYTES: decompressed section bytes handled at a time
+
+
+def test_hwp_records_across_section_pieces():
+    """hwp-3 inflates and cuts records 256 KiB at a time: a paragraph, an extended header and a skipped
+    record that cross piece boundaries give the same paragraphs as one whole stream."""
+    assert hwp._PIECE_BYTES == PIECE
+    filler = make_hwp.record(99, 0, b'\x00' * (PIECE - 40))           # ends just before the first boundary
+    across = make_hwp.para('경계를 넘는 문단 ' * 20)                        # PARA_HEADER + PARA_TEXT across it
+    big_other = make_hwp.record(99, 0, b'\x07' * (2 * PIECE + 123))    # a skipped record over two pieces
+    long_text = '긴 문단 ' * (PIECE // 8)                                 # one PARA_TEXT over several pieces
+    raw = filler + across + big_other + make_hwp.para('뒤 문단') + make_hwp.para(long_text) + make_hwp.para('끝')
+    padding = PIECE - len(raw) % PIECE - 6                               # the last header straddles a boundary
+    raw = raw[:-len(make_hwp.para('끝'))] + make_hwp.record(99, 0, b'\x00' * padding) + make_hwp.para('끝')
+    for compressed in (True,):
+        data = make_hwp.hwp_bytes([['x']], compressed=compressed, raw_sections={0: raw})
+        result = run(data, '.hwp')
+        assert outcome(result) == ('ok', None)
+        assert texts(result) == [('경계를 넘는 문단 ' * 20).strip(), '뒤 문단', long_text.strip(), '끝']
+        assert [u.unit['index'] for u in result.units] == [1, 2, 3, 4]
+    oversized = filler + make_hwp.record(make_hwp.TAG_PARA_TEXT, 1, b'A\x00' * (PIECE // 2 + 10))
+    data = make_hwp.hwp_bytes([['x']], raw_sections={0: oversized})
+    assert outcome(run(data, '.hwp', Limits(hwp_max_para_bytes=PIECE))) == ('too_large', 'hwp_para')
+    assert outcome(run(make_hwp.hwp_bytes([['x']], raw_sections={0: oversized[:-1]}), '.hwp',
+                       Limits(hwp_max_para_bytes=PIECE))) == ('failed', 'hwp_bad_record')  # cut short: damage first
+    cut = filler + make_hwp.para('x' * 400_000)[:-2]  # a gathered paragraph that never ends
+    assert outcome(run(make_hwp.hwp_bytes([['x']], raw_sections={0: cut}), '.hwp')) == ('failed', 'hwp_bad_record')
+
+
+def test_hwp_section_memory_does_not_grow_with_the_section():
+    """Review M1 B15 (``hwp_records``): hwp-2 inflated a whole section at once (about twice its size). hwp-3
+    holds one 256 KiB piece: a 4 MiB section of other records and 65,536 empty paragraphs peaks <= 2 MiB."""
+    raw = (make_hwp.record(99, 0, bytes(4000)) * 1000 + make_hwp.record(make_hwp.TAG_PARA_TEXT, 1, b'') * 65_536
+           + make_hwp.para('끝'))
+    data = make_hwp.hwp_bytes([['x']], raw_sections={0: raw})
+    assert len(raw) > 4 * 2**20 and len(data) < 64 * 2**10
+    status, error, units, peak = traced_peak(data, '.hwp', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak <= 2 * 2**20
+    assert run(data, '.hwp').units[0].unit == {'kind': 'section_para', 'section': 1, 'index': 65_537}
+
+
+def test_hwp_time_limit_is_checked_per_piece(monkeypatch):
+    raw = make_hwp.para('a') + make_hwp.record(99, 0, b'\x00' * (3 * PIECE)) + make_hwp.para('b')  # 4 pieces
+    data = make_hwp.hwp_bytes([['x']], raw_sections={0: raw})
+    assert outcome(run(data, '.hwp', Limits(parse_seconds=-1))) == ('too_large', 'parse_time')
+    looks = fake_clock(monkeypatch)
+    assert texts(run(data, '.hwp', Limits(parse_seconds=100))) == ['a', 'b']
+    assert looks[0] == 1 + 4  # the start, then one look per 256 KiB piece
+    looks[0] = 0
+    assert outcome(run(data, '.hwp', Limits(parse_seconds=3.5))) == ('too_large', 'parse_time')
+
+
+def test_pdf_time_limit_is_checked_before_each_page(monkeypatch):
+    data = make_pdf.latin_pdf([['one'], ['two'], ['three']])
+    assert outcome(run(data, '.pdf', Limits(parse_seconds=-1))) == ('too_large', 'parse_time')
+    looks = fake_clock(monkeypatch)
+    assert texts(run(data, '.pdf', Limits(parse_seconds=100))) == ['one', 'two', 'three'] and looks[0] == 1 + 3
+    looks[0] = 0
+    assert outcome(run(data, '.pdf', Limits(parse_seconds=2.5))) == ('too_large', 'parse_time')
+
+
+def test_pdf_text_limit_stops_while_reading():
+    data = make_pdf.latin_pdf([['one'], ['two'], ['three']])
+    assert outcome(run(data, '.pdf', Limits(max_text_chars=11))) == ('ok', None)
+    assert outcome(run(data, '.pdf', Limits(max_text_chars=10))) == ('too_large', 'limit_chars')
 
 
 def test_hwp_other_records_are_skipped_and_trailing_deflate_data_is_ignored():
@@ -453,13 +534,35 @@ def test_hwpx_only_plain_decimal_part_names_are_sections_and_repeated_names_are_
     assert outcome(run(buffer.getvalue(), '.hwpx')) == ('failed', 'bad_zip')
 
 
-def test_hwpx_memory_stays_near_the_part_size():
-    """1 MiB of empty ``hp:p``: hwpx-1 built a tree (about 16 times the part); the stream keeps the part and
-    one chunk of events: peak <= 3 x the part (k = 3)."""
+def test_hwpx_memory_does_not_grow_with_the_part():
+    """1 MiB of empty ``hp:p``: hwpx-1 built a tree (about 16 times the part), hwpx-2 kept the part and one
+    chunk of elements; hwpx-3 streams the member into expat: peak <= 2 MiB whatever the size."""
     part = 2**20
     data = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p/>' * (part // 7)])])
     status, error, units, peak = traced_peak(data, '.hwpx', Limits())
-    assert (status, error, units) == ('ok', None, 0) and peak <= 3 * part
+    assert (status, error, units) == ('ok', None, 0) and peak <= 2 * 2**20
+
+
+def test_hwpx_structure_text_and_time_limits(monkeypatch):
+    """Review M1-3 for HWPX: deep nesting is ``xml_depth`` (hwpx-2 kept every open element and walked the
+    open path after each chunk); one paragraph's text over ``xml_max_text_chars`` is ``xml_text``."""
+    deep = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p>' * 100_000 + '</hp:p>' * 100_000])])
+    started = time.perf_counter()
+    status, error, units, peak = traced_peak(deep, '.hwpx', Limits())
+    assert (status, error) == ('too_large', 'xml_depth') and peak <= 2**20 and time.perf_counter() - started < 2
+    two = make_hwp.hwpx_bytes([make_hwp.hwpx_section([make_hwp.hp_para('x' * 500) + make_hwp.hp_para('y' * 500)])])
+    assert outcome(run(two, '.hwpx', Limits(xml_max_text_chars=500))) == ('ok', None)
+    split = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p><hp:run><hp:t>' + 'x' * 300 + '</hp:t><hp:t>'
+                                                          + 'y' * 300 + '</hp:t></hp:run></hp:p>'])])
+    assert outcome(run(split, '.hwpx', Limits(xml_max_text_chars=600))) == ('ok', None)
+    assert outcome(run(split, '.hwpx', Limits(xml_max_text_chars=599))) == ('too_large', 'xml_text')
+    assert outcome(run(split, '.hwpx', Limits(max_text_chars=599))) == ('too_large', 'limit_chars')
+    sections = hwpx([make_hwp.hp_para('a')], [make_hwp.hp_para('b')], [make_hwp.hp_para('c')])
+    looks = fake_clock(monkeypatch)
+    assert texts(run(sections, '.hwpx', Limits(parse_seconds=100))) == ['a', 'b', 'c']
+    used = looks[0] - 1
+    looks[0] = 0
+    assert outcome(run(sections, '.hwpx', Limits(parse_seconds=used - 0.5))) == ('too_large', 'parse_time')
 
 
 def test_hwpx_inline_children_of_a_text_and_odd_nesting():

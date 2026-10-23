@@ -1,13 +1,17 @@
 """DOCX, XLSX and PPTX parsers (design M1 §5.3, §5.4, §5.8, §11 ③). Packages are generated, never committed."""
 import gc
+import io
 import re
+import time
 import tracemalloc
+import types
+import zipfile
 
 import pytest
 
 from fixtures import SENTINEL, make_ooxml
 from workmcp import locator, parsers
-from workmcp.parsers import Limits, docx, pptx, xlsx
+from workmcp.parsers import Limits, _container, docx, pptx, xlsx
 
 CASES = {item.rel_path: (item, data) for item, data in make_ooxml.build()}
 MIB = 2**20
@@ -96,18 +100,59 @@ def test_docx_rejects_bad_zip_missing_part_dtd_invalid_xml_and_oversized_member(
     assert outcome(big, '.docx', Limits(zip_max_part_bytes=3 * MIB)) == ('ok', None, 1)
 
 
-def test_docx_memory_stays_near_the_part_size():
-    """Review M1-1 (P2): 1 MiB of empty ``w:p`` packs into a few KiB. docx-1 built a tree plus four maps
-    (about 88 times the part); the stream keeps the part and one chunk of events: peak <= 3 x the part
-    (k = 3, about 1.8 measured). Over ``zip_max_part_bytes`` the bounded read stops at the limit: peak
-    <= 3 x the limit."""
-    part = 2**20
+def test_docx_memory_does_not_grow_with_the_part():
+    """Review M1-1 (P2): 2 MiB of empty ``w:p`` packs into a few KiB. docx-1 built a tree plus four maps
+    (about 88 times the part), docx-2 held the part and one chunk of elements (about 1.8 times). docx-3
+    streams the member in 64 KiB pieces into expat and builds no element: peak <= 2 MiB whatever the
+    part's size (about 1.3 measured for 1 and 4 MiB parts; docx-2 about 3.6 for this 2 MiB part), also when
+    the read stops at ``zip_max_part_bytes``."""
+    part = 2 * 2**20
     data = make_ooxml.docx_package('<w:p/>' * (part // 6))
     assert len(data) < 16 * 2**10
     status, error, units, peak = traced_peak(data, '.docx', Limits())
-    assert (status, error, units) == ('ok', None, 0) and peak <= 3 * part
+    assert (status, error, units) == ('ok', None, 0) and peak <= 2 * 2**20
     status, error, units, peak = traced_peak(data, '.docx', Limits(zip_max_part_bytes=part // 2))
-    assert (status, error) == ('too_large', 'zip_part') and peak <= 3 * part // 2
+    assert (status, error) == ('too_large', 'zip_part') and peak <= 2 * 2**20
+
+
+def test_docx_structure_limits_reach_the_dispatcher():
+    """Review M1-3 and M1-4 through ``parsers.parse``: deep nesting (100,000 ``w:p``; docx-2: ok after a time
+    that grows with the depth squared), an attribute bomb, a name bomb and one long text node."""
+    deep = make_ooxml.docx_package('<w:p>' * 100_000 + '</w:p>' * 100_000)
+    attributes = make_ooxml.docx_package('<w:p ' + ' '.join(f'a{n:06d}=""' for n in range(60_000)) + '/>')
+    names = make_ooxml.docx_package(''.join(f'<x{n:06d}/>' for n in range(20_000)))
+    text = make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run('x' * (8 * 2**20 + 1))))
+    started = time.perf_counter()
+    assert outcome(deep, '.docx') == ('too_large', 'xml_depth', 0)
+    assert outcome(attributes, '.docx') == ('too_large', 'xml_attributes', 0)
+    assert outcome(names, '.docx') == ('too_large', 'xml_names', 0)
+    assert outcome(text, '.docx') == ('too_large', 'xml_text', 0)
+    assert time.perf_counter() - started < 5
+    assert traced_peak(deep, '.docx', Limits())[3] <= 2**20
+    assert traced_peak(names, '.docx', Limits())[3] <= 6 * 2**20  # expat and the name table hold 10,000 names
+
+
+def test_docx_paragraph_text_and_file_text_are_limited_while_reading():
+    two_runs = make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run('x' * 600), make_ooxml.w_run('y' * 600)))
+    assert outcome(two_runs, '.docx', Limits(xml_max_text_chars=1200)) == ('ok', None, 1)
+    assert outcome(two_runs, '.docx', Limits(xml_max_text_chars=1199)) == ('too_large', 'xml_text', 0)
+    many = make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run('x' * 600)) * 10)
+    assert outcome(many, '.docx', Limits(max_text_chars=6000)) == ('ok', None, 10)
+    assert outcome(many, '.docx', Limits(max_text_chars=5999)) == ('too_large', 'limit_chars', 0)
+
+
+def test_docx_time_limit(monkeypatch):
+    """Every fed piece checks the clock; a parse that runs past ``parse_seconds`` is ``too_large/parse_time``."""
+    data = make_ooxml.docx_package('<w:p/>' * 100_000)  # about 10 pieces
+    assert outcome(data, '.docx', Limits(parse_seconds=-1)) == ('too_large', 'parse_time', 0)
+    now = [0.0]
+
+    def monotonic():
+        now[0] += 1.0  # every look at the clock is one second later
+        return now[0]
+    monkeypatch.setattr(_container, 'time', types.SimpleNamespace(monotonic=monotonic))
+    assert outcome(data, '.docx', Limits(parse_seconds=100)) == ('ok', None, 0)
+    assert outcome(data, '.docx', Limits(parse_seconds=5)) == ('too_large', 'parse_time', 0)
 
 
 def test_docx_strict_and_foreign_roots_are_unsupported():
@@ -169,24 +214,43 @@ def test_pptx_reads_only_the_first_choice_of_alternate_content():
         ({'kind': 'slide', 'slide': 1, 'shape': 1}, '첫 선택 도형'), ({'kind': 'slide', 'slide': 1, 'shape': 2}, SENTINEL)]
 
 
-def test_pptx_strict_is_unsupported_and_a_slide_over_the_tree_limit_is_too_large():
+def test_pptx_strict_is_unsupported():
     assert outcome(make_ooxml.to_strict(CASES['docs/deck.pptx'][1]), '.pptx') == ('unsupported', 'ooxml_strict', 0)
-    slide = make_ooxml._slide(make_ooxml.p_sp([make_ooxml.a_p(make_ooxml.a_r(SENTINEL))]))
+
+
+def test_pptx_slides_are_streamed_too():
+    """Review M1-L12: pptx-2 read slides, the presentation and its relationships as trees (about 27 times
+    the part, up to +739 MiB with two trees alive). pptx-3 streams every part: a 1 MiB slide and 1 MiB of
+    relationships peak <= 2 MiB, and a slide over the old 16 MiB tree limit is read."""
+    slide = make_ooxml._slide('<p:pic/>' * (2**20 // 8) + make_ooxml.p_sp([make_ooxml.a_p(make_ooxml.a_r(SENTINEL))]))
     data = make_ooxml.pptx_package([('rId2', slide)], ['rId2'])
-    assert outcome(data, '.pptx', Limits(xml_max_tree_bytes=len(slide.encode()))) == ('ok', None, 1)
-    assert outcome(data, '.pptx', Limits(xml_max_tree_bytes=len(slide.encode()) - 1)) == ('too_large', 'xml_tree', 0)
-
-
-def test_pptx_tree_memory_is_bounded_by_the_tree_limit():
-    """Slides are trees: about 11 times the part for tiny elements (measured), asserted <= 16 x (k = 16).
-    So the default ``xml_max_tree_bytes`` (16 MiB) bounds one slide near 180 MiB. A part over the limit
-    is refused after the read only: peak <= 3 x the part."""
-    part = 2**20
-    data = make_ooxml.pptx_package([('rId2', make_ooxml._slide('<p:pic/>' * (part // 8)))], ['rId2'])
     status, error, units, peak = traced_peak(data, '.pptx', Limits())
-    assert (status, error, units) == ('ok', None, 0) and peak <= 16 * part
-    status, error, units, peak = traced_peak(data, '.pptx', Limits(xml_max_tree_bytes=part // 2))
-    assert (status, error) == ('too_large', 'xml_tree') and peak <= 3 * part
+    assert (status, error, units) == ('ok', None, 1) and peak <= 2 * 2**20
+    rels = make_ooxml.zip_bytes({**dict(_members(data)), 'ppt/_rels/presentation.xml.rels': (
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + ''.join(f'<Relationship Id="rX{n}" Type="t" Target="slides/none.xml"/>' for n in range(15_000))
+        + '<Relationship Id="rId2" Type="t" Target="slides/slide1.xml"/></Relationships>')})
+    status, error, units, peak = traced_peak(rels, '.pptx', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak <= 2 * 2**20
+    spaced = ('<p:pic/>' + ' ' * 2**20) * 17  # 17 MiB, mostly white space so that the test stays quick
+    big = make_ooxml.pptx_package([('rId2', make_ooxml._slide(spaced))], ['rId2'])
+    assert outcome(big, '.pptx') == ('ok', None, 0)
+
+
+def test_pptx_deep_groups_are_a_depth_limit_not_a_recursion_error():
+    """pptx-2 recursed once per nested group (a deep enough file was ``exception:RecursionError``)."""
+    deep = make_ooxml.pptx_package([('rId2', make_ooxml._slide('<p:grpSp>' * 5_000 + '</p:grpSp>' * 5_000))],
+                                   ['rId2'])
+    assert outcome(deep, '.pptx') == ('too_large', 'xml_depth', 0)
+    groups = make_ooxml._slide(make_ooxml.p_group(make_ooxml.p_group(make_ooxml.p_group(
+        make_ooxml.p_sp([make_ooxml.a_p(make_ooxml.a_r('깊은 도형'))])))))
+    result = parsers.parse(make_ooxml.pptx_package([('rId2', groups)], ['rId2']), '.pptx', Limits())
+    assert [(u.unit, u.text) for u in result.units] == [({'kind': 'slide', 'slide': 1, 'shape': 4}, '깊은 도형')]
+
+
+def _members(data: bytes) -> list[tuple[str, bytes]]:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        return [(name, archive.read(name)) for name in archive.namelist()]
 
 
 # ---- XLSX ----------------------------------------------------------------------------------------
@@ -252,14 +316,68 @@ def test_xlsx_strict_is_unsupported():
     assert outcome(make_ooxml.to_strict(CASES['sheets/book.xlsx'][1]), '.xlsx') == ('unsupported', 'ooxml_strict', 0)
 
 
-def test_xlsx_memory_stays_near_the_part_size():
-    """1 MiB of empty rows: xlsx-1 kept a cleared shell per row (about 15 times the part); the stream keeps
-    the part and one chunk of events: peak <= 3 x the part (k = 3)."""
+def test_xlsx_memory_does_not_grow_with_the_part():
+    """1 MiB of empty rows: xlsx-1 kept a cleared shell per row (about 15 times the part), xlsx-2 the part and
+    one chunk of events; xlsx-3 streams the member: peak <= 2 MiB whatever the size."""
     part = 2**20
     sheet = make_ooxml._sheet('<row/>' * (part // 6))
     data = make_ooxml.xlsx_package([('시트', 'xl/worksheets/sheet1.xml', sheet)], None)
     status, error, units, peak = traced_peak(data, '.xlsx', Limits())
-    assert (status, error, units) == ('ok', None, 0) and peak <= 3 * part
+    assert (status, error, units) == ('ok', None, 0) and peak <= 2 * 2**20
+
+
+SST = '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{}</sst>'
+
+
+def xlsx_with(sheet_rows: str, shared: str | None = None) -> bytes:
+    return make_ooxml.xlsx_package([('시트', 'xl/worksheets/sheet1.xml', make_ooxml._sheet(sheet_rows))], shared)
+
+
+def test_xlsx_shared_strings_count_and_text_limits():
+    """Review M1 B12/B13: shared strings are kept for the whole parse. More of them than ``max_units`` is
+    ``limit_units`` (Excel writes only strings its cells use), one longer than ``xml_max_text_chars`` is
+    ``xml_text``, and their characters count towards ``max_text_chars``."""
+    shared = SST.format('<si><t>a</t></si><si><r><t>b</t></r><r><t>c</t></r></si><si><t>d</t></si>')
+    data = xlsx_with('<row r="1"><c r="A1" t="s"><v>1</v></c></row>', shared)
+    assert [u.text for u in parsers.parse(data, '.xlsx', Limits()).units] == ['bc']
+    assert outcome(data, '.xlsx', Limits(max_units=3)) == ('ok', None, 1)
+    assert outcome(data, '.xlsx', Limits(max_units=2)) == ('too_large', 'limit_units', 0)
+    assert outcome(data, '.xlsx', Limits(max_text_chars=4)) == ('ok', None, 1)
+    assert outcome(data, '.xlsx', Limits(max_text_chars=3)) == ('too_large', 'limit_chars', 0)
+    assert outcome(data, '.xlsx', Limits(xml_max_text_chars=2)) == ('ok', None, 1)
+    assert outcome(data, '.xlsx', Limits(xml_max_text_chars=1)) == ('too_large', 'xml_text', 0)
+    one_huge = xlsx_with('', SST.format('<si><t>' + 'x' * (8 * 2**20 + 1) + '</t></si>'))
+    assert outcome(one_huge, '.xlsx') == ('too_large', 'xml_text', 0)
+
+
+def test_xlsx_cell_text_limit_and_cells_outside_a_row():
+    data = xlsx_with('<row r="2"><c t="inlineStr"><is><t>' + 'x' * 100 + '</t></is></c>'
+                     '<c t="str"><v>' + 'y' * 100 + '</v></c></row><c r="C9" t="str"><v>z</v></c>')
+    result = parsers.parse(data, '.xlsx', Limits())
+    assert [(u.unit['cell'], len(u.text)) for u in result.units] == [('A2', 100), ('B2', 100), ('C9', 1)]
+    assert outcome(data, '.xlsx', Limits(xml_max_text_chars=99)) == ('too_large', 'xml_text', 0)
+
+
+def test_xlsx_workbook_relationships_keep_only_the_sheets_targets_and_the_clock_spans_every_part(monkeypatch):
+    data = make_ooxml.xlsx_sheets(3)
+    members = dict(_members(data))
+    rels = members['xl/_rels/workbook.xml.rels'].decode()
+    noise = ''.join(f'<Relationship Id="rX{n}" Type="t" Target="worksheets/none.xml"/>' for n in range(15_000))
+    members['xl/_rels/workbook.xml.rels'] = rels.replace('</Relationships>', noise + '</Relationships>')
+    padded = make_ooxml.zip_bytes(members)
+    status, error, units, peak = traced_peak(padded, '.xlsx', Limits())
+    assert (status, error, units) == ('ok', None, 3) and peak <= 2 * 2**20
+    checks = [0]
+
+    def monotonic():
+        checks[0] += 1
+        return float(checks[0])
+    monkeypatch.setattr(_container, 'time', types.SimpleNamespace(monotonic=monotonic))
+    assert outcome(data, '.xlsx', Limits(parse_seconds=1000)) == ('ok', None, 3)
+    used = checks[0] - 1  # one look when the clock starts, then one per piece of every part
+    assert used >= 5  # workbook, relationships, three sheets: one clock for the whole file
+    checks[0] = 0
+    assert outcome(data, '.xlsx', Limits(parse_seconds=used - 0.5)) == ('too_large', 'parse_time', 0)
 
 
 def test_xlsx_unit_limit_stops_early():

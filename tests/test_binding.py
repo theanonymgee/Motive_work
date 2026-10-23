@@ -138,12 +138,23 @@ def test_parser_version_mismatch_is_unverifiable_until_reparse(db, bundle, tmp_p
     db.execute("UPDATE versions SET parser_version='text-0' WHERE document_id=?", (doc,))
     report = binding.verify(db)
     assert report['ok'] and unverifiable(report)['parser_version_mismatch'] == 1
+    # review M1-L13: the CLI prints the notice, which names the command that fixes it
+    assert report['notice'] == ['1개 버전이 다른 파서 버전으로 저장됨 — `workmcp scan --reparse`로 다시 파싱']
     assert scan(db, root)['total']['reparsed'] == 0  # without --reparse nothing changes
     result = scan(db, root, reparse=True)
     assert result['total']['reparsed'] == 1 and result['total']['parsed_ok'] == 1
     report = binding.verify(db)
-    assert report['ok'] and 'parser_version_mismatch' not in unverifiable(report)
+    assert report['ok'] and 'parser_version_mismatch' not in unverifiable(report) and report['notice'] == []
     assert versions(db, doc)[0][1] == 1  # re-parsed in place, no new version
+
+
+def test_running_out_of_time_when_parsing_again_is_unverifiable_not_failed(db, bundle, tmp_path):
+    """``parse_seconds`` is the one limit that depends on the machine: a version that parsed in time during the
+    scan may not when verify parses it again. That is ``timeout`` (not checked), never a binding failure."""
+    doc = document(db, tmp_path/'src'/'docs'/'report.docx')[0]
+    report = binding.verify(db, document_ids=[doc], limits=parsers.Limits(parse_seconds=-1))
+    assert report['ok'] and report['versions']['checked'] == 0 and unverifiable(report) == {'timeout': 1}
+    assert binding.verify(db, document_ids=[doc])['versions']['ok'] == 1
 
 
 def test_missing_file_is_reported(db, bundle, tmp_path):

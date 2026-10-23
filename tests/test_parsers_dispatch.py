@@ -19,9 +19,9 @@ PYPDF = importlib.metadata.version('pypdf')
 OLEFILE = importlib.metadata.version('olefile')
 EXPECTED_PARSERS = {
     '.txt': ('text', 'text-1'), '.md': ('text', 'text-1'), '.csv': ('csv', 'csv-1'),
-    '.pdf': ('pdf', f'pdf-1/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-2'), '.pptx': ('pptx', 'pptx-2'),
-    '.xlsx': ('xlsx', 'xlsx-2'), '.eml': ('eml', 'eml-2'), '.hwp': ('hwp', f'hwp-2/olefile-{OLEFILE}'),
-    '.hwpx': ('hwpx', 'hwpx-2')}
+    '.pdf': ('pdf', f'pdf-2/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-3'), '.pptx': ('pptx', 'pptx-3'),
+    '.xlsx': ('xlsx', 'xlsx-3'), '.eml': ('eml', 'eml-2'), '.hwp': ('hwp', f'hwp-3/olefile-{OLEFILE}'),
+    '.hwpx': ('hwpx', 'hwpx-3')}
 SIGNED = {'.pdf': b'%PDF-1.4\n', '.docx': b'PK\x03\x04', '.pptx': b'PK\x03\x04', '.xlsx': b'PK\x05\x06',
           '.hwpx': b'PK\x03\x04'}
 
@@ -256,7 +256,9 @@ def test_limits_defaults_follow_the_design():
                               csv_max_columns=1_000, pdf_max_pages=2_000, pptx_max_slides=2_000,
                               xlsx_max_sheets=1_000, eml_max_parts=1_000, hwp_max_sections=1_000,
                               zip_max_entries=10_000, zip_max_part_bytes=128 * 2**20,
-                              zip_max_total_bytes=512 * 2**20, xml_max_tree_bytes=16 * 2**20,
-                              hwp_max_para_bytes=16 * 2**20)
+                              zip_max_total_bytes=512 * 2**20, xml_max_depth=256, xml_max_attributes=1_000,
+                              xml_max_markup_bytes=2**20, xml_max_names=10_000, xml_max_text_chars=8 * 2**20,
+                              hwp_max_para_bytes=16 * 2**20, parse_seconds=60.0)
+    assert Limits().xml_max_text_chars == Limits().hwp_max_para_bytes // 2  # one unit's text, the same in every format
     with pytest.raises(AttributeError):
         Limits().max_units = 1  # frozen

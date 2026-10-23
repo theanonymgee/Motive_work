@@ -101,6 +101,7 @@ class _Latest:
     mtime_ns: int
     parse_status: str
     parser_version: str | None
+    parse_error: str | None
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,7 @@ class _Doc:
 
 
 _LOOKUP = ('SELECT d.id, d.root_id, d.path, d.status, v.id, v.seq, v.sha256, v.size, v.mtime_ns, v.parse_status, '
-           'v.parser_version FROM documents d LEFT JOIN versions v ON v.document_id = d.id '
+           'v.parser_version, v.parse_error FROM documents d LEFT JOIN versions v ON v.document_id = d.id '
            'AND v.seq = (SELECT MAX(seq) FROM versions WHERE document_id = d.id) WHERE d.path_key = ?')
 _VERSION_FIELDS = 'parser, parser_version, encoding, parse_status, parse_error, unit_count, text_chars'
 
@@ -176,10 +177,14 @@ class _Scan:
                         (store.now(), version_id))
 
     def needs_retry(self, latest: _Latest, current: str) -> bool:
-        status = latest.parse_status
-        if status in ('locked', 'pending') or (status == 'failed' and self.retry_failed):
+        status, code = latest.parse_status, latest.parse_error
+        # too_large is final except parse_time (depends on the machine's load) and xml_tree (a code of the
+        # old tree parsers, pptx-2/xlsx-2, whose parts the stream parsers now read).
+        if status in ('locked', 'pending') or (self.retry_failed and (
+                status == 'failed' or (status, code) == ('too_large', 'parse_time'))):
             return True
-        return self.reparse and status != 'too_large' and latest.parser_version != current
+        retryable = status != 'too_large' or code in ('parse_time', 'xml_tree')
+        return self.reparse and retryable and latest.parser_version != current
 
     # -- versions and units -----------------------------------------------------------------
     def reuse_source(self, sha: str, parser_version: str, exclude: int | None) -> int | None:

@@ -45,8 +45,10 @@ ERROR_CODES = {
     'unsupported': frozenset({
         'pdf_bad_signature', 'bad_signature', 'legacy_ole', 'hwp_bad_header', 'hwp_version', 'ooxml_strict'}),
     'too_large': frozenset({
-        'file_bytes', 'limit_units', 'limit_chars', 'zip_entries', 'zip_total', 'zip_part', 'xml_tree', 'hwp_para',
-        'pdf_count', 'pptx_count', 'xlsx_count', 'eml_count', 'hwp_count'}),
+        'file_bytes', 'limit_units', 'limit_chars', 'zip_entries', 'zip_total', 'zip_part', 'hwp_para',
+        'xml_depth', 'xml_attributes', 'xml_markup', 'xml_names', 'xml_text', 'parse_time',
+        'pdf_count', 'pptx_count', 'xlsx_count', 'eml_count', 'hwp_count',
+        'xml_tree'}),  # xml_tree: no longer raised (pptx-2, xlsx-2 trees); kept so stored rows stay valid codes
     'encrypted': frozenset({'pdf_encrypted', 'hwp_encrypted', 'ooxml_encrypted'}),
 }
 EXCEPTION_PREFIX = 'exception:'
@@ -83,12 +85,22 @@ class Limits:
     zip_max_entries: int = 10_000
     zip_max_part_bytes: int = 128 * 2**20
     zip_max_total_bytes: int = 512 * 2**20
-    # An XML part read as a whole tree (PPTX slides, the workbook and relationship parts) takes about 20 times
-    # its size in memory, so it has its own small limit. The large parts (DOCX body, HWPX sections, XLSX
-    # sheets and shared strings) are streamed and only bounded by zip_max_part_bytes.
-    xml_max_tree_bytes: int = 16 * 2**20
+    # Every XML part is streamed (_container.XmlStream, no tree); these bound its structure (design M1 §15):
+    # nesting depth (Office and HWPX documents stay well under 100; libxml2 refuses more than 256 by
+    # default), attributes plus namespace declarations of one element (a Word root carries about 40), bytes
+    # of one start tag, comment or processing instruction, distinct element and attribute names in one part
+    # (a few hundred in real parts) and characters of one text node, which is also the limit of the text one
+    # XML unit gathers (8 Mi characters, the same as hwp_max_para_bytes).
+    xml_max_depth: int = 256
+    xml_max_attributes: int = 1_000
+    xml_max_markup_bytes: int = 2**20
+    xml_max_names: int = 10_000
+    xml_max_text_chars: int = 8 * 2**20
     # One HWP PARA_TEXT record (UTF-16LE, 2 bytes per character): 8M characters.
     hwp_max_para_bytes: int = 16 * 2**20
+    # Wall-clock seconds for one file's parse (XML pieces, HWP records, PDF pages); over it is
+    # too_large/parse_time. Unlike every other limit it depends on the machine (see binding 'timeout').
+    parse_seconds: float = 60.0
 
 
 class ParseFailure(Exception):

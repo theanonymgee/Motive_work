@@ -22,7 +22,8 @@ SCOPE = ('결속 100% = parse_status가 ok인 버전 중 현재 파일의 sha256
          '단위(순서·종류·좌표·텍스트·해시)·청크·근거 인용이 같은 파서 버전으로 현재 파일에서 다시 만들어진 값과 '
          '같음. 파서가 원문을 올바르게 읽었는지는 보이지 않음. 파일이 바뀐 옛 버전은 재검증 불가(stale)로 따로 셈.')
 MAX_FAILURES = 20
-UNVERIFIABLE = ('stale', 'missing', 'locked', 'unstable', 'parser_version_mismatch', 'skipped_not_ok', 'placeholder')
+UNVERIFIABLE = ('stale', 'missing', 'locked', 'unstable', 'parser_version_mismatch', 'skipped_not_ok', 'placeholder',
+                'timeout')
 
 
 def _sha(text: str) -> str:
@@ -99,6 +100,11 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
     if key not in cache:
         cache[key] = parsers.parse(data, ext, limits)
     result = cache[key]
+    if (result.status, result.error) == ('too_large', 'parse_time'):
+        # The only limit that depends on the machine: running out of time again is not a mismatch.
+        report['result'] = 'timeout'
+        report['note'] = 'parsing again took longer than parse_seconds'
+        return report
 
     failures = report['failures']
 
@@ -226,6 +232,8 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
                 stale_latest.add(report['document_id'])
     units['rate'] = units['bound'] / units['total'] if units['total'] else 0.0
     notice = [f'{len(stale_latest)}개 문서가 마지막 스캔 이후 바뀜 — `workmcp scan`을 먼저 실행'] if stale_latest else []
+    if mismatched := versions['unverifiable']['parser_version_mismatch']:
+        notice.append(f'{mismatched}개 버전이 다른 파서 버전으로 저장됨 — `workmcp scan --reparse`로 다시 파싱')
     return {'scope': SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version
                                                 for ext in sorted(parsers.SUPPORTED_EXTENSIONS)},
             'checked_at': store.now(), 'versions': versions, 'units': units, 'chunks_checked': chunks,

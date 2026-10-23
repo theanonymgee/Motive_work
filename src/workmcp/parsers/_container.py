@@ -3,17 +3,23 @@
 Everything works on bytes in memory: no path is opened, nothing is extracted to disk and no
 nested archive is read.
 
-- zip: entry count, declared total size and duplicate member names are checked when opening;
-  one member is read with a bounded read (``limit + 1`` bytes at most), so a member whose header
-  lies about its size still cannot exceed the limit.
-- XML: a part containing ``<!DOCTYPE`` or ``<!ENTITY`` (in UTF-8 or UTF-16) is refused before
-  parsing, and a first pass that builds nothing refuses a document type declaration in any
-  encoding expat reads. Office/HWPX parts never carry a DTD. Unknown encodings and malformed XML
-  are ``xml_invalid``.
-- XML memory: a tree costs about 20 times the part's size, so ``parse_xml`` (small parts only)
-  refuses a part over ``Limits.xml_max_tree_bytes`` (``too_large/xml_tree``). Large parts go
-  through ``iter_xml``, which detaches every finished element from its parent: memory holds the
-  part's bytes, the open element path and what the caller keeps.
+- zip: entry count, declared total size and duplicate member names are checked when opening.
+  ``part_chunks`` reads one member in 64 KiB pieces and stops past ``zip_max_part_bytes``, so a
+  member whose header lies about its size still cannot exceed the limit, and a part is never held
+  whole. ``zipfile`` checks the CRC when the read reaches the end.
+- XML (``XmlStream``): expat called directly with handlers that build no element objects; the
+  caller gets ``start``/``text``/``end`` events and the list of open tags. Memory is one fed piece,
+  the events it produced and what the caller keeps, whatever the part's size or shape. Structural
+  limits (all ``too_large``): nesting depth (``xml_depth``), attributes and namespace declarations
+  of one element (``xml_attributes``), bytes of one piece of markup such as a start tag, a comment
+  or a processing instruction (``xml_markup``), distinct element and attribute names in a part
+  (``xml_names``, expat and the name table keep every name until the part ends) and one text node
+  (``xml_text``). A part containing ``<!DOCTYPE`` or ``<!ENTITY`` (UTF-8 or UTF-16 bytes) and a
+  document type declaration in any encoding are ``failed/xml_dtd``; Office/HWPX parts never carry a
+  DTD. Unknown encodings and malformed XML are ``xml_invalid``.
+- Time: ``Clock`` holds the deadline of one parse (``Limits.parse_seconds``); the XML stream checks
+  it after every fed piece and the HWP and PDF parsers in their record and page loops
+  (``too_large/parse_time``).
 - OOXML root: ``check_root`` tells Strict Open XML (``unsupported/ooxml_strict``) and other
   foreign roots (``unsupported/bad_signature``) from the transitional parts the parsers read.
 - OLE: stream names only (to tell encrypted OOXML from legacy Office files, and to find HWP
@@ -22,19 +28,48 @@ nested archive is read.
 from __future__ import annotations
 
 import io
-import xml.etree.ElementTree as ET
+import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from xml.parsers import expat
 
 import olefile
 
 from . import OLE_SIGNATURE, Limits, ParseFailure
 
+START, END, TEXT = 'start', 'end', 'text'
 _DTD_MARKERS = tuple(marker.encode(codec) for marker in ('<!DOCTYPE', '<!ENTITY')
                      for codec in ('utf-8', 'utf-16-le', 'utf-16-be'))
-_FEED_BYTES = 1 << 14  # one chunk of events (about 40 bytes of objects per XML byte) at a time
-_READ_BYTES = 1 << 18
+_MARKER_TAIL = max(len(marker) for marker in _DTD_MARKERS) - 1
+_FEED_BYTES = 1 << 16  # one zip read and one expat feed; its events (a few MiB at most) are handed out before the next
 _STRICT_NAMESPACE = '{http://purl.oclc.org/ooxml/'
+_NO_ATTRIBUTES: dict = {}  # shared by every element without attributes: read it, never change it
+
+
+class Clock:
+    """Deadline of one parse: ``check()`` raises ``too_large/parse_time`` once ``parse_seconds`` have passed."""
+    __slots__ = ('deadline',)
+
+    def __init__(self, limits: Limits):
+        self.deadline = time.monotonic() + limits.parse_seconds
+
+    def check(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise ParseFailure('too_large', 'parse_time')
+
+
+class TextBudget:
+    """Characters a parser keeps for its units across a whole file; past ``max_text_chars`` it is
+    ``too_large/limit_chars`` at once instead of after the text has piled up."""
+    __slots__ = ('left',)
+
+    def __init__(self, limits: Limits):
+        self.left = limits.max_text_chars
+
+    def take(self, count: int) -> None:
+        self.left -= count
+        if self.left < 0:
+            raise ParseFailure('too_large', 'limit_chars')
 
 
 def open_zip(data: bytes, limits: Limits) -> zipfile.ZipFile:
@@ -55,12 +90,13 @@ def open_zip(data: bytes, limits: Limits) -> zipfile.ZipFile:
     return archive
 
 
-def read_part(archive: zipfile.ZipFile, name: str, limits: Limits, *, required: bool = True) -> bytearray | None:
-    """One member's bytes (exact name). Missing: ``failed/missing_part``, or None when not required.
+def part_chunks(archive: zipfile.ZipFile, name: str, limits: Limits, *,
+                required: bool = True) -> Iterator[bytes] | None:
+    """One member's bytes (exact name) as pieces of at most 64 KiB, read only when iterated.
 
-    The bytes go into one buffer of the declared size (capped at the limit + 1) in 256 KiB reads, so
-    reading costs the member's size once. ``zipfile`` never returns more than the declared size and
-    checks the CRC when it reaches it.
+    Missing: ``failed/missing_part``, or None when not required. Past ``zip_max_part_bytes``:
+    ``too_large/zip_part`` (the excess is never handed out). Damaged data, a CRC mismatch or an
+    encrypted member: ``failed/bad_zip``.
     """
     try:
         info = archive.getinfo(name)
@@ -68,38 +104,31 @@ def read_part(archive: zipfile.ZipFile, name: str, limits: Limits, *, required: 
         if required:
             raise ParseFailure('failed', 'missing_part') from None
         return None
-    size = min(info.file_size, limits.zip_max_part_bytes + 1)
-    data = bytearray(size)
-    filled = 0
+    return _member_chunks(archive, info, limits.zip_max_part_bytes)
+
+
+def _member_chunks(archive: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> Iterator[bytes]:
     try:
-        with archive.open(info, 'r') as member, memoryview(data) as view:
-            while filled < size:
-                chunk = member.read(min(_READ_BYTES, size - filled))
-                if not chunk:
-                    break
-                view[filled:filled + len(chunk)] = chunk
-                filled += len(chunk)
-            if filled <= limits.zip_max_part_bytes:
-                member.read(1)  # reach the end so that zipfile checks the CRC (also of a member declared empty)
+        member = archive.open(info, 'r')
     except MemoryError:
         raise
-    except Exception:  # bad compression data, CRC mismatch, encrypted or unsupported member
+    except Exception:  # encrypted or unsupported member
         raise ParseFailure('failed', 'bad_zip') from None
-    del data[filled:]
-    if len(data) > limits.zip_max_part_bytes:
-        raise ParseFailure('too_large', 'zip_part')
-    return data
-
-
-class _DocumentType(Exception):
-    pass
-
-
-class _DoctypeGuard:
-    """Parser target that builds nothing and refuses a document type declaration."""
-
-    def doctype(self, name, pubid, system):
-        raise _DocumentType()
+    total = 0
+    with member:
+        while True:
+            try:
+                chunk = member.read(_FEED_BYTES)  # reading up to the end makes zipfile check the CRC
+            except MemoryError:
+                raise
+            except Exception:  # bad compression data, CRC mismatch
+                raise ParseFailure('failed', 'bad_zip') from None
+            if not chunk:
+                return
+            total += len(chunk)
+            if total > limit:
+                raise ParseFailure('too_large', 'zip_part')
+            yield chunk
 
 
 def reject_dtd(part: bytes) -> None:
@@ -107,78 +136,143 @@ def reject_dtd(part: bytes) -> None:
         raise ParseFailure('failed', 'xml_dtd')
 
 
-def _feed(parser, part: bytes) -> None:
-    """Feed the whole part in chunks (expat copies each fed buffer) and close the parser."""
-    try:
-        for start in range(0, len(part), _FEED_BYTES):
-            parser.feed(part[start:start + _FEED_BYTES])
-        return parser.close()
-    except _DocumentType:
-        raise ParseFailure('failed', 'xml_dtd') from None
-    except ET.ParseError:
-        raise ParseFailure('failed', 'xml_invalid') from None
+def _handlers(limits: Limits):
+    """An expat parser whose callbacks queue ``(kind, tag, value)`` events in the returned list.
 
-
-def _guard(part: bytes) -> None:
-    """Refuse a DTD (byte check, then a pass that builds nothing) and malformed XML before any tree is made."""
-    reject_dtd(part)
-    _feed(ET.XMLParser(target=_DoctypeGuard()), part)
-
-
-def parse_xml(part: bytes, limits: Limits) -> ET.Element:
-    """Root element of one small XML part (namespaces as ``{uri}local`` tags)."""
-    if len(part) > limits.xml_max_tree_bytes:
-        raise ParseFailure('too_large', 'xml_tree')
-    _guard(part)
-    return _feed(ET.XMLParser(), part)
-
-
-def iter_xml(part: bytes) -> Iterator[tuple[str, ET.Element, list[ET.Element]]]:
-    """``(event, element, path)`` for every ``'start'`` and ``'end'`` of an element, in document order.
-
-    ``path`` is the list of open ancestors (parent last, the element itself not included; the
-    same list object throughout, read it but do not keep or change it). Attributes are there at
-    ``'start'`` and text at ``'end'``; a child's ``tail`` is set by the time the next event
-    arrives. After each fed chunk every finished element is detached from its parent, so a caller
-    must not rely on an element's children: it keeps what it needs from each element when that
-    element ends. The whole part is checked first (DTD, well-formedness).
+    Names become ``{uri}local`` tags; every distinct name (prefix included, as expat stores it) and
+    every element's attributes are counted. No element object is ever made. The callbacks are
+    closures over locals because they run once per event.
     """
-    _guard(part)
-    pull = ET.XMLPullParser(events=('start', 'end'))
-    path = []
-    for start in range(0, len(part) + _FEED_BYTES, _FEED_BYTES):
-        last = start >= len(part)
-        try:
-            if last:
-                pull.close()
-            else:
-                pull.feed(part[start:start + _FEED_BYTES])
-            events = list(pull.read_events())
-        except ET.ParseError:
-            raise ParseFailure('failed', 'xml_invalid') from None
-        for event, element in events:
-            if event == 'start':
-                yield event, element, path
-                path.append(element)
-            else:
-                path.pop()
-                yield event, element, path
-        del events
-        # Detach every finished element: an open element keeps only its open child, which is its last one.
-        for depth, element in enumerate(path):
-            if len(element):
-                if depth + 1 < len(path) and element[-1] is path[depth + 1]:
-                    del element[:-1]
+    events = []
+    append = events.append
+    tags = {}   # name as expat reports it ('uri}local}prefix') -> tag; its size is the name count
+    ends = {}   # the same name -> its END event (one tuple per name, shared by every end)
+    get, end_of = tags.get, ends.__getitem__
+    depth = declared = 0  # open elements; namespace declarations of the element about to start
+    max_names, max_attributes, max_depth = limits.xml_max_names, limits.xml_max_attributes, limits.xml_max_depth
+
+    def name(raw):
+        if len(tags) >= max_names:
+            raise ParseFailure('too_large', 'xml_names')
+        uri, separator, rest = raw.partition('}')
+        tag = '{' + uri + '}' + rest.partition('}')[0] if separator else raw
+        tags[raw], ends[raw] = tag, (END, tag, None)
+        return tag
+
+    def start(raw, attributes):
+        nonlocal depth, declared
+        depth += 1
+        if depth > max_depth:
+            raise ParseFailure('too_large', 'xml_depth')
+        tag = get(raw) or name(raw)
+        if attributes or declared:
+            if len(attributes) + declared > max_attributes:
+                raise ParseFailure('too_large', 'xml_attributes')
+            declared = 0
+            append((START, tag, {get(key) or name(key): value for key, value in attributes.items()}))
+        else:
+            append((START, tag, _NO_ATTRIBUTES))
+
+    def end(raw):
+        nonlocal depth
+        depth -= 1
+        append(end_of(raw))
+
+    def text(data):
+        append((TEXT, None, data))
+
+    def namespace(prefix, uri):
+        nonlocal declared
+        declared += 1
+        key = 'xmlns:' + (prefix or '')
+        if key not in tags:
+            name(key)
+
+    def doctype(*args):
+        raise ParseFailure('failed', 'xml_dtd')
+
+    parser = expat.ParserCreate(namespace_separator='}')
+    parser.namespace_prefixes = True  # 'uri}local}prefix': distinct raw names stay distinct when counted
+    parser.buffer_text = True
+    parser.buffer_size = _FEED_BYTES  # one text event per run per fed piece
+    parser.StartElementHandler, parser.EndElementHandler, parser.CharacterDataHandler = start, end, text
+    parser.StartNamespaceDeclHandler, parser.StartDoctypeDeclHandler = namespace, doctype
+    return parser, events
+
+
+class XmlStream:
+    """Events of one XML part, in document order: ``(START, tag, attributes)``, ``(TEXT, None, text)``,
+    ``(END, tag, None)``.
+
+    Tags and attribute names are ``{uri}local`` (or ``local`` without a namespace), as in
+    ElementTree; the attributes dict is the caller's to read, not to change. ``path`` lists the open tags, outermost first; it is the same list throughout (read
+    it, do not keep or change it). At ``START`` and ``END`` it does not include the element itself;
+    at ``TEXT`` its last tag is the element the text is directly in. A text node may come as several
+    ``TEXT`` events (one per fed piece). Comments and processing instructions give no event.
+
+    ``source`` is the part's bytes or an iterable of pieces (``part_chunks``). Damage found late in
+    a part fails the whole parse, so a caller keeps its units only when the stream ends normally.
+    """
+
+    def __init__(self, source: bytes | Iterable[bytes], limits: Limits, clock: Clock | None = None):
+        self.source, self.limits = source, limits
+        self.clock = clock or Clock(limits)
+        self.path: list[str] = []
+
+    def _pieces(self) -> Iterator[bytes]:
+        source = self.source
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            source = (source,)
+        for chunk in source:
+            for start in range(0, len(chunk), _FEED_BYTES):
+                yield chunk[start:start + _FEED_BYTES]
+
+    def __iter__(self) -> Iterator[tuple]:
+        limits, clock, path = self.limits, self.clock, self.path
+        max_text, max_markup = limits.xml_max_text_chars, limits.xml_max_markup_bytes
+        parser, events = _handlers(limits)
+        pieces = self._pieces()
+        chunk, run, fed = next(pieces, None), 0, 0
+        while True:
+            final = chunk is None
+            if not final:
+                following = next(pieces, None)  # one piece ahead: a DTD marker across the boundary is found first
+                reject_dtd(chunk)
+                if following is not None:
+                    reject_dtd(chunk[-_MARKER_TAIL:] + following[:_MARKER_TAIL])
+                fed += len(chunk)
+            try:
+                parser.Parse(b'' if final else chunk, final)
+            except expat.ExpatError:
+                raise ParseFailure('failed', 'xml_invalid') from None
+            if fed - parser.CurrentByteIndex > max_markup:  # bytes expat holds for markup that has not ended yet
+                raise ParseFailure('too_large', 'xml_markup')
+            for event in events:
+                kind = event[0]
+                if kind is START:
+                    run = 0
+                    yield event
+                    path.append(event[1])
+                elif kind is END:
+                    run = 0
+                    path.pop()
+                    yield event
                 else:
-                    del element[:]
-        if last:
-            return
+                    run += len(event[2])
+                    if run > max_text:
+                        raise ParseFailure('too_large', 'xml_text')
+                    yield event
+            events.clear()
+            clock.check()
+            if final:
+                return
+            chunk = following
 
 
-def check_root(element: ET.Element, expected: str) -> None:
+def check_root(tag: str, expected: str) -> None:
     """The root of a main OOXML part must be the transitional ``expected`` tag."""
-    if element.tag != expected:
-        if element.tag.startswith(_STRICT_NAMESPACE):
+    if tag != expected:
+        if tag.startswith(_STRICT_NAMESPACE):
             raise ParseFailure('unsupported', 'ooxml_strict')
         raise ParseFailure('unsupported', 'bad_signature')
 
