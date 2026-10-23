@@ -10,6 +10,8 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT
   with a probe folder as the source root, a write and a delete inside it (both blocked).
 - ``scan ROOT``: source-read audit with ROOT as the source root: ``config.validate_root`` ->
   ``collect.scan`` -> ``binding.verify`` -> a second ``collect.scan`` (must be all unchanged).
+  Settings come from ``config.toml`` in the data home (the test sets a small ``max_file_mb`` so a
+  large file goes through ``stream_sha256`` under the hook too).
   The report has counts only (per status/code and per parser), never document text.
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
@@ -17,8 +19,11 @@ Runtime boundary: no socket connect/bind/send to an address other than loopback 
 Windows asyncio event loop makes an internal socket pair for wake-ups, so a loopback ``bind``
 must ask for port 0 (any free port, as ``socket.socketpair`` does): a fixed-port listener is a
 local server another process could reach and is a violation (M0 review v2 N-L5). With a source root set,
-also no write to anything under it: no ``open`` with a write mode or write flags, no remove,
-rename, utime, chmod, truncate, mkdir, rmdir, link or ``shutil`` call on a path under it.
+also no write to anything under it: no ``open`` with a write mode or write flags (delete-on-close
+``O_TEMPORARY`` counts), no remove, rename, utime, chmod, truncate, mkdir, rmdir, link or
+``shutil`` call on a path under it, no SQLite database opened under it, and no such call on a
+name relative to a directory descriptor (``dir_fd``; its folder is unknown, so it is refused).
+Paths are compared after dropping a Win32 long-path or device prefix.
 A violating event is recorded, then blocked (the hook raises), so it never happens. The event
 log is written to LOG_JSON (never stdout, which belongs to JSON-RPC in ``serve`` mode).
 """
@@ -26,6 +31,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import unquote  # string handling only; no network
 
 LOOPBACK = frozenset({'127.0.0.1', '::1'})
 ADDRESS_EVENTS = frozenset({'socket.connect', 'socket.bind', 'socket.sendto', 'socket.sendmsg'})
@@ -41,10 +47,20 @@ PROBE_LISTEN_PORT = 8765  # a fixed loopback port; the bind is blocked before it
 # Source-write events (measured on this PC, design M1 §4.3): 'rb' arrives as mode 'r'; os.open has
 # mode None and the flags; Path.touch/os.utime -> os.utime; os.replace -> os.rename; os.unlink -> os.remove.
 WRITE_MODE_CHARS = frozenset('wax+')
-WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+# O_TEMPORARY (0x40, Windows) deletes the file when it is closed; O_SHORT_LIVED (0x1000) creates a
+# temporary file. Both only exist on Windows.
+O_TEMPORARY = getattr(os, 'O_TEMPORARY', 0)
+O_SHORT_LIVED = getattr(os, 'O_SHORT_LIVED', 0)
+WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC | O_TEMPORARY | O_SHORT_LIVED
 SOURCE_WRITE_EVENTS = frozenset({'os.remove', 'os.unlink', 'os.rename', 'os.rmdir', 'os.mkdir', 'os.utime',
                                  'os.chmod', 'os.chown', 'os.chflags', 'os.truncate', 'os.link', 'os.symlink',
                                  'os.setxattr', 'os.removexattr'})
+# (path position, dir_fd position) pairs in the audit events above (CPython posixmodule). The event
+# carries dir_fd -1 when none was given; Windows has no dir_fd support at all.
+DIR_FD_ARGS = {'os.remove': ((0, 1),), 'os.unlink': ((0, 1),), 'os.rmdir': ((0, 1),), 'os.mkdir': ((0, 2),),
+               'os.rename': ((0, 2), (1, 3)), 'os.link': ((0, 2), (1, 3)), 'os.symlink': ((1, 2),),
+               'os.utime': ((0, 3),), 'os.chmod': ((0, 2),), 'os.chown': ((0, 3),)}
+LONG_PREFIXES = (r'\\?\UNC' + '\\', r'\\?' + '\\', r'\\.' + '\\')  # Win32 long-path and device prefixes
 
 
 def is_loopback(address) -> bool:
@@ -69,14 +85,45 @@ def judge(event: str, args: tuple) -> str | None:
     return None
 
 
+def _plain(text: str) -> str:
+    r"""``text`` without a Win32 long-path or device prefix (``\\?\C:\x`` -> ``C:\x``)."""
+    if os.name != 'nt':
+        return text
+    text = text.replace('/', '\\')
+    for prefix in LONG_PREFIXES:
+        if text[:len(prefix)].upper() == prefix.upper():
+            return (r'\\' if 'UNC' in prefix else '') + text[len(prefix):]
+    return text
+
+
 def _key(path) -> str | None:
     """Normalised absolute form of a path argument; None for file descriptors and other values."""
     if isinstance(path, (str, bytes, os.PathLike)):
         try:
-            return os.path.normcase(os.path.abspath(os.fsdecode(path)))
+            return os.path.normcase(os.path.abspath(_plain(os.fsdecode(path))))
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _sqlite_path(database):
+    """The file a ``sqlite3.connect`` argument names (``file:`` URIs too); None for ``:memory:``."""
+    if isinstance(database, bytes):
+        database = os.fsdecode(database)
+    if isinstance(database, os.PathLike):
+        database = os.fspath(database)
+    if not isinstance(database, str) or database in ('', ':memory:'):
+        return None
+    if database.startswith('file:'):
+        database = database[len('file:'):].split('?', 1)[0].split('#', 1)[0]
+        if database.startswith('//'):
+            database = database[2:]  # file:///C:/x -> /C:/x (empty authority)
+        if os.name == 'nt' and len(database) > 2 and database[0] == '/' and database[2] == ':':
+            database = database[1:]
+        database = unquote(database)  # Path.as_uri() percent-encodes spaces and non-ASCII names
+        if database in ('', ':memory:'):
+            return None
+    return database
 
 
 def under(path, root) -> bool:
@@ -88,7 +135,7 @@ def under(path, root) -> bool:
 
 
 def is_source_event(event: str) -> bool:
-    return event == 'open' or event in SOURCE_WRITE_EVENTS or event.startswith('shutil.')
+    return event in ('open', 'sqlite3.connect') or event in SOURCE_WRITE_EVENTS or event.startswith('shutil.')
 
 
 def judge_source_write(event: str, args: tuple, root) -> str | None:
@@ -102,9 +149,18 @@ def judge_source_write(event: str, args: tuple, root) -> str | None:
         if mode is None and isinstance(flags, int) and flags & WRITE_FLAGS:
             return f'os.open flags {flags} under the source root'
         return None
+    if event == 'sqlite3.connect':
+        database = _sqlite_path(args[0] if args else None)
+        return 'sqlite3.connect on a database under the source root' if under(database, root) else None
     if event in SOURCE_WRITE_EVENTS or event.startswith('shutil.'):
         if any(under(arg, root) for arg in args):
             return f'{event} on a path under the source root'
+        for path_at, fd_at in DIR_FD_ARGS.get(event, ()):
+            if fd_at >= len(args) or isinstance(args[fd_at], bool) or not isinstance(args[fd_at], int):
+                continue
+            name = args[path_at]
+            if args[fd_at] >= 0 and isinstance(name, (str, bytes, os.PathLike)) and not os.path.isabs(os.fsdecode(name)):
+                return f'{event} on a name relative to a directory descriptor (folder unknown)'
     return None
 
 
@@ -155,6 +211,7 @@ def imports() -> dict:
 
 def probe() -> dict:
     import socket
+    import sqlite3
     import subprocess
 
     blocked = {}
@@ -200,9 +257,15 @@ def probe() -> dict:
         attempt('source_create', lambda: (source/'new.txt').write_bytes(b'x'))
         attempt('source_remove', original.unlink)
         attempt('source_utime', lambda: os.utime(original))
+        if O_TEMPORARY:  # read-only open that deletes the file on close (review M1 P12)
+            attempt('source_open_temporary',
+                    lambda: os.close(os.open(original, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | O_TEMPORARY)))
+        attempt('source_sqlite', lambda: sqlite3.connect(source/'probe.db').close())
+        attempt('source_sqlite_uri', lambda: sqlite3.connect(f'{(source/"probe.db").as_uri()}?mode=rwc', uri=True).close())
     finally:
         SOURCE_ROOT.clear()
-    unchanged = original.read_bytes() == b'synthetic probe file\n' and not (source/'new.txt').exists()
+    unchanged = (original.read_bytes() == b'synthetic probe file\n' and not (source/'new.txt').exists()
+                 and not (source/'probe.db').exists())
     return {'blocked': blocked, 'source_unchanged': unchanged}
 
 

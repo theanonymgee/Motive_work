@@ -3,11 +3,15 @@
 Every document is generated here at test time (``tests/fixtures/make_pdf.py``, ``make_hwp.py``,
 ``cfb.py``); nothing binary is committed.
 """
+import gc
 import io
 import logging
 import random
 import re
 import struct
+import tracemalloc
+import warnings
+import zipfile
 from pathlib import Path
 
 import olefile
@@ -28,6 +32,22 @@ def run(data: bytes, ext: str, limits: Limits = DEFAULT_LIMITS):
 
 def outcome(result) -> tuple[str, str | None]:
     return result.status, result.error
+
+
+def traced_peak(data: bytes, ext: str, limits: Limits):
+    """``(status, error, unit count, peak bytes)``: tracemalloc peak of one dispatcher call.
+
+    The input is built and the parser modules are imported before tracing starts, so the peak is what
+    parsing allocates (streams, decompressed sections, events, text, units).
+    """
+    run(b'warm up', '.txt')
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = run(data, ext, limits)
+        return result.status, result.error, len(result.units), tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
 
 
 def texts(result) -> list[str]:
@@ -128,8 +148,8 @@ def test_every_unit_passes_locator_check_unit(rel):
 
 def test_parser_versions_follow_the_format():
     assert re.fullmatch(r'pdf-1/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
-    assert re.fullmatch(r'hwp-1/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
-    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-1')
+    assert re.fullmatch(r'hwp-2/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
+    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-2')
     assert parsers.parser_for('.pdf').version == pdf.VERSION
     assert parsers.parser_for('.hwp').version == hwp.VERSION
     assert parsers.parser_for('.HWPX').version == hwp.HWPX_VERSION
@@ -264,6 +284,69 @@ def test_hwp_sections_are_read_in_numeric_order_and_empty_text_keeps_the_index()
         (1, 1, 'zero'), (1, 2, 'zero b'), (3, 1, 'two'), (11, 1, 'ten')]
 
 
+def test_hwp_only_plain_decimal_stream_names_are_sections():
+    """Review M1-L8: ``Section0`` and ``Section00`` would both be section 1 and repeat its locators."""
+    def stream(texts_):
+        return make_hwp.deflate(make_hwp.section_stream(texts_))
+    streams = {'FileHeader': make_hwp.file_header(make_hwp.FLAG_COMPRESSED), 'BodyText/Section0': stream(['zero']),
+               'BodyText/Section00': stream(['not a section']), 'BodyText/Section01': stream(['not either'])}
+    result = run(cfb.write_cfb(streams), '.hwp')
+    assert [(u.unit, u.text) for u in result.units] == [({'kind': 'section_para', 'section': 1, 'index': 1}, 'zero')]
+
+
+def reference_para_text(raw: bytes) -> str:
+    """The hwp-1 rule, one integer per WCHAR: the bytes-based reader must give the same text."""
+    chars = struct.unpack('<%dH' % (len(raw) // 2), raw[:len(raw) // 2 * 2])
+    units, i = [], 0
+    while i < len(chars):
+        c = chars[i]
+        if c in hwp._LONG_CONTROLS:
+            i += 8
+            continue
+        if c in (10, 13):
+            units.append(10)
+        elif c >= 32:
+            units.append(c)
+        i += 1
+    return struct.pack('<%dH' % len(units), *units).decode('utf-16-le', errors='replace')
+
+
+def test_hwp_para_text_matches_the_per_character_rule():
+    # U+0400 then U+AC00 is 00 04 00 AC: the bytes 04 00 look like a control when read from an odd offset.
+    assert hwp._para_text('\u0400\uac00'.encode('utf-16-le')) == '\u0400\uac00'
+    noise = random.Random(11)
+    alphabet = [0, 1, 2, 9, 10, 13, 24, 31, 32, 0x41, 0x400, 0x1F00, 0xAC00, 0xD800, 0xDC00, 0xD83D, 0xDE00, 0xFFFF]
+    for _ in range(400):
+        raw = struct.pack('<%dH' % (n := noise.randrange(0, 60)), *(noise.choice(alphabet) for _ in range(n)))
+        raw += b'\x07' * noise.randrange(0, 2)  # an odd trailing byte is ignored
+        assert hwp._para_text(raw) == reference_para_text(raw) == hwp._para_text(memoryview(raw)), raw
+
+
+def test_hwp_paragraph_limit_and_early_unit_and_text_limits():
+    text = '가' * 500  # 1,000 bytes of PARA_TEXT plus the closing 0x000D
+    data = make_hwp.hwp_bytes([[text, 'b']])
+    assert outcome(run(data, '.hwp', Limits(hwp_max_para_bytes=1002))) == ('ok', None)
+    assert outcome(run(data, '.hwp', Limits(hwp_max_para_bytes=1001))) == ('too_large', 'hwp_para')
+    many = make_hwp.hwp_bytes([['a', 'b', 'c'], ['d']])
+    assert outcome(run(many, '.hwp', Limits(max_units=3))) == ('too_large', 'limit_units')
+    assert outcome(run(many, '.hwp', Limits(max_text_chars=3))) == ('too_large', 'limit_chars')
+
+
+def test_hwp_memory_is_bounded_by_the_section_and_paragraph_limits():
+    """Review M1-1 (P4): hwp-1 turned a paragraph into one Python integer per character (about 35 times its
+    size). A 1 MiB paragraph (a few KiB compressed) now takes <= 5 x its size (k = 5, about 3.5 measured:
+    the inflated section, the cut-out text and the decoded string). A 4 MiB paragraph over
+    ``hwp_max_para_bytes`` is refused before decoding: peak <= 3 x the inflated 4 MiB section."""
+    size = 2**20
+    data = make_hwp.hwp_bytes([['가' * (size // 2)]])
+    assert len(data) < 16 * 2**10
+    status, error, units, peak = traced_peak(data, '.hwp', Limits())
+    assert (status, error, units) == ('ok', None, 1) and peak <= 5 * size
+    big = make_hwp.hwp_bytes([['가' * (2 * size)]])
+    status, error, units, peak = traced_peak(big, '.hwp', Limits(hwp_max_para_bytes=size // 4))
+    assert (status, error) == ('too_large', 'hwp_para') and peak <= 3 * 4 * size
+
+
 def test_hwp_other_records_are_skipped_and_trailing_deflate_data_is_ignored():
     raw = (make_hwp.record(make_hwp.TAG_DOCUMENT_PROPERTIES, 0, b'\x07' * 30)
            + make_hwp.para('keep me') + make_hwp.record(99, 2, b'\xff' * 10))
@@ -355,6 +438,36 @@ def test_hwpx_sections_numeric_order_empty_paragraphs_and_other_parts_ignored():
     result = run(archive, '.hwpx')
     assert [(u.unit['section'], u.unit['index'], u.text) for u in result.units] == [
         (1, 2, 'zero'), (3, 2, 'two'), (11, 2, 'ten')]
+
+
+def test_hwpx_only_plain_decimal_part_names_are_sections_and_repeated_names_are_bad_zip():
+    archive = make_hwp.hwpx_bytes([], extra={
+        'Contents/section0.xml': make_hwp.hwpx_section([make_hwp.hp_para('zero')]),
+        'Contents/section00.xml': make_hwp.hwpx_section([make_hwp.hp_para('not a section')])})
+    assert [(u.unit['section'], u.text) for u in run(archive, '.hwpx').units] == [(1, 'zero')]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as twice, warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # zipfile warns about the repeated name
+        for text in ('first', 'second'):
+            twice.writestr('Contents/section0.xml', make_hwp.hwpx_section([make_hwp.hp_para(text)]))
+    assert outcome(run(buffer.getvalue(), '.hwpx')) == ('failed', 'bad_zip')
+
+
+def test_hwpx_memory_stays_near_the_part_size():
+    """1 MiB of empty ``hp:p``: hwpx-1 built a tree (about 16 times the part); the stream keeps the part and
+    one chunk of events: peak <= 3 x the part (k = 3)."""
+    part = 2**20
+    data = make_hwp.hwpx_bytes([make_hwp.hwpx_section(['<hp:p/>' * (part // 7)])])
+    status, error, units, peak = traced_peak(data, '.hwpx', Limits())
+    assert (status, error, units) == ('ok', None, 0) and peak <= 3 * part
+
+
+def test_hwpx_inline_children_of_a_text_and_odd_nesting():
+    xml = (f'<?xml version="1.0"?><hs:sec xmlns:hs="{make_hwp.HS_NS}" xmlns:hp="{make_hwp.HP_NS}"><hp:p><hp:run>'
+           '<hp:t>a<hp:tab/>b<hp:lineBreak/>c<hp:x>ignored</hp:x>d</hp:t>tail ignored<hp:tab/>'
+           '<hp:t>e<hp:p><hp:run><hp:t>inner</hp:t></hp:run></hp:p>f</hp:t></hp:run></hp:p></hs:sec>').encode('utf-8')
+    result = run(make_hwp.hwpx_bytes([xml]), '.hwpx')
+    assert [(u.unit['index'], u.text) for u in result.units] == [(1, 'a\tb\ncd\tef'), (2, 'inner')]
 
 
 def test_hwpx_rejects_missing_section_bad_zip_dtd_invalid_xml_and_limits():

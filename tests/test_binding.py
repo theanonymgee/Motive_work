@@ -229,6 +229,64 @@ def test_validate_locator_against_store(db, bundle, tmp_path):
         assert info.value.code == code
 
 
+def online_only(monkeypatch, *targets):
+    """Report the cloud recall attribute for ``targets`` (all files when none); stand-in for OneDrive."""
+    keys = {(os.stat(t).st_ino, os.stat(t).st_dev) for t in targets}
+    real = binding.collect.file_attributes
+
+    def attributes(info):
+        value = real(info)
+        if not keys or (info.st_ino, info.st_dev) in keys:
+            value |= paths.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        return value
+
+    monkeypatch.setattr(binding.collect, 'file_attributes', attributes)
+
+
+def test_verify_does_not_read_a_cloud_placeholder(db, bundle, tmp_path, monkeypatch):
+    """Review M1-2: an active document that became online-only is not opened (no download)."""
+    path = tmp_path/'src'/'docs'/'notes_utf8.txt'
+    online_only(monkeypatch, path)
+    reads = []
+    real_read = binding.collect.read_source
+    monkeypatch.setattr(binding.collect, 'read_source', lambda p: reads.append(p) or real_read(p))
+    report = binding.verify(db)
+    assert str(path.resolve()) not in reads and reads  # the other files are still read
+    assert report['ok'] and unverifiable(report)['placeholder'] == 1
+    oks = report['versions']['ok']
+    reads.clear()
+    report = binding.verify(db, read_cloud_placeholders=True)  # [scan] read_cloud_placeholders = true
+    assert str(path.resolve()) in reads and 'placeholder' not in unverifiable(report)
+    assert report['versions']['ok'] == oks + 1
+
+
+def test_verify_reads_nothing_when_every_file_is_a_placeholder(db, tmp_path, monkeypatch):
+    root = add_root(db, tmp_path/'src')
+    (tmp_path/'src'/'a.txt').write_bytes('\n'.join(LINES_KO).encode('utf-8'))
+    scan(db, root)
+    online_only(monkeypatch)
+    calls = []
+    monkeypatch.setattr(binding.collect, 'read_source', lambda p: calls.append(p))
+    report = binding.verify(db)
+    assert calls == [] and unverifiable(report) == {'placeholder': 1}
+    assert report['ok'] and report['versions']['checked'] == 0  # nothing verified (the CLI says so)
+
+
+def test_units_on_a_version_that_is_not_ok_are_a_failure(db, bundle, tmp_path):
+    """Review M1-L7: a status changed away from ok while its units stay is not 'skipped'."""
+    version, _ = first_unit(db, 'docs/notes_utf8.txt', tmp_path)
+    stored = db.execute('SELECT COUNT(*) FROM units WHERE version_id=?', (version,)).fetchone()[0]
+    before = binding.verify(db)
+    db.execute("UPDATE versions SET parse_status='failed', parse_error='binary_content' WHERE id=?", (version,))
+    report = binding.verify(db)
+    assert not report['ok'] and report['versions']['failed'] == 1
+    [failure] = report['failures']
+    assert (failure['version_id'], failure['problem'], failure['ordinal']) == (version, 'units_on_not_ok_version', None)
+    assert report['units']['total'] == before['units']['total'] and report['units']['bound'] == before['units']['bound'] - stored
+    assert unverifiable(report)['skipped_not_ok'] == unverifiable(before)['skipped_not_ok']
+    assert SENTINEL not in json.dumps(report, ensure_ascii=False)
+
+
 def test_binding_reads_sources_only_through_read_source():
     source = open(binding.__file__, encoding='utf-8').read()
     assert 'open(' not in source.replace('collect.read_source', '') and 'collect.read_source(path)' in source

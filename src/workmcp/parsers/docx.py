@@ -6,71 +6,91 @@ text box or a table inside a paragraph is not repeated in the outer one. ``index
 ``w:p`` of the document in order (empty ones too); ``table``, ``row``, ``column`` are the position of
 the closest table, row and cell. Headers, footers, footnotes and comments are not read. Text boxes
 that Word writes twice (``mc:Choice`` and ``mc:Fallback``) are read once, from ``mc:Choice``.
+
+The part is read as a stream of element events (``_container.iter_xml``) with no tree and no parent
+map, so memory stays near the part's size. A Strict Open XML document is ``unsupported/ooxml_strict``.
 """
 from __future__ import annotations
 
 from . import Limits, ParseFailure, Unit, _container
 
 NAME = 'docx'
-VERSION = 'docx-1'
+VERSION = 'docx-2'
 
 _W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _MC = '{http://schemas.openxmlformats.org/markup-compatibility/2006}'
-_P, _T, _TAB, _BR, _CR = _W + 'p', _W + 't', _W + 'tab', _W + 'br', _W + 'cr'
+_DOCUMENT, _P, _T = _W + 'document', _W + 'p', _W + 't'
 _TBL, _TR, _TC = _W + 'tbl', _W + 'tr', _W + 'tc'
 _FALLBACK = _MC + 'Fallback'
-_PIECES = {_T: None, _TAB: '\t', _BR: '\n', _CR: '\n'}
-
-
-def _position(element, parents, positions):
-    """1-based position of a ``w:tr``/``w:tc`` among its siblings of the same tag."""
-    parent = parents[element]
-    if parent not in positions:
-        counts, table = {}, {}
-        for child in parent:
-            counts[child.tag] = counts.get(child.tag, 0) + 1
-            table[child] = counts[child.tag]
-        positions[parent] = table
-    return positions[parent][element]
+_BREAKS = {_W + 'tab': '\t', _W + 'br': '\n', _W + 'cr': '\n'}
 
 
 def parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
     archive = _container.open_zip(data, limits)
-    root = _container.parse_xml(_container.read_part(archive, 'word/document.xml', limits))
-    parents = {child: parent for parent in root.iter() for child in parent}
-    # Per element, in document order (a parent always comes before its children): the closest ancestor
-    # paragraph and cell, and whether it sits inside mc:Fallback. Walking up per element would be quadratic
-    # on deeply nested XML.
-    paragraph_of, cell_of, fallback = {root: None}, {root: None}, {root: False}
-    paragraphs, indexes, pieces, tables = [], {}, {}, {}
-    for element in root.iter():
+    part = _container.read_part(archive, 'word/document.xml', limits)
+    found = []        # (index, unit, text) of the paragraphs with text, in the order they end
+    paragraphs = []   # open w:p: [index, pieces, inside mc:Fallback, coordinates of the closest cell]
+    cells = []        # open w:tc: its coordinates, or None when it is not in a w:tr of a w:tbl
+    tables = {}       # open w:tbl -> [number, w:tr children so far]
+    rows = {}         # open w:tr -> [position in its w:tbl or None, w:tc children so far]
+    texts = {}        # open w:t -> (pieces of its paragraph, slot for its text)
+    index = table_count = fallback = 0
+    for event, element, path in _container.iter_xml(part):
         tag = element.tag
-        if element is not root:
-            parent = parents[element]
-            paragraph_of[element] = parent if parent.tag == _P else paragraph_of[parent]
-            cell_of[element] = parent if parent.tag == _TC else cell_of[parent]
-            fallback[element] = fallback[parent] or parent.tag == _FALLBACK
-        if tag == _P:
-            paragraphs.append(element)
-            indexes[element] = len(paragraphs)
-            pieces[element] = []
-        elif tag == _TBL:
-            tables[element] = len(tables) + 1
-        elif tag in _PIECES and paragraph_of[element] is not None:
-            pieces[paragraph_of[element]].append((element.text or '') if tag == _T else _PIECES[tag])
-    units, positions = [], {}
-    for paragraph in paragraphs:
-        text = ''.join(pieces[paragraph]).strip()
-        if not text or fallback[paragraph]:
+        parent = path[-1] if path else None
+        if event == 'start':
+            if parent is None:
+                _container.check_root(element, _DOCUMENT)
+            if tag == _P:
+                index += 1
+                paragraphs.append([index, [], fallback > 0, cells[-1] if cells else None])
+            elif tag == _T:
+                if paragraphs:
+                    pieces = paragraphs[-1][1]
+                    texts[element] = (pieces, len(pieces))
+                    pieces.append('')
+            elif tag in _BREAKS:
+                if paragraphs:
+                    paragraphs[-1][1].append(_BREAKS[tag])
+            elif tag == _TBL:
+                table_count += 1
+                tables[element] = [table_count, 0]
+            elif tag == _TR:
+                position = None
+                if parent is not None and parent.tag == _TBL:
+                    tables[parent][1] += 1
+                    position = tables[parent][1]
+                rows[element] = [position, 0]
+            elif tag == _TC:
+                coordinates = None
+                if parent is not None and parent.tag == _TR:
+                    row = rows[parent]
+                    row[1] += 1
+                    table = path[-2] if len(path) > 1 else None
+                    if row[0] is not None and table is not None and table.tag == _TBL:
+                        coordinates = {'table': tables[table][0], 'row': row[0], 'column': row[1]}
+                cells.append(coordinates)
+            elif tag == _FALLBACK:
+                fallback += 1
             continue
-        unit = {'kind': 'paragraph', 'index': indexes[paragraph]}
-        cell = cell_of[paragraph]
-        row = parents.get(cell) if cell is not None else None
-        table = parents.get(row) if row is not None else None
-        if row is not None and row.tag == _TR and table.tag == _TBL:
-            unit.update(table=tables[table], row=_position(row, parents, positions),
-                        column=_position(cell, parents, positions))
-        units.append(Unit(len(units) + 1, 'paragraph', unit, text))
-        if len(units) > limits.max_units:
-            raise ParseFailure('too_large', 'limit_units')
-    return units, None
+        if tag == _P:
+            number, pieces, skipped, coordinates = paragraphs.pop()
+            text = ''.join(pieces).strip()
+            if text and not skipped:
+                found.append((number, {'kind': 'paragraph', 'index': number, **(coordinates or {})}, text))
+                if len(found) > limits.max_units:
+                    raise ParseFailure('too_large', 'limit_units')
+        elif tag == _T:
+            if element in texts:
+                pieces, slot = texts.pop(element)
+                pieces[slot] = element.text or ''
+        elif tag == _TBL:
+            del tables[element]
+        elif tag == _TR:
+            del rows[element]
+        elif tag == _TC:
+            cells.pop()
+        elif tag == _FALLBACK:
+            fallback -= 1
+    found.sort(key=lambda item: item[0])  # a nested paragraph ends before the one around it
+    return [Unit(n, 'paragraph', unit, text) for n, (_, unit, text) in enumerate(found, 1)], None

@@ -104,7 +104,31 @@ def many_parts(count: int) -> bytes:
     return msg.as_bytes()
 
 
-NO_HEADERS = '\n본문만 있고 헤더가 없는 바이트 합성표지7f3a\n'.encode()
+ATTACHED_LINE = '첨부된 메일 본문 줄'
+
+
+def forwarded_message(*, inline: bool = False) -> bytes:
+    """mixed[ plain (part 2), message/rfc822 (part 3)[ the attached message (part 4) ] ].
+
+    The attached message has its own headers and a text/plain body (``ATTACHED_LINE``), which the parser
+    must not read. ``inline`` drops the attachment disposition of the message/rfc822 part.
+    """
+    inner = EmailMessage()
+    inner['From'] = f'{PEOPLE[2]} <{mail_address(PEOPLE[2])}>'
+    inner['Subject'] = '전달된 합성 메일'
+    inner['Date'] = DATE
+    inner.set_content(f'{ATTACHED_LINE}\n')
+    msg = EmailMessage()
+    _headers(msg, cc=False)
+    msg.set_content(_body(LINES_KO[:2]))
+    msg.add_attachment(inner)
+    msg.set_boundary('=_synthetic_mixed_=')
+    if inline:
+        del msg.get_payload(1)['Content-Disposition']
+    return msg.as_bytes()
+
+
+NO_HEADERS ='\n본문만 있고 헤더가 없는 바이트 합성표지7f3a\n'.encode()
 
 
 def html_expected(rel_path: str, part: int) -> Expected:

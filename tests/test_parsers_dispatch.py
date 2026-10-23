@@ -6,6 +6,7 @@ dispatcher contract is checked, with a fake parser standing in where a case need
 import importlib.metadata
 import os
 import re
+from dataclasses import replace
 
 import pytest
 
@@ -18,9 +19,9 @@ PYPDF = importlib.metadata.version('pypdf')
 OLEFILE = importlib.metadata.version('olefile')
 EXPECTED_PARSERS = {
     '.txt': ('text', 'text-1'), '.md': ('text', 'text-1'), '.csv': ('csv', 'csv-1'),
-    '.pdf': ('pdf', f'pdf-1/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-1'), '.pptx': ('pptx', 'pptx-1'),
-    '.xlsx': ('xlsx', 'xlsx-1'), '.eml': ('eml', 'eml-1'), '.hwp': ('hwp', f'hwp-1/olefile-{OLEFILE}'),
-    '.hwpx': ('hwpx', 'hwpx-1')}
+    '.pdf': ('pdf', f'pdf-1/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-2'), '.pptx': ('pptx', 'pptx-2'),
+    '.xlsx': ('xlsx', 'xlsx-2'), '.eml': ('eml', 'eml-2'), '.hwp': ('hwp', f'hwp-2/olefile-{OLEFILE}'),
+    '.hwpx': ('hwpx', 'hwpx-2')}
 SIGNED = {'.pdf': b'%PDF-1.4\n', '.docx': b'PK\x03\x04', '.pptx': b'PK\x03\x04', '.xlsx': b'PK\x05\x06',
           '.hwpx': b'PK\x03\x04'}
 
@@ -166,6 +167,17 @@ def test_bad_units_are_never_returned(monkeypatch, bad):
     assert (result.status, result.error, result.units) == ('failed', 'unit_shape_invalid', ())
 
 
+def test_two_units_with_one_locator_are_refused(monkeypatch):
+    """Review M1-L8: binding and the locator check find a unit by its locator, so one version must not repeat one."""
+    twice = [Unit(1, 'section_para', {'kind': 'section_para', 'section': 1, 'index': 1}, 'first'),
+             Unit(2, 'section_para', {'index': 1, 'section': 1, 'kind': 'section_para'}, 'second')]  # same unit_json
+    fake(monkeypatch, lambda data, limits: (twice, None))
+    result = parsers.parse(b'synthetic', '.txt', Limits())
+    assert (result.status, result.error, result.units) == ('failed', 'unit_duplicate', ())
+    fake(monkeypatch, lambda data, limits: ([twice[0], replace(twice[1], unit={**twice[1].unit, 'index': 2})], None))
+    assert parsers.parse(b'synthetic', '.txt', Limits()).status == 'ok'
+
+
 def test_encoding_must_be_text_or_none(monkeypatch):
     fake(monkeypatch, lambda data, limits: ([line(1, 'good')], b'utf-8'))
     assert parsers.parse(b'synthetic', '.txt', Limits()).error == 'unit_shape_invalid'
@@ -244,6 +256,7 @@ def test_limits_defaults_follow_the_design():
                               csv_max_columns=1_000, pdf_max_pages=2_000, pptx_max_slides=2_000,
                               xlsx_max_sheets=1_000, eml_max_parts=1_000, hwp_max_sections=1_000,
                               zip_max_entries=10_000, zip_max_part_bytes=128 * 2**20,
-                              zip_max_total_bytes=512 * 2**20)
+                              zip_max_total_bytes=512 * 2**20, xml_max_tree_bytes=16 * 2**20,
+                              hwp_max_para_bytes=16 * 2**20)
     with pytest.raises(AttributeError):
         Limits().max_units = 1  # frozen

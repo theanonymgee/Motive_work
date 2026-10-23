@@ -710,10 +710,17 @@ def test_runtime_judge_separates_loopback_from_everything_else(event, args, outs
 def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
     """Positive control through the real hook: outside attempts are recorded and blocked before they happen."""
     _, report = run_wrapper(tmp_path, 'probe')
+    temporary = {'source_open_temporary': True} if _audited_server.O_TEMPORARY else {}
     assert report['blocked'] == {'connect': True, 'getaddrinfo': True, 'subprocess': True, 'loopback': False,
                                  'loopback_listener': True, 'source_read': False, 'source_write': True,
-                                 'source_create': True, 'source_remove': True, 'source_utime': True}
-    assert report['source_unchanged'] is True
+                                 'source_create': True, 'source_remove': True, 'source_utime': True,
+                                 **temporary, 'source_sqlite': True, 'source_sqlite_uri': True}
+    assert report['source_unchanged'] is True  # the delete-on-close open did not delete the file, no .db made
+    source_flagged = [e for e in report['events'] if e.get('source') and e['violation']]
+    assert {e['event'] for e in source_flagged} >= {'open', 'os.remove', 'os.utime', 'sqlite3.connect'}
+    if temporary:
+        flags = [int(e['violation'].split()[2]) for e in source_flagged if e['violation'].startswith('os.open flags')]
+        assert any(value & _audited_server.O_TEMPORARY and not value & (os.O_WRONLY | os.O_RDWR) for value in flags)
     flagged = {e['event'] for e in report['events'] if e['violation']}
     assert {'socket.connect', 'socket.getaddrinfo', 'subprocess.Popen', 'socket.bind'} <= flagged
     listener = [e for e in report['events'] if e['event'] == 'socket.bind' and e['violation']]

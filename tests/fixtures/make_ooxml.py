@@ -374,6 +374,37 @@ def pptx_with_dtd() -> bytes:
     return pptx_package([('rId2', slide)], ['rId2'])
 
 
+def pptx_alternate_choices() -> bytes:
+    """``mc:AlternateContent`` with two ``mc:Choice`` (shapes 1, then nothing from the second) and a Fallback."""
+    alternate = (f'<mc:AlternateContent xmlns:mc="{NS_MC}">'
+                 f'<mc:Choice Requires="p14">{p_sp([a_p(a_r("첫 선택 도형"))])}</mc:Choice>'
+                 f'<mc:Choice Requires="p15">{p_sp([a_p(a_r("둘째 선택 도형"))])}</mc:Choice>'
+                 f'<mc:Fallback>{p_sp([a_p(a_r("대체 도형"))])}</mc:Fallback></mc:AlternateContent>')
+    return pptx_package([('rId2', _slide(alternate, p_sp([a_p(a_r(SENTINEL))])))], ['rId2'])
+
+
+# Transitional -> Strict Open XML namespaces (ISO/IEC 29500 Strict); package relationships and content types stay.
+STRICT_NAMESPACES = {
+    NS_W: 'http://purl.oclc.org/ooxml/wordprocessingml/main',
+    NS_S: 'http://purl.oclc.org/ooxml/spreadsheetml/main',
+    NS_P: 'http://purl.oclc.org/ooxml/presentationml/main',
+    NS_A: 'http://purl.oclc.org/ooxml/drawingml/main',
+    NS_R: 'http://purl.oclc.org/ooxml/officeDocument/relationships',
+}
+
+
+def to_strict(data: bytes) -> bytes:
+    """The same package written with Strict namespaces (also in relationship types, which share the prefix)."""
+    source = zipfile.ZipFile(io.BytesIO(data))
+    parts = {}
+    for name in source.namelist():
+        text = source.read(name).decode('utf-8')
+        for transitional, strict in STRICT_NAMESPACES.items():
+            text = text.replace(transitional, strict)
+        parts[name] = text
+    return zip_bytes(parts)
+
+
 # ---- bundle -----------------------------------------------------------------------------------
 
 def build() -> list[tuple[Expected, bytes]]:

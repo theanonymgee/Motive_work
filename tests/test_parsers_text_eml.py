@@ -1,5 +1,7 @@
 """TXT/MD/CSV and EML parsers (design M1 §5.7, §5.8, §11 ③). Documents are generated, never committed."""
 import re
+from email import policy
+from email.parser import BytesParser
 
 import pytest
 
@@ -147,6 +149,19 @@ def test_eml_html_is_read_when_the_only_plain_part_is_an_attachment():
     result = parsers.parse(make_eml.html_with_text_attachment_message(), '.eml', Limits())
     assert {u.unit['part'] for u in result.units[1:]} == {2}
     assert not any('첨부에만' in u.text for u in result.units)
+
+
+@pytest.mark.parametrize('inline', [False, True], ids=['attached', 'inline'])
+def test_eml_parts_of_an_embedded_message_are_not_read(inline):
+    """Review M1-L9 (P13): msg.walk() goes into a message/rfc822 part; its body is not this mail's body."""
+    data = make_eml.forwarded_message(inline=inline)
+    disposition = BytesParser(policy=policy.default).parsebytes(data).get_payload(1).get_content_disposition()
+    assert disposition == (None if inline else 'attachment')
+    result = parsers.parse(data, '.eml', Limits())
+    assert result.status == 'ok'
+    assert [(u.unit, u.text) for u in result.units[1:]] == [
+        ({'kind': 'mail', 'part': 2, 'line': n}, line) for n, line in enumerate(LINES_KO[:2], 1)]
+    assert not any(make_eml.ATTACHED_LINE in u.text or '전달된' in u.text for u in result.units)
 
 
 def test_eml_without_headers_or_with_only_other_headers_is_rejected():

@@ -5,8 +5,10 @@ the check proves that what is stored can be rebuilt from the original with the s
 version; it does not prove that the parser read the original correctly. A version whose file
 changed since it was observed cannot be re-checked and is counted as ``stale``, not as a failure.
 
-Files are read through ``collect.read_source`` only (mode ``'rb'``), once per document. Failure
-entries carry the path, short hash, unit coordinates and a fixed problem code, never unit text.
+Files are read through ``collect.read_source`` only (mode ``'rb'``), once per document, and a
+cloud placeholder (online-only file) is not read unless ``read_cloud_placeholders`` is set: reading
+it would make the sync client download it (design §2.4). Failure entries carry the path, short
+hash, unit coordinates and a fixed problem code, never unit text.
 """
 from __future__ import annotations
 
@@ -20,14 +22,14 @@ SCOPE = ('결속 100% = parse_status가 ok인 버전 중 현재 파일의 sha256
          '단위(순서·종류·좌표·텍스트·해시)·청크·근거 인용이 같은 파서 버전으로 현재 파일에서 다시 만들어진 값과 '
          '같음. 파서가 원문을 올바르게 읽었는지는 보이지 않음. 파일이 바뀐 옛 버전은 재검증 불가(stale)로 따로 셈.')
 MAX_FAILURES = 20
-UNVERIFIABLE = ('stale', 'missing', 'locked', 'unstable', 'parser_version_mismatch', 'skipped_not_ok')
+UNVERIFIABLE = ('stale', 'missing', 'locked', 'unstable', 'parser_version_mismatch', 'skipped_not_ok', 'placeholder')
 
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def _read(path: str, size: int):
+def _read(path: str, size: int, read_cloud_placeholders: bool = False):
     """``('ok', data, sha)`` or ``(result, None, None)`` for a file that cannot be re-checked."""
     try:
         before = os.stat(path, follow_symlinks=False)
@@ -35,6 +37,8 @@ def _read(path: str, size: int):
         return 'missing', None, None
     except OSError:
         return 'locked', None, None
+    if collect.file_attributes(before) & collect.RECALL_ATTRIBUTES and not read_cloud_placeholders:
+        return 'placeholder', None, None  # online-only: opening it would download it
     if before.st_size != size:
         return 'stale', None, None  # different size: different content, no need to read it
     try:
@@ -50,9 +54,13 @@ def _read(path: str, size: int):
     return 'ok', data, sha
 
 
-def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | None = None, files: dict | None = None) -> dict:
+def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | None = None, files: dict | None = None,
+                   *, read_cloud_placeholders: bool = False) -> dict:
     """Re-derive one version (design §6.2). ``cache`` keeps parse results by (sha256, parser version)
-    and ``files`` keeps one read per document."""
+    and ``files`` keeps one read per document.
+
+    A version that is not ``ok`` but still has units is a failure (``units_on_not_ok_version``): the
+    store claims text the parser status says was never read."""
     limits = limits or parsers.Limits()
     files = {} if files is None else files
     row = db.execute('SELECT v.document_id, v.sha256, v.size, v.parse_status, v.parser_version, d.path, d.ext, '
@@ -65,10 +73,16 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
               'latest': bool(is_latest), 'result': None, 'units_total': 0, 'units_bound': 0, 'chunks_checked': 0,
               'evidence_checked': 0, 'failures': []}
     if parse_status != 'ok':
-        report['result'] = 'skipped_not_ok'
+        stored = db.execute('SELECT COUNT(*) FROM units WHERE version_id=?', (version_id,)).fetchone()[0]
+        if stored:
+            report.update(result='failed', units_total=stored)
+            report['failures'].append({'version_id': version_id, 'ordinal': None, 'problem': 'units_on_not_ok_version',
+                                       'path': path, 'sha12': sha256[:12], 'unit_label': '-'})
+        else:
+            report['result'] = 'skipped_not_ok'
         return report
     if document_id not in files or files[document_id][0] == 'stale':
-        files[document_id] = _read(path, size)
+        files[document_id] = _read(path, size, read_cloud_placeholders)
     outcome, data, current_sha = files[document_id]
     if outcome == 'ok' and current_sha != sha256:
         outcome = 'stale'
@@ -173,8 +187,12 @@ def _label(unit) -> str:
         return '-'
 
 
-def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None = None) -> dict:
-    """Every version in scope (all, some roots, or some documents), aggregated (design §6.3)."""
+def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None = None, *,
+           read_cloud_placeholders: bool = False) -> dict:
+    """Every version in scope (all, some roots, or some documents), aggregated (design §6.3).
+
+    ``ok`` is "no failure among the checked versions"; ``versions.checked == 0`` means nothing was
+    verified (the CLI says so)."""
     sql = 'SELECT v.id FROM versions v JOIN documents d ON d.id = v.document_id'
     clauses, args = [], []
     if root_ids is not None:
@@ -192,7 +210,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     chunks = evidence = 0
     failures, stale_latest = [], set()
     for version_id in ids:
-        report = verify_version(db, version_id, cache, limits, files)
+        report = verify_version(db, version_id, cache, limits, files, read_cloud_placeholders=read_cloud_placeholders)
         result = report['result']
         if result in ('ok', 'failed'):
             versions['checked'] += 1

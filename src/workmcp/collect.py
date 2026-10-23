@@ -107,11 +107,12 @@ class _Latest:
 class _Doc:
     id: int
     root_id: int
+    path: str
     status: str
     latest: _Latest | None
 
 
-_LOOKUP = ('SELECT d.id, d.root_id, d.status, v.id, v.seq, v.sha256, v.size, v.mtime_ns, v.parse_status, '
+_LOOKUP = ('SELECT d.id, d.root_id, d.path, d.status, v.id, v.seq, v.sha256, v.size, v.mtime_ns, v.parse_status, '
            'v.parser_version FROM documents d LEFT JOIN versions v ON v.document_id = d.id '
            'AND v.seq = (SELECT MAX(seq) FROM versions WHERE document_id = d.id) WHERE d.path_key = ?')
 _VERSION_FIELDS = 'parser, parser_version, encoding, parse_status, parse_error, unit_count, text_chars'
@@ -145,8 +146,15 @@ class _Scan:
         row = self.db.execute(_LOOKUP, (key,)).fetchone()
         if row is None:
             return None
-        latest = _Latest(*row[3:]) if row[3] is not None else None
-        return _Doc(row[0], row[1], row[2], latest)
+        latest = _Latest(*row[4:]) if row[4] is not None else None
+        return _Doc(row[0], row[1], row[2], row[3], latest)
+
+    def relocate(self, doc: _Doc, root_id: int, path: str):
+        """Same document (same ``path_key``) seen under another root or with another spelling (case)."""
+        if doc.root_id != root_id:
+            self.db.execute('UPDATE documents SET root_id=? WHERE id=?', (root_id, doc.id))
+        if doc.path != path:
+            self.db.execute('UPDATE documents SET path=? WHERE id=?', (path, doc.id))
 
     def mark_seen(self, doc_id: int):
         self.db.execute('UPDATE documents SET last_seen_at=? WHERE id=?', (store.now(), doc_id))
@@ -237,8 +245,7 @@ class _Scan:
             if doc.status == 'deleted':
                 self.db.execute("UPDATE documents SET status='skipped', skip_reason='cloud_placeholder', "
                                 "deleted_at=NULL WHERE id=?", (doc.id,))
-            if doc.root_id != root_id:
-                self.db.execute('UPDATE documents SET root_id=? WHERE id=?', (root_id, doc.id))
+            self.relocate(doc, root_id, path)
             self.mark_seen(doc.id)
         self.emit('skipped', path, code='cloud_placeholder')
 
@@ -262,8 +269,8 @@ class _Scan:
     def process_file(self, root_id, path, ext, counts):
         key = os.path.normcase(path)
         doc = self.lookup(key)
-        if doc is not None and doc.root_id != root_id:
-            self.db.execute('UPDATE documents SET root_id=? WHERE id=?', (root_id, doc.id))
+        if doc is not None:
+            self.relocate(doc, root_id, path)
         try:
             before = os.stat(path, follow_symlinks=False)
         except OSError:
@@ -271,6 +278,9 @@ class _Scan:
                 self.mark_seen(doc.id)
             counts['errors'] += 1
             self.emit('error', path, code='stat_failed')
+            return
+        if file_attributes(before) & RECALL_ATTRIBUTES and not self.settings.read_cloud_placeholders:
+            self.placeholder(root_id, path, ext, counts)  # became online-only after the folder was listed
             return
         latest = doc.latest if doc is not None else None
         current = parsers.parser_for(ext).version
@@ -375,7 +385,9 @@ class _Scan:
                     is_link = entry.is_symlink() or junction
                     is_dir = entry.is_dir(follow_symlinks=False) or junction
                 except OSError:
+                    # Unknown whether a file or a folder: nothing at or under this path is judged deleted.
                     counts['errors'] += 1
+                    self.unreadable.append(os.path.normcase(path))
                     self.emit('error', path, code='stat_failed')
                     continue
                 attributes = file_attributes(info)
@@ -410,12 +422,15 @@ class _Scan:
             stack.extend(reversed(folders))
 
     def judge_deleted(self, root_id, counts):
-        """Active or skipped documents of a fully walked root that were not seen (design §3.4)."""
+        """Active or skipped documents of a fully walked root that were not seen (design §3.4).
+
+        Never a document at or under a path that could not be listed or stat'ed (``unreadable``)."""
+        unknown = set(self.unreadable)
         hidden_under = [folder.rstrip(os.sep) + os.sep for folder in self.unreadable]
         rows = self.db.execute("SELECT id, path, path_key FROM documents WHERE root_id=? AND status IN "
                                "('active','skipped')", (root_id,)).fetchall()
         for doc_id, path, key in rows:
-            if doc_id in self.seen or any(key.startswith(prefix) for prefix in hidden_under):
+            if doc_id in self.seen or key in unknown or any(key.startswith(prefix) for prefix in hidden_under):
                 continue
             self.db.execute("UPDATE documents SET status='deleted', deleted_at=? WHERE id=?", (store.now(), doc_id))
             counts['deleted'] += 1

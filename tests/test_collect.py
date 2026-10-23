@@ -576,6 +576,90 @@ def test_unreadable_folder_is_counted_and_its_documents_are_not_deleted(db, tmp_
     assert document(db, tmp_path/'src'/'locked-dir'/'in.txt')[1] == 'active'
 
 
+def test_stat_failure_of_a_listed_folder_or_file_deletes_nothing(db, tmp_path, monkeypatch):
+    """Review M1-L6: an entry whose stat fails might be a folder or a file; nothing at or under it is deleted."""
+    root = add_root(db, tmp_path/'src')
+    (tmp_path/'src'/'sub').mkdir()
+    (tmp_path/'src'/'sub'/'in.txt').write_bytes(b'synthetic inside\n')
+    (tmp_path/'src'/'f.txt').write_bytes(b'synthetic file\n')
+    (tmp_path/'src'/'ok.txt').write_bytes(b'synthetic ok\n')
+    assert changes(scan(db, root)) == {'added': 3}
+    failing = {'sub', 'f.txt'}
+    real = os.scandir
+
+    class Entry:
+        def __init__(self, entry):
+            self._entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self._entry, name)
+
+        def stat(self, **options):
+            if self._entry.name in failing:
+                raise PermissionError(13, 'synthetic stat denial')
+            return self._entry.stat(**options)
+
+    class Listing:
+        def __init__(self, listing):
+            self._listing = listing
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._listing.close()
+
+        def __iter__(self):
+            return (Entry(entry) for entry in self._listing)
+
+    monkeypatch.setattr(collect.os, 'scandir', lambda folder: Listing(real(folder)))
+    result = scan(db, root)
+    assert result['total']['errors'] == 2 and changes(result) == {'unchanged': 1}
+    assert [e['code'] for e in result['events'] if e['event'] == 'error'] == ['stat_failed', 'stat_failed']
+    for rel in ('sub/in.txt', 'f.txt', 'ok.txt'):
+        assert document(db, tmp_path/'src'/rel)[1] == 'active', rel
+    failing.clear()
+    assert changes(scan(db, root)) == {'unchanged': 3}
+    failing.add('f.txt')
+    (tmp_path/'src'/'ok.txt').unlink()  # a real deletion next to the failing entry is still judged
+    assert changes(scan(db, root)) == {'unchanged': 1, 'deleted': 1}
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='case-insensitive names (normcase) are a Windows matter')
+def test_case_only_rename_updates_the_stored_path(db, tmp_path, calls):
+    """Review M1-L5 (P10): same path_key, so the same document, but documents.path takes the new spelling."""
+    root = text_root(db, tmp_path)
+    old, new = tmp_path/'src'/'a.txt', tmp_path/'src'/'A.TXT'
+    scan(db, root)
+    doc_id = document(db, old)[0]
+    os.rename(old, new)
+    assert changes(scan(db, root)) == {'unchanged': 1} and calls['read'] == 1
+    assert db.execute('SELECT id, path FROM documents').fetchall() == [(doc_id, str(new.resolve()))]
+    assert document(db, new)[0] == doc_id
+
+
+def test_file_that_becomes_a_placeholder_after_listing_is_not_read(db, tmp_path, monkeypatch, calls):
+    """Review M1-2 (scan side): the attribute is checked again on the stat made just before reading."""
+    root = text_root(db, tmp_path)
+    path = tmp_path/'src'/'a.txt'
+    scan(db, root)
+    rewrite(path, b'synthetic changed\n')  # would be read and become a new version
+    real = collect.file_attributes
+    seen = {'calls': 0}
+
+    def attributes(info):
+        seen['calls'] += 1  # 1st: the folder listing, 2nd: the stat before reading
+        value = real(info)
+        return value | paths.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS if seen['calls'] >= 2 else value
+
+    monkeypatch.setattr(collect, 'file_attributes', attributes)
+    calls.update(read=0)
+    result = scan(db, root)
+    assert calls['read'] == 0 and calls['stream'] == 0 and result['total']['skipped'] == 1
+    assert changes(result) == {} and result['total']['new_versions'] == 0
+    assert document(db, path)[1] == 'active' and len(versions(db, document(db, path)[0])) == 1
+
+
 def test_name_that_is_not_utf8_is_an_error_not_a_crash(db, tmp_path):
     root = add_root(db, tmp_path/'src')
     try:

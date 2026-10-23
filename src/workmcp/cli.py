@@ -218,13 +218,13 @@ def verify_lines(report: dict) -> list[str]:
         f"verify {report['checked_at']}  versions {v['total']} checked {v['checked']} ok {v['ok']} "
         f"failed {v['failed']}  unverifiable {sum(un.values())} (stale {un['stale']}, missing {un['missing']}, "
         f"locked {un['locked']}, unstable {un['unstable']}, parser {un['parser_version_mismatch']}, "
-        f"not_ok {un['skipped_not_ok']})",
+        f"not_ok {un['skipped_not_ok']}, placeholder {un['placeholder']})",
         f"units {u['bound']}/{u['total']} bound ({u['rate'] * 100:.1f}%)  chunks {report['chunks_checked']}  "
         f"evidence {report['evidence_checked']}",
         *report['notice'],
     ]
     if report['ok']:
-        lines.append('binding ok')
+        lines.append('binding ok' if v['checked'] else 'binding ok (nothing verified)')
     else:
         lines.append('binding FAILED')
         lines += [f"{f['path']} @ {f['sha12']} / {f['unit_label']} : {f['problem']}" for f in report['failures']]
@@ -258,7 +258,8 @@ def verify(args) -> int:
                     print(f'not a scanned source root: {raw}', file=sys.stderr)
                     return 4
                 root_ids.append(row[0])
-        report = binding.verify(db, root_ids=root_ids, document_ids=args.doc or None, limits=cfg.scan.limits)
+        report = binding.verify(db, root_ids=root_ids, document_ids=args.doc or None, limits=cfg.scan.limits,
+                                read_cloud_placeholders=cfg.scan.read_cloud_placeholders)
     finally:
         db.close()
     print('\n'.join(verify_lines(report)))

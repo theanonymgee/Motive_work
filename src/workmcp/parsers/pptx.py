@@ -5,14 +5,16 @@ Slides are read in ``p:sldIdLst`` order (not file-name order). In a slide, every
 depth-first document order (a group gets one and its children follow). A shape with text gives one
 ``slide`` unit (paragraphs joined by a line break); a table gives one ``slide_cell`` unit per
 non-empty cell. Notes, masters and layouts are not read; ``mc:AlternateContent`` is read through its
-``mc:Choice``.
+first ``mc:Choice`` only (the others and ``mc:Fallback`` are alternatives of the same content).
+Each part is parsed as a tree, so it must fit ``Limits.xml_max_tree_bytes``; a Strict Open XML
+presentation is ``unsupported/ooxml_strict``.
 """
 from __future__ import annotations
 
 from . import Limits, ParseFailure, Unit, _container
 
 NAME = 'pptx'
-VERSION = 'pptx-1'
+VERSION = 'pptx-2'
 
 _P = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
 _A = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
@@ -39,12 +41,13 @@ def _resolve(base: str, target: str) -> str:
 
 
 def _relationships(archive, name: str, limits: Limits) -> dict[str, str]:
-    root = _container.parse_xml(_container.read_part(archive, name, limits))
+    root = _container.parse_xml(_container.read_part(archive, name, limits), limits)
     return {rel.get('Id'): rel.get('Target') for rel in root.iter(_REL + 'Relationship')}
 
 
 def _slide_names(archive, limits: Limits) -> list[str]:
-    root = _container.parse_xml(_container.read_part(archive, 'ppt/presentation.xml', limits))
+    root = _container.parse_xml(_container.read_part(archive, 'ppt/presentation.xml', limits), limits)
+    _container.check_root(root, _P + 'presentation')
     rels = _relationships(archive, 'ppt/_rels/presentation.xml.rels', limits)
     names = []
     for slide_id in root.iter(_P + 'sldId'):
@@ -66,16 +69,16 @@ def _text(body) -> str:
 
 
 def _shapes(parent):
-    """Shape elements below ``parent`` in depth-first order, looking through ``mc:Choice``."""
+    """Shape elements below ``parent`` in depth-first order, looking through the first ``mc:Choice``."""
     for child in parent:
         if child.tag in _SHAPES:
             yield child
             if child.tag == _P + 'grpSp':
                 yield from _shapes(child)
         elif child.tag == _MC + 'AlternateContent':
-            for choice in child:
-                if choice.tag == _MC + 'Choice':
-                    yield from _shapes(choice)
+            choice = child.find(_MC + 'Choice')
+            if choice is not None:
+                yield from _shapes(choice)
 
 
 def _slide_units(root, slide: int, units: list, limits: Limits) -> None:
@@ -108,6 +111,6 @@ def parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
         raise ParseFailure('too_large', 'pptx_count')
     units = []
     for slide, name in enumerate(names, 1):
-        root = _container.parse_xml(_container.read_part(archive, name, limits))
+        root = _container.parse_xml(_container.read_part(archive, name, limits), limits)
         _slide_units(root, slide, units, limits)
     return units, None

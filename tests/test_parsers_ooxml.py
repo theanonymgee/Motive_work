@@ -1,5 +1,7 @@
 """DOCX, XLSX and PPTX parsers (design M1 §5.3, §5.4, §5.8, §11 ③). Packages are generated, never committed."""
+import gc
 import re
+import tracemalloc
 
 import pytest
 
@@ -31,6 +33,22 @@ def check(item, data, limits=None):
 def outcome(data, ext, limits=None):
     result = parsers.parse(data, ext, limits or Limits())
     return result.status, result.error, len(result.units)
+
+
+def traced_peak(data, ext, limits):
+    """``(status, error, unit count, peak bytes)``: tracemalloc peak of one dispatcher call.
+
+    The input is built and the parser modules are imported before tracing starts, so the peak is what
+    parsing allocates (part bytes, events, tree, units).
+    """
+    parsers.parse(b'warm up', '.txt', Limits())
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = parsers.parse(data, ext, limits)
+        return result.status, result.error, len(result.units), tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
 
 
 def encrypt_flag(data: bytes) -> bytes:
@@ -76,6 +94,26 @@ def test_docx_rejects_bad_zip_missing_part_dtd_invalid_xml_and_oversized_member(
     assert len(big) < MIB  # spaces compress well: only the bounded read can see the real size
     assert outcome(big, '.docx', Limits(zip_max_part_bytes=MIB)) == ('too_large', 'zip_part', 0)
     assert outcome(big, '.docx', Limits(zip_max_part_bytes=3 * MIB)) == ('ok', None, 1)
+
+
+def test_docx_memory_stays_near_the_part_size():
+    """Review M1-1 (P2): 1 MiB of empty ``w:p`` packs into a few KiB. docx-1 built a tree plus four maps
+    (about 88 times the part); the stream keeps the part and one chunk of events: peak <= 3 x the part
+    (k = 3, about 1.8 measured). Over ``zip_max_part_bytes`` the bounded read stops at the limit: peak
+    <= 3 x the limit."""
+    part = 2**20
+    data = make_ooxml.docx_package('<w:p/>' * (part // 6))
+    assert len(data) < 16 * 2**10
+    status, error, units, peak = traced_peak(data, '.docx', Limits())
+    assert (status, error, units) == ('ok', None, 0) and peak <= 3 * part
+    status, error, units, peak = traced_peak(data, '.docx', Limits(zip_max_part_bytes=part // 2))
+    assert (status, error) == ('too_large', 'zip_part') and peak <= 3 * part // 2
+
+
+def test_docx_strict_and_foreign_roots_are_unsupported():
+    assert outcome(make_ooxml.to_strict(CASES['docs/report.docx'][1]), '.docx') == ('unsupported', 'ooxml_strict', 0)
+    foreign = make_ooxml.docx_package('', extra={'word/document.xml': '<?xml version="1.0"?><document><p/></document>'})
+    assert outcome(foreign, '.docx') == ('unsupported', 'bad_signature', 0)
 
 
 def test_zip_entry_and_total_size_limits_apply_to_every_zip_format():
@@ -125,6 +163,32 @@ def test_pptx_empty_slide_has_no_units_and_limits_and_damage_are_coded():
         'failed', 'missing_part', 0)
 
 
+def test_pptx_reads_only_the_first_choice_of_alternate_content():
+    result = parsers.parse(make_ooxml.pptx_alternate_choices(), '.pptx', Limits())
+    assert [(u.unit, u.text) for u in result.units] == [
+        ({'kind': 'slide', 'slide': 1, 'shape': 1}, '첫 선택 도형'), ({'kind': 'slide', 'slide': 1, 'shape': 2}, SENTINEL)]
+
+
+def test_pptx_strict_is_unsupported_and_a_slide_over_the_tree_limit_is_too_large():
+    assert outcome(make_ooxml.to_strict(CASES['docs/deck.pptx'][1]), '.pptx') == ('unsupported', 'ooxml_strict', 0)
+    slide = make_ooxml._slide(make_ooxml.p_sp([make_ooxml.a_p(make_ooxml.a_r(SENTINEL))]))
+    data = make_ooxml.pptx_package([('rId2', slide)], ['rId2'])
+    assert outcome(data, '.pptx', Limits(xml_max_tree_bytes=len(slide.encode()))) == ('ok', None, 1)
+    assert outcome(data, '.pptx', Limits(xml_max_tree_bytes=len(slide.encode()) - 1)) == ('too_large', 'xml_tree', 0)
+
+
+def test_pptx_tree_memory_is_bounded_by_the_tree_limit():
+    """Slides are trees: about 11 times the part for tiny elements (measured), asserted <= 16 x (k = 16).
+    So the default ``xml_max_tree_bytes`` (16 MiB) bounds one slide near 180 MiB. A part over the limit
+    is refused after the read only: peak <= 3 x the part."""
+    part = 2**20
+    data = make_ooxml.pptx_package([('rId2', make_ooxml._slide('<p:pic/>' * (part // 8)))], ['rId2'])
+    status, error, units, peak = traced_peak(data, '.pptx', Limits())
+    assert (status, error, units) == ('ok', None, 0) and peak <= 16 * part
+    status, error, units, peak = traced_peak(data, '.pptx', Limits(xml_max_tree_bytes=part // 2))
+    assert (status, error) == ('too_large', 'xml_tree') and peak <= 3 * part
+
+
 # ---- XLSX ----------------------------------------------------------------------------------------
 
 def test_xlsx_shared_inline_numbers_booleans_formulas_and_phonetic():
@@ -164,6 +228,38 @@ def test_xlsx_without_shared_strings_sheet_limit_and_damage_are_coded():
     assert outcome(make_ooxml.xlsx_sheets(3), '.xlsx', Limits(xlsx_max_sheets=3)) == ('ok', None, 3)
     assert outcome(make_ooxml.xlsx_missing_sheet(), '.xlsx') == ('failed', 'missing_part', 0)
     assert outcome(make_ooxml.xlsx_with_dtd(), '.xlsx') == ('failed', 'xml_dtd', 0)
+
+
+def test_xlsx_duplicate_cells_and_sheet_names_are_refused():
+    def book(*rows, sheets=(('시트', 'xl/worksheets/sheet1.xml'),)):
+        return make_ooxml.xlsx_package([(name, member, make_ooxml._sheet(*rows)) for name, member in sheets], None)
+    twice = '<row r="1">' + make_ooxml._c('A1', None, '<v>1</v>') + make_ooxml._c('A1', None, '<v>2</v>') + '</row>'
+    assert outcome(book(twice), '.xlsx') == ('failed', 'unit_duplicate', 0)
+    implied = '<row r="1">' + make_ooxml._c('B1', None, '<v>1</v>') + make_ooxml._c(None, None, '<v>2</v>') + \
+        make_ooxml._c('C1', None, '<v>3</v>') + '</row>'  # the cell without an address is C1 too
+    assert outcome(book(implied), '.xlsx') == ('failed', 'unit_duplicate', 0)
+    split_row = ('<row r="1">' + make_ooxml._c('A1', None, '<v>1</v>') + '</row>'
+                 + '<row r="1">' + make_ooxml._c('A1', None, '<v>2</v>') + '</row>')
+    assert outcome(book(split_row), '.xlsx') == ('failed', 'unit_duplicate', 0)
+    one = '<row r="1">' + make_ooxml._c('A1', None, '<v>1</v>') + '</row>'
+    same_name = (('시트', 'xl/worksheets/sheet1.xml'), ('시트', 'xl/worksheets/sheet2.xml'))
+    assert outcome(book(one, sheets=same_name), '.xlsx') == ('failed', 'unit_duplicate', 0)
+    other_name = (('시트', 'xl/worksheets/sheet1.xml'), ('시트2', 'xl/worksheets/sheet2.xml'))
+    assert outcome(book(one, sheets=other_name), '.xlsx') == ('ok', None, 2)
+
+
+def test_xlsx_strict_is_unsupported():
+    assert outcome(make_ooxml.to_strict(CASES['sheets/book.xlsx'][1]), '.xlsx') == ('unsupported', 'ooxml_strict', 0)
+
+
+def test_xlsx_memory_stays_near_the_part_size():
+    """1 MiB of empty rows: xlsx-1 kept a cleared shell per row (about 15 times the part); the stream keeps
+    the part and one chunk of events: peak <= 3 x the part (k = 3)."""
+    part = 2**20
+    sheet = make_ooxml._sheet('<row/>' * (part // 6))
+    data = make_ooxml.xlsx_package([('시트', 'xl/worksheets/sheet1.xml', sheet)], None)
+    status, error, units, peak = traced_peak(data, '.xlsx', Limits())
+    assert (status, error, units) == ('ok', None, 0) and peak <= 3 * part
 
 
 def test_xlsx_unit_limit_stops_early():

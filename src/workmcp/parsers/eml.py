@@ -3,7 +3,8 @@
 One ``mail_header`` unit (From/To/Cc/Subject/Date that are present, RFC 2047 words decoded) and the
 lines of every ``text/plain`` part that is not an attachment (``mail`` units, ``part`` = 1-based
 position in ``msg.walk()``). A message without such a part gives the text of its ``text/html`` parts
-instead. Attachments are not read.
+instead. Attachments are not read, and neither is any part of a message carried inside the
+message (``message/rfc822`` and other ``message/*`` parts, attached or inline).
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from html.parser import HTMLParser
 from . import Limits, ParseFailure, Unit
 
 NAME = 'eml'
-VERSION = 'eml-1'
+VERSION = 'eml-2'
 
 HEADERS = ('From', 'To', 'Cc', 'Subject', 'Date')
 _LINE_BREAK = re.compile(r'\r\n|\r|\n')
@@ -96,7 +97,14 @@ def parse(data: bytes, limits: Limits) -> tuple[list[Unit], str | None]:
     header_text = '\n'.join(header_lines).strip()
     if header_text:
         units.append(Unit(1, 'mail_header', {'kind': 'mail_header'}, header_text))
-    readable = [(number, part) for number, part in enumerate(parts, 1) if part.get_content_disposition() != 'attachment']
+    # A message inside the message (message/rfc822 and the other message/* types) is an attachment
+    # whatever its disposition: none of its parts is read. They keep their numbers in msg.walk().
+    embedded = set()
+    for part in parts:
+        if part.get_content_maintype() == 'message' and id(part) not in embedded:
+            embedded.update(id(inner) for inner in part.walk() if inner is not part)
+    readable = [(number, part) for number, part in enumerate(parts, 1)
+                if id(part) not in embedded and part.get_content_disposition() != 'attachment']
     plain = [(number, part) for number, part in readable if part.get_content_type() == 'text/plain']
     if plain:
         for number, part in plain:

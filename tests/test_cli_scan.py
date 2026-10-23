@@ -161,7 +161,8 @@ def test_verify_cli_output_and_exit_codes(home, tmp_path, capsys):
     assert (code, err) == (0, '')
     lines = out.splitlines()
     assert re.fullmatch(rf'verify \S+  versions {len(expected)} checked {oks} ok {oks} failed 0  unverifiable {not_ok} '
-                        rf'\(stale 0, missing 0, locked 0, unstable 0, parser 0, not_ok {not_ok}\)', lines[0])
+                        rf'\(stale 0, missing 0, locked 0, unstable 0, parser 0, not_ok {not_ok}, placeholder 0\)',
+                        lines[0])
     assert lines[1:] == [f'units {units}/{units} bound (100.0%)  chunks 0  evidence 0', 'binding ok']
     assert run(capsys, 'verify', '--root', str(src))[0] == 0
     assert run(capsys, 'verify', '--root', str(tmp_path/'elsewhere'))[0] == 4
@@ -181,6 +182,39 @@ def test_verify_cli_output_and_exit_codes(home, tmp_path, capsys):
     assert SENTINEL not in out and '변조' not in out
     other = db_doc_id(home, 'ascii.txt')
     assert run(capsys, 'verify', '--doc', str(other))[0] == 0
+
+
+def test_verify_cli_says_when_nothing_was_verified(home, tmp_path, capsys):
+    """Review M1-L7: exit 0 as designed (§6.3), but the last line tells 'nothing verified' apart from a pass."""
+    src = tmp_path/'src'
+    bundle.write_bundle(src)
+    assert run(capsys, 'scan', '--root', str(src))[0] == 0
+    failed = db_doc_id(home, 'binary.txt')
+    code, out, _ = run(capsys, 'verify', '--doc', str(failed))
+    assert code == 0 and out.splitlines()[-1] == 'binding ok (nothing verified)' and ' checked 0 ' in out
+    code, out, _ = run(capsys, 'verify', '--doc', str(db_doc_id(home, 'ascii.txt')))
+    assert code == 0 and out.splitlines()[-1] == 'binding ok'
+
+
+def test_verify_cli_passes_read_cloud_placeholders(home, tmp_path, capsys, monkeypatch):
+    """Review M1-2: ``verify`` follows ``[scan] read_cloud_placeholders`` (default false: no read)."""
+    from workmcp import binding, collect
+    src = tmp_path/'src'
+    (src/'docs').mkdir(parents=True)
+    (src/'docs'/'a.txt').write_bytes(b'synthetic placeholder line\n')
+    assert run(capsys, 'scan', '--root', str(src))[0] == 0
+    real_attributes, real_read = collect.file_attributes, collect.read_source
+    reads = []
+    monkeypatch.setattr(collect, 'file_attributes',
+                        lambda info: real_attributes(info) | paths.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+    monkeypatch.setattr(collect, 'read_source', lambda p: reads.append(p) or real_read(p))
+    assert binding.collect is collect
+    code, out, _ = run(capsys, 'verify')
+    assert code == 0 and reads == [] and 'placeholder 1)' in out
+    assert out.splitlines()[-1] == 'binding ok (nothing verified)'
+    config.config_file(home).write_text('[scan]\nread_cloud_placeholders = true\n', encoding='utf-8')
+    code, out, _ = run(capsys, 'verify')
+    assert code == 0 and len(reads) == 1 and 'placeholder 0)' in out and out.splitlines()[-1] == 'binding ok'
 
 
 def db_doc_id(home, name):

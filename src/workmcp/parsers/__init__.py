@@ -13,8 +13,10 @@ Contract of a parser module (``text``, ``eml``, ``docx``, ``pptx``, ``xlsx``, ``
 
 ``parse(data, ext, limits)`` here never raises for bad content: it checks the signature
 (``sniff``), calls the module, renumbers ordinals 1..N, checks every unit with
-``locator.check_unit`` and applies the unit and text limits. Same bytes, same limits and same
-parser version give the same result (binding depends on it).
+``locator.check_unit``, refuses two units with the same locator in one version
+(``failed/unit_duplicate``: binding and locator checks look a unit up by its locator) and applies
+the unit and text limits. Same bytes, same limits and same parser version give the same result
+(binding depends on it).
 """
 from __future__ import annotations
 
@@ -39,10 +41,11 @@ ERROR_CODES = {
     'failed': frozenset({
         'encoding_unknown', 'binary_content', 'csv_columns', 'bad_zip', 'missing_part', 'xml_dtd', 'xml_invalid',
         'pdf_no_text', 'pdf_read_error', 'hwp_bad_record', 'hwp_bad_stream', 'ole_invalid', 'eml_no_headers',
-        'unit_shape_invalid', 'not_implemented'}),
-    'unsupported': frozenset({'pdf_bad_signature', 'bad_signature', 'legacy_ole', 'hwp_bad_header', 'hwp_version'}),
+        'unit_shape_invalid', 'unit_duplicate', 'not_implemented'}),
+    'unsupported': frozenset({
+        'pdf_bad_signature', 'bad_signature', 'legacy_ole', 'hwp_bad_header', 'hwp_version', 'ooxml_strict'}),
     'too_large': frozenset({
-        'file_bytes', 'limit_units', 'limit_chars', 'zip_entries', 'zip_total', 'zip_part',
+        'file_bytes', 'limit_units', 'limit_chars', 'zip_entries', 'zip_total', 'zip_part', 'xml_tree', 'hwp_para',
         'pdf_count', 'pptx_count', 'xlsx_count', 'eml_count', 'hwp_count'}),
     'encrypted': frozenset({'pdf_encrypted', 'hwp_encrypted', 'ooxml_encrypted'}),
 }
@@ -80,6 +83,12 @@ class Limits:
     zip_max_entries: int = 10_000
     zip_max_part_bytes: int = 128 * 2**20
     zip_max_total_bytes: int = 512 * 2**20
+    # An XML part read as a whole tree (PPTX slides, the workbook and relationship parts) takes about 20 times
+    # its size in memory, so it has its own small limit. The large parts (DOCX body, HWPX sections, XLSX
+    # sheets and shared strings) are streamed and only bounded by zip_max_part_bytes.
+    xml_max_tree_bytes: int = 16 * 2**20
+    # One HWP PARA_TEXT record (UTF-16LE, 2 bytes per character): 8M characters.
+    hwp_max_para_bytes: int = 16 * 2**20
 
 
 class ParseFailure(Exception):
@@ -158,17 +167,17 @@ def sniff(data: bytes, ext: str) -> tuple[str, str] | None:
     return None
 
 
-def _valid_unit(unit) -> bool:
+def _unit_key(unit) -> str | None:
+    """``unit_json`` of a well-formed unit, None for a malformed one."""
     if not isinstance(unit, Unit) or not isinstance(unit.text, str) or not unit.text \
             or unit.text != unit.text.strip() or not isinstance(unit.unit, dict) or unit.unit.get('kind') != unit.kind:
-        return False
+        return None
     try:
         locator.check_unit(unit.unit)
-        unit_json(unit.unit)
         unit.text.encode('utf-8')  # a lone surrogate cannot be stored or hashed
+        return unit_json(unit.unit)
     except (locator.LocatorError, TypeError, ValueError):
-        return False
-    return True
+        return None
 
 
 def parse(data: bytes, ext: str, limits: Limits) -> ParseResult:
@@ -191,8 +200,11 @@ def parse(data: bytes, ext: str, limits: Limits) -> ParseResult:
         return result(failure.status, failure.code)
     except Exception as exc:  # message dropped on purpose: it may quote document text
         return result('failed', EXCEPTION_PREFIX + type(exc).__name__)
-    if not all(_valid_unit(unit) for unit in units) or not (encoding is None or isinstance(encoding, str)):
+    keys = [_unit_key(unit) for unit in units]
+    if None in keys or not (encoding is None or isinstance(encoding, str)):
         return result('failed', 'unit_shape_invalid')
+    if len(set(keys)) != len(keys):
+        return result('failed', 'unit_duplicate')
     if len(units) > limits.max_units:
         return result('too_large', 'limit_units')
     if sum(len(unit.text) for unit in units) > limits.max_text_chars:
