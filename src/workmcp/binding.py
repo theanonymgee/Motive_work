@@ -231,9 +231,9 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
             if result == 'stale' and report['latest']:
                 stale_latest.add(report['document_id'])
     units['rate'] = units['bound'] / units['total'] if units['total'] else 0.0
-    notice = [f'{len(stale_latest)}개 문서가 마지막 스캔 이후 바뀜 — `workmcp scan`을 먼저 실행'] if stale_latest else []
+    notice = [f'{len(stale_latest)}개 문서가 마지막 스캔 이후 바뀜 - `workmcp scan`을 먼저 실행'] if stale_latest else []
     if mismatched := versions['unverifiable']['parser_version_mismatch']:
-        notice.append(f'{mismatched}개 버전이 다른 파서 버전으로 저장됨 — `workmcp scan --reparse`로 다시 파싱')
+        notice.append(f'{mismatched}개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱')
     return {'scope': SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version
                                                 for ext in sorted(parsers.SUPPORTED_EXTENSIONS)},
             'checked_at': store.now(), 'versions': versions, 'units': units, 'chunks_checked': chunks,

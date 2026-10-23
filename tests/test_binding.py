@@ -139,7 +139,7 @@ def test_parser_version_mismatch_is_unverifiable_until_reparse(db, bundle, tmp_p
     report = binding.verify(db)
     assert report['ok'] and unverifiable(report)['parser_version_mismatch'] == 1
     # review M1-L13: the CLI prints the notice, which names the command that fixes it
-    assert report['notice'] == ['1개 버전이 다른 파서 버전으로 저장됨 — `workmcp scan --reparse`로 다시 파싱']
+    assert report['notice'] == ['1개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱']
     assert scan(db, root)['total']['reparsed'] == 0  # without --reparse nothing changes
     result = scan(db, root, reparse=True)
     assert result['total']['reparsed'] == 1 and result['total']['parsed_ok'] == 1

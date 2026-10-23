@@ -3,7 +3,10 @@
 Run in-process with a temporary data home (conftest) and the full synthetic bundle (``fixtures.bundle``).
 """
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -210,7 +213,7 @@ def test_verify_cli_points_to_reparse_after_a_parser_version_change(home, tmp_pa
     code, out, _ = run(capsys, 'verify')
     lines = out.splitlines()
     assert code == 0 and ' parser 1, ' in lines[0] and lines[-1] == 'binding ok (nothing verified)'
-    assert lines[2] == '1개 버전이 다른 파서 버전으로 저장됨 — `workmcp scan --reparse`로 다시 파싱'
+    assert lines[2] == '1개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱'
     assert run(capsys, 'scan', '--root', str(src), '--reparse')[0] == 0
     code, out, _ = run(capsys, 'verify')
     assert code == 0 and '--reparse' not in out and out.splitlines()[-1] == 'binding ok'
@@ -297,3 +300,56 @@ def test_status_tool_reports_last_scan(home, tmp_path, capsys):
     assert re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d', last['at'])
     assert after['result']['db']['documents'] == len(expected)
     assert SENTINEL not in json.dumps(after, ensure_ascii=False)
+
+
+def run_piped(home, encoding, *argv):
+    """``workmcp`` in a child process whose stdout/stderr are pipes encoded as ``encoding`` (review M1-8)."""
+    src = Path(__file__).resolve().parent.parent/'src'
+    env = {**os.environ, 'WORKMCP_HOME': str(home), 'PYTHONIOENCODING': encoding,
+           'PYTHONPATH': os.pathsep.join(filter(None, [str(src), os.environ.get('PYTHONPATH')]))}
+    done = subprocess.run([sys.executable, '-m', 'workmcp', *argv], env=env, capture_output=True, timeout=120)
+    return done.returncode, done.stdout.decode(encoding), done.stderr.decode(encoding)
+
+
+def test_cli_output_survives_a_pipe_encoding_without_the_characters(home, tmp_path):
+    """Review M1-8: every command exits normally on a cp949 pipe even when a path holds characters cp949 lacks."""
+    emoji = '😀'
+    with pytest.raises(UnicodeEncodeError):
+        emoji.encode('cp949')
+    src = tmp_path/f'src{emoji}'
+    (src/f'docs{emoji}').mkdir(parents=True)
+    (src/f'docs{emoji}'/f'a{emoji}.txt').write_bytes(b'synthetic line one\nsynthetic line two\n')
+    write_config(home, src)
+
+    code, out, err = run_piped(home, 'cp949', 'scan')
+    assert code == 0 and err == '' and f'src{emoji}' not in out and 'src?' in out
+    code, out, err = run_piped(home, 'cp949', 'verify')
+    assert code == 0 and out.splitlines()[-1] == 'binding ok'
+
+    db = store.open_home(home)
+    try:
+        db.execute("UPDATE versions SET parser_version='text-0'")
+    finally:
+        db.close()
+    code, out, err = run_piped(home, 'cp949', 'verify')
+    assert code == 0 and err == ''
+    assert out.splitlines()[2] == '1개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱'
+    code, out, err = run_piped(home, 'cp949', 'scan', '--root', str(src), '--reparse')
+    assert code == 0 and err == '' and 'reparsed 1' in out
+
+    for command in ('sources', 'doctor'):
+        code, out, err = run_piped(home, 'cp949', command)
+        assert code == 0 and err == '' and 'src?' in out, (command, out, err)
+    code, out, err = run_piped(home, 'cp949', 'verify', '--root', str(src))
+    assert code == 0 and out.splitlines()[-1] == 'binding ok'
+    code, out, err = run_piped(home, 'cp949', 'verify', '--root', str(src/'missing'))
+    assert code == 4 and out == '' and 'not a scanned source root' in err
+
+
+def test_cli_keeps_the_pipe_encoding_when_it_can_represent_the_text(home, tmp_path):
+    emoji = '😀'
+    src = tmp_path/f'src{emoji}'
+    src.mkdir()
+    (src/'a.txt').write_bytes(b'synthetic line one\n')
+    code, out, _ = run_piped(home, 'utf-8', 'scan', '--root', str(src))
+    assert code == 0 and f'src{emoji}' in out

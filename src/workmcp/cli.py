@@ -25,6 +25,14 @@ from . import __version__, models, paths, store
 LOG_FORMAT = '%(asctime)s | %(message)s'
 
 
+def _tolerant(stream) -> None:
+    """Keep the stream's encoding (readers of a pipe expect it) but print ``?`` for a character it lacks."""
+    try:
+        stream.reconfigure(errors='replace')
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 def _home():
     """``(home, None)`` or ``(None, exit code 2)`` after printing the rule broken."""
     try:
@@ -327,7 +335,10 @@ def main(argv=None) -> int:
     verify_parser.add_argument('--root', action='append', metavar='PATH')
     verify_parser.add_argument('--doc', action='append', type=int, metavar='ID')
     sub.add_parser('sources', help='list the configured source roots and their state')
+    _tolerant(sys.stderr)
     args = parser.parse_args(argv)
+    if args.command != 'serve':  # serve's stdout is the JSON-RPC channel: left untouched
+        _tolerant(sys.stdout)
     if args.command == 'doctor':
         return doctor()
     if args.command == 'scan':
