@@ -35,9 +35,17 @@ WRAPPER = Path(__file__).resolve().parent/'_audited_server.py'
 # Allowlists. An entry allows that dotted name and everything under it. Each entry must be used
 # by the real sources (``test_allowlists_match_the_sources_exactly``), so the lists never grow
 # wider than the code needs.
-COMMON_IMPORTS = frozenset({'__future__', 'argparse', 'collections.abc', 'datetime', 'hashlib', 'importlib.metadata',
-                            'os', 'pathlib', 're', 'sqlite3', 'sys', 'typing'})
-MODULE_IMPORTS = {'server.py': frozenset({'mcp.server.MCPServer'})}
+COMMON_IMPORTS = frozenset({'__future__', 'argparse', 'collections.abc', 'dataclasses', 'datetime', 'hashlib',
+                            'importlib.metadata', 'io', 'json', 'os', 'pathlib', 're', 'sqlite3', 'sys', 'typing'})
+# M1 parsers: the exact import lines of design M1 §8.1 (zip/XML/OLE/PDF/mail only where they are read).
+MODULE_IMPORTS = {
+    'server.py': frozenset({'mcp.server.MCPServer'}),
+    'parsers/_container.py': frozenset({'zipfile', 'xml.etree.ElementTree', 'olefile'}),
+    'parsers/text.py': frozenset({'csv'}),
+    'parsers/eml.py': frozenset({'email.policy', 'email.parser.BytesParser', 'html.parser.HTMLParser'}),
+    'parsers/pdf.py': frozenset({'logging', 'pypdf.PdfReader', 'pypdf.errors.PdfReadError'}),
+    'parsers/hwp.py': frozenset({'struct', 'zlib', 'olefile'}),
+}
 FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'})}  # inside function bodies only
 
 MODELS_DOTTED = 'workmcp.models'
@@ -49,6 +57,8 @@ DYNAMIC_LOADERS = frozenset({'import_module', 'resolve_name', 'run_module', 'run
 ESCAPE_ATTRS = frozenset({'__dict__', '__globals__', '__builtins__', '__subclasses__', '__loader__', '__import__'})
 OS_PROCESS_CALLS = ('system', 'popen', 'startfile', 'fork', 'forkpty', 'exec', 'spawn', 'posix_spawn')
 NON_STDIO_RUNNERS = frozenset({'run_sse_async', 'run_streamable_http_async', 'sse_app', 'streamable_http_app'})
+# Network parts of an allowlisted package (``logging`` is allowed for log files and the pypdf logger only).
+NETWORK_SUBMODULES = (('logging', 'handlers'), ('logging', 'config'))
 GUARDED_MODULES = ('os', 'sys')  # may not be passed around or rebound (aliasing hides later calls)
 NETWORK_CLIENT_PACKAGES = {'httpx', 'httpx2', 'requests', 'aiohttp', 'huggingface_hub', 'urllib3'}
 
@@ -133,6 +143,8 @@ def banned_qualified(dotted: str) -> str | None:
         return f'os process call {dotted}'
     if parts[:2] == ['sys', 'modules']:
         return 'sys.modules access'
+    if tuple(parts[:2]) in NETWORK_SUBMODULES:
+        return f'network submodule {dotted}'
     if parts[-1] in DYNAMIC_LOADERS:
         return f'dynamic code loading {dotted}'
     if parts[-1] in ESCAPE_ATTRS:
@@ -250,7 +262,8 @@ def models_network():
 def test_package_has_sources():
     assert {rel(p) for p in package_sources()} >= {
         '__init__.py', '__main__.py', 'cli.py', 'paths.py', 'store.py', 'locator.py', 'models.py', 'tools.py',
-        'server.py', 'parsers/__init__.py'}
+        'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
+        'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py'}
 
 
 # 1
@@ -388,6 +401,11 @@ MORE_BYPASSES = [
     'import threading',
     'import json\nimport socket',
     'def f():\n    import socket',
+    'import logging.handlers\nlogging.handlers.SocketHandler("example.invalid", 9020)',
+    'import logging\nlogging.handlers.HTTPHandler("example.invalid", "/")',
+    'from logging import handlers',
+    'import logging\nlogging.config.listen(9030)',
+    'import logging as lg\ngetattr(lg, "handlers")',
 ]
 
 
@@ -412,6 +430,26 @@ def test_urllib_is_allowed_only_inside_models_functions():
     assert violations('models.py', 'import urllib.request\n')
     assert violations('models.py', 'def f():\n    import socket\n')
     assert violations('tools.py', inside)
+
+
+@pytest.mark.parametrize('snippet', [
+    'import logging.handlers', 'import logging\nlogging.handlers.SocketHandler("example.invalid", 9020)',
+    'from logging.handlers import DatagramHandler', 'import logging\nlogging.config.listen(9030)',
+    'import logging.config'])
+def test_logging_allowlist_does_not_open_network_handlers(snippet):
+    assert violations('parsers/pdf.py', 'import logging\nlogging.getLogger("pypdf").setLevel(logging.ERROR)\n') == []
+    assert violations('parsers/pdf.py', snippet)
+
+
+def test_parser_libraries_are_allowed_only_in_their_modules():
+    assert violations('parsers/pdf.py', 'from pypdf import PdfReader\n') == []
+    assert violations('parsers/hwp.py', 'import olefile\nimport zlib\n') == []
+    assert violations('parsers/docx.py', 'from pypdf import PdfReader\n')
+    assert violations('parsers/docx.py', 'import zipfile\n')  # through _container only
+    assert violations('parsers/text.py', 'import olefile\n')
+    assert violations('server.py', 'import xml.etree.ElementTree as ET\n')
+    assert violations('parsers/_container.py', 'import xml.dom.minidom\n')
+    assert violations('parsers/eml.py', 'import email.utils\nemail.utils.make_msgid()\n')
 
 
 def test_server_may_use_mcp_but_not_other_transports():
@@ -446,7 +484,11 @@ def run_wrapper(tmp_path, mode):
 
 def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
     _, report = run_wrapper(tmp_path, 'imports')
-    assert {'workmcp.server', 'workmcp.models', 'workmcp.tools', 'workmcp.parsers'} <= set(report['modules'])
+    assert {'workmcp.server', 'workmcp.models', 'workmcp.tools', 'workmcp.parsers', 'workmcp.parsers._container',
+            'workmcp.parsers.text', 'workmcp.parsers.eml', 'workmcp.parsers.docx', 'workmcp.parsers.pptx',
+            'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp'} <= set(report['modules'])
+    # the parser libraries really were imported under the hook (their import side effects are audited)
+    assert {'pypdf', 'olefile', 'xml.etree.ElementTree', 'zipfile', 'email.parser'} <= set(report['loaded'])
     assert [e for e in report['events'] if e['violation']] == []
     assert not [e for e in report['events'] if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
 
@@ -546,7 +588,10 @@ def test_runtime_judge_separates_loopback_from_everything_else(event, args, outs
 def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
     """Positive control through the real hook: outside attempts are recorded and blocked before they happen."""
     _, report = run_wrapper(tmp_path, 'probe')
-    assert report['blocked'] == {'connect': True, 'getaddrinfo': True, 'subprocess': True, 'loopback': False}
+    assert report['blocked'] == {'connect': True, 'getaddrinfo': True, 'subprocess': True, 'loopback': False,
+                                 'source_read': False, 'source_write': True, 'source_create': True,
+                                 'source_remove': True, 'source_utime': True}
+    assert report['source_unchanged'] is True
     flagged = {e['event'] for e in report['events'] if e['violation']}
     assert {'socket.connect', 'socket.getaddrinfo', 'subprocess.Popen'} <= flagged
     loopback = [e for e in report['events'] if e['event'] in ('socket.bind', 'socket.connect') and '127.0.0.1' in e['detail']]

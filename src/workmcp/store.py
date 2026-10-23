@@ -5,6 +5,11 @@ Source records (documents/versions/units/chunks) and knowledge records
 FTS5 index ``chunks_fts`` are derived and may be rebuilt. ``chunks_fts`` is created outside
 the migration ledger only when this SQLite has FTS5 with the trigram tokenizer, so a
 Python without FTS5 still opens the store (lexical search then falls back to LIKE).
+
+Schema v1 is edited in place until the first real install (M5): no data home has been created
+from it yet (design M1 §10.1), and a development store made from an earlier v1 is refused by
+the checksum check (delete it and scan again). From the M5 install on, v1 is frozen and every
+change is a new migration.
 """
 from __future__ import annotations
 
@@ -24,6 +29,7 @@ CREATE TABLE documents(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL REFERENC
   path_key TEXT NOT NULL UNIQUE,
   ext TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('active','deleted','skipped')),
+  skip_reason TEXT,
   first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, deleted_at TEXT);
 
 -- One row per observed content change, in observation order (seq 1, 2, ...). The same sha256
@@ -37,6 +43,28 @@ CREATE TABLE versions(id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFER
   parse_error TEXT, unit_count INTEGER, text_chars INTEGER,
   UNIQUE(document_id, seq));
 CREATE INDEX versions_sha256 ON versions(document_id, sha256);
+-- unit reuse across documents: same content, same parser version (design M1 §3.3)
+CREATE INDEX versions_by_sha256 ON versions(sha256, parser_version);
+-- What was observed (document, seq, sha256, size, observed_at) never changes; superseded_at is set
+-- once (NULL -> value); mtime_ns and the parser columns may change (touched file, retry, --reparse).
+-- A 'locked' row holds the placeholder sha256 '0'*64 and gets the real sha256/size when read; no
+-- row becomes 'locked' later (that would reopen its sha256).
+CREATE TRIGGER versions_update_guard BEFORE UPDATE ON versions
+  WHEN NEW.id <> OLD.id OR NEW.document_id <> OLD.document_id OR NEW.seq <> OLD.seq
+    OR NEW.observed_at <> OLD.observed_at
+    OR ((NEW.sha256 <> OLD.sha256 OR NEW.size <> OLD.size) AND OLD.parse_status <> 'locked')
+    OR (NEW.parse_status = 'locked' AND OLD.parse_status <> 'locked')
+    OR (OLD.superseded_at IS NOT NULL AND NEW.superseded_at IS NOT OLD.superseded_at)
+  BEGIN SELECT RAISE(ABORT, 'version identity is append-only'); END;
+CREATE TRIGGER versions_no_delete BEFORE DELETE ON versions BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+-- REPLACE deletes the old row without DELETE triggers; refuse an INSERT that reuses either
+-- uniqueness key (id, or (document_id, seq)) before any conflict handling.
+CREATE TRIGGER versions_no_replace BEFORE INSERT ON versions
+  WHEN EXISTS(SELECT 1 FROM versions WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER versions_no_replace_seq BEFORE INSERT ON versions
+  WHEN EXISTS(SELECT 1 FROM versions WHERE document_id = NEW.document_id AND seq = NEW.seq)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 
 CREATE TABLE units(id INTEGER PRIMARY KEY, version_id INTEGER NOT NULL REFERENCES versions(id),
   ordinal INTEGER NOT NULL, kind TEXT NOT NULL,
@@ -124,6 +152,12 @@ CREATE TABLE links(id INTEGER PRIMARY KEY, from_id INTEGER NOT NULL REFERENCES a
 
 CREATE TABLE deliveries(id INTEGER PRIMARY KEY, at TEXT NOT NULL, client TEXT NOT NULL,
   tool TEXT NOT NULL, locator_json TEXT NOT NULL, chars INTEGER NOT NULL);
+
+-- Scan history and summary (status.last_scan, interrupted-scan cleanup; design M1 §3.5).
+CREATE TABLE scans(id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+  status TEXT NOT NULL CHECK(status IN ('running','done','aborted')),
+  partial INTEGER NOT NULL DEFAULT 0, roots_json TEXT NOT NULL,
+  counts_json TEXT NOT NULL DEFAULT '{}', note TEXT);
 """
 
 # (version, name, sql). Never edit an applied entry; append a new one.

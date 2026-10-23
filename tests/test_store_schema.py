@@ -6,9 +6,11 @@ import pytest
 from workmcp import paths, store, tools
 
 TABLES = {'schema_migrations', 'source_roots', 'documents', 'versions', 'units', 'chunks', 'chunk_vectors',
-          'entities', 'assertions', 'evidence', 'links', 'deliveries'}
+          'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans'}
 TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_status_guard', 'assertions_no_delete',
-            'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace'}
+            'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace',
+            'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq'}
+INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunk_vectors_text'}
 H = '0' * 64
 NOW = '2026-10-23T09:00:00+09:00'
 LATER = '2026-10-23T10:00:00+09:00'
@@ -29,6 +31,7 @@ def names(db, kind):
 def test_empty_db_has_schema_v1(db):
     assert TABLES <= names(db, 'table')
     assert TRIGGERS <= names(db, 'trigger')
+    assert INDEXES <= names(db, 'index')
     assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
     assert db.execute('PRAGMA foreign_keys').fetchone()[0] == 1
     rows = db.execute('SELECT version, name FROM schema_migrations').fetchall()
@@ -59,9 +62,9 @@ def add_document(db):
                       (root, NOW, NOW)).lastrowid
 
 
-def add_version(db, doc, seq, sha256):
+def add_version(db, doc, seq, sha256, status='ok'):
     return db.execute("INSERT INTO versions(document_id, seq, sha256, size, mtime_ns, observed_at, parse_status) "
-                      "VALUES(?, ?, ?, 1, 1, ?, 'ok')", (doc, seq, sha256, NOW)).lastrowid
+                      "VALUES(?, ?, ?, 1, 1, ?, ?)", (doc, seq, sha256, NOW, status)).lastrowid
 
 
 def test_content_returning_to_an_earlier_hash_is_a_new_version(db):
@@ -336,3 +339,130 @@ def test_read_connection_cannot_write(tmp_path):
             reader.execute(r"INSERT INTO source_roots(path, added_at) VALUES('C:\synthetic', ?)", (NOW,))
     finally:
         reader.close()
+
+
+# M1 schema additions (design M1 §10.2)
+def columns(db, table):
+    return [r[1] for r in db.execute(f'PRAGMA table_info({table})')]
+
+
+def test_m1_columns_tables_and_indexes(db):
+    assert 'skip_reason' in columns(db, 'documents')
+    assert columns(db, 'scans') == ['id', 'started_at', 'finished_at', 'status', 'partial', 'roots_json',
+                                    'counts_json', 'note']
+    index = {r[1]: r for r in db.execute('PRAGMA index_list(versions)')}
+    assert [r[2] for r in db.execute('PRAGMA index_info(versions_by_sha256)')] == ['sha256', 'parser_version']
+    assert index['versions_by_sha256'][2] == 0  # not unique: the same content may be in many documents
+
+
+def test_document_can_be_skipped_with_a_reason(db):
+    root = db.execute(r"INSERT INTO source_roots(path, added_at) VALUES('C:\synthetic', ?)", (NOW,)).lastrowid
+    doc = db.execute(r"INSERT INTO documents(root_id, path, path_key, ext, status, skip_reason, first_seen_at, "
+                     r"last_seen_at) VALUES(?, 'C:\synthetic\p.docx', 'c:\synthetic\p.docx', '.docx', 'skipped', "
+                     r"'cloud_placeholder', ?, ?)", (root, NOW, NOW)).lastrowid
+    assert db.execute('SELECT status, skip_reason FROM documents WHERE id=?', (doc,)).fetchone() == (
+        'skipped', 'cloud_placeholder')
+
+
+def test_scans_table_records_status_and_counts(db):
+    scan = db.execute("INSERT INTO scans(started_at, status, roots_json) VALUES(?, 'running', '[\"C:\\synthetic\"]')",
+                      (NOW,)).lastrowid
+    db.execute("UPDATE scans SET status='done', finished_at=?, counts_json='{\"added\": 1}' WHERE id=?", (LATER, scan))
+    assert db.execute('SELECT status, partial, counts_json FROM scans WHERE id=?', (scan,)).fetchone() == (
+        'done', 0, '{"added": 1}')
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO scans(started_at, status, roots_json) VALUES(?, 'finished', '[]')", (NOW,))
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO scans(started_at, roots_json) VALUES(?, '[]')", (NOW,))  # status is required
+
+
+def version_row(db, version):
+    return db.execute('SELECT * FROM versions WHERE id=?', (version,)).fetchone()
+
+
+@pytest.mark.parametrize('assignment', [
+    "sha256='b'||substr(sha256, 2)", 'size=size+1', 'seq=seq+1', 'document_id=document_id+1',
+    "observed_at='2000-01-01T00:00:00+09:00'", 'id=id+100', "parse_status='locked'"])
+def test_version_identity_cannot_change(db, assignment):
+    doc = add_document(db)
+    db.execute(r"INSERT INTO documents(root_id, path, path_key, ext, status, first_seen_at, last_seen_at) "
+               r"SELECT root_id, 'C:\synthetic\b.txt', 'c:\synthetic\b.txt', '.txt', 'active', ?, ? FROM documents",
+               (NOW, NOW))  # a second document, so a changed document_id would satisfy the foreign key
+    version = add_version(db, doc, 1, 'a' * 64)
+    before = version_row(db, version)
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute(f'UPDATE versions SET {assignment} WHERE id=?', (version,))
+    assert version_row(db, version) == before
+
+
+def test_superseded_at_is_set_once(db):
+    version = add_version(db, add_document(db), 1, 'a' * 64)
+    db.execute('UPDATE versions SET superseded_at=? WHERE id=?', (NOW, version))
+    for value in (LATER, None):
+        with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+            db.execute('UPDATE versions SET superseded_at=? WHERE id=?', (value, version))
+    assert db.execute('SELECT superseded_at FROM versions WHERE id=?', (version,)).fetchone() == (NOW,)
+
+
+def test_version_observation_updates_that_are_allowed(db):
+    """touched (mtime_ns), supersede (NULL -> value), retry/--reparse (parser columns)."""
+    version = add_version(db, add_document(db), 1, 'a' * 64)
+    db.execute('UPDATE versions SET mtime_ns=99 WHERE id=?', (version,))
+    db.execute('UPDATE versions SET superseded_at=? WHERE id=?', (LATER, version))
+    db.execute("UPDATE versions SET parser='text', parser_version='text-2', encoding='utf-8', parse_status='failed', "
+               "parse_error='encoding_unknown', unit_count=0, text_chars=0 WHERE id=?", (version,))
+    db.execute("UPDATE versions SET parse_status='ok', parse_error=NULL, unit_count=3, text_chars=30 WHERE id=?",
+               (version,))
+    assert db.execute('SELECT mtime_ns, superseded_at, parser_version, parse_status, unit_count FROM versions '
+                      'WHERE id=?', (version,)).fetchone() == (99, LATER, 'text-2', 'ok', 3)
+
+
+def test_locked_placeholder_gets_its_hash_once(db):
+    version = add_version(db, add_document(db), 1, H, status='locked')
+    db.execute("UPDATE versions SET sha256=?, size=42, mtime_ns=7, parse_status='ok', unit_count=1 WHERE id=?",
+               ('c' * 64, version))
+    assert db.execute('SELECT sha256, size, parse_status FROM versions WHERE id=?', (version,)).fetchone() == (
+        'c' * 64, 42, 'ok')
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):  # no longer locked: hash is fixed
+        db.execute("UPDATE versions SET sha256=? WHERE id=?", ('d' * 64, version))
+
+
+def test_versions_cannot_be_deleted(db):
+    version = add_version(db, add_document(db), 1, 'a' * 64)
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute('DELETE FROM versions WHERE id=?', (version,))
+    assert db.execute('SELECT COUNT(*) FROM versions').fetchone()[0] == 1
+
+
+VERSION_COLUMNS = 'id, document_id, seq, sha256, size, mtime_ns, observed_at, parse_status'
+
+
+@pytest.mark.parametrize('verb', ['INSERT OR REPLACE INTO', 'REPLACE INTO'])
+@pytest.mark.parametrize('key', ['id', 'document_seq'])
+def test_versions_cannot_be_replaced_through_either_key(db, verb, key):
+    doc = add_document(db)
+    first, second = add_version(db, doc, 1, 'a' * 64), add_version(db, doc, 2, 'b' * 64)
+    before = db.execute('SELECT * FROM versions ORDER BY id').fetchall()
+    values = (first, doc, 9) if key == 'id' else (None, doc, 2)  # same id / same (document_id, seq)
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute(f"{verb} versions({VERSION_COLUMNS}) VALUES(?, ?, ?, ?, 5, 5, ?, 'ok')", (*values, 'e' * 64, NOW))
+    assert db.execute('SELECT * FROM versions ORDER BY id').fetchall() == before
+    assert second == first + 1
+
+
+def test_version_upsert_on_document_seq_is_refused(db):
+    doc = add_document(db)
+    version = add_version(db, doc, 1, 'a' * 64)
+    before = version_row(db, version)
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute("INSERT INTO versions(document_id, seq, sha256, size, mtime_ns, observed_at, parse_status) "
+                   "VALUES(?, 1, ?, 5, 5, ?, 'ok') ON CONFLICT(document_id, seq) DO UPDATE SET mtime_ns=5",
+                   (doc, 'e' * 64, NOW))
+    assert version_row(db, version) == before
+
+
+def test_versions_unique_keys_are_id_and_document_seq_only(db):
+    """Both keys are guarded above; a third UNIQUE key would need its own guard."""
+    unique = [r[1] for r in db.execute('PRAGMA index_list(versions)') if r[2]]
+    assert len(unique) == 1
+    assert [r[2] for r in db.execute(f'PRAGMA index_info({unique[0]})')] == ['document_id', 'seq']
