@@ -327,13 +327,75 @@ def test_eml_lines_are_held_memory_and_the_parser_reads_on_the_clock(monkeypatch
     assert outcome(message, '.eml', Limits(max_held_bytes=200_000)) == ('too_large', 'limit_memory')
     assert outcome(message, '.eml', Limits(max_held_bytes=400_000)) == ('ok', None)
     reads = []
-    original = eml._Reader.read1
+    original = eml._Reader.read
 
-    def read1(self, size=-1):
+    def read(self, size=-1):
         reads.append(size)
         return original(self, size)
-    monkeypatch.setattr(eml._Reader, 'read1', read1)
+    monkeypatch.setattr(eml._Reader, 'read', read)
     big = message + b'y' * 100_000 + b'\n'
     assert outcome(big, '.eml', Limits()) == ('ok', None) and len(reads) > 5
     assert outcome(big, '.eml', Limits(max_unit_chars=99_999)) == ('too_large', 'unit_chars')  # one raw line
     assert outcome(message, '.eml', Limits(max_events=4_000)) == ('too_large', 'limit_events')
+
+
+def reference_mail_lines(data: bytes) -> list[tuple[int, str]]:
+    """eml-3 before review v4: the whole part decoded, stripped of tags in one go, then split."""
+    part = [p for p in BytesParser(policy=policy.default).parsebytes(data).walk() if p.get_content_maintype() == 'text'][0]
+    try:
+        body = part.get_content()
+    except (LookupError, ValueError):
+        body = (part.get_payload(decode=True) or b'').decode('utf-8', errors='replace')
+    if part.get_content_type() == 'text/html':
+        stripper = eml._HtmlText(_container.Budget(Limits()))
+        stripper.feed(body)
+        stripper.close()
+        body = ''.join(stripper.out)
+    return [(n, line.strip()) for n, line in enumerate(re.split(r'\r\n|\r|\n', body), 1) if line.strip()]
+
+
+def test_eml_parts_are_read_in_pieces_with_the_same_lines():
+    """Review v4 M1-11: decoding a part piece by piece, stripping HTML piece by piece and cutting lines as
+    they come gives the lines (and numbers) of the whole part, whatever the charset, transfer encoding and
+    where a CRLF or a character falls against the 1 MiB pieces."""
+    import base64
+    noise = random.Random(17)
+    words = ['합성', 'word', '\U0001f600', '&amp;', 'é', '<b>bold</b>', '<p>', '</p>', '<br>', ' ', 'x' * 300]
+    for charset, kind, transfer in [('utf-8', 'text/plain', '8bit'), ('utf-8', 'text/html', '8bit'),
+                                    ('utf-8', 'text/html', 'base64'), ('cp949', 'text/plain', '8bit'),
+                                    ('iso-8859-1', 'text/html', '8bit'), ('utf-16', 'text/plain', 'base64'),
+                                    ('x-unknown', 'text/plain', '8bit')]:
+        pieces, size = [], 0
+        while size < 2_600_000:
+            word = noise.choice(words)
+            if charset in ('cp949', 'iso-8859-1') and word in ('\U0001f600', 'é'):
+                word = '가' if charset == 'cp949' else 'ü'
+            if charset == 'iso-8859-1' and word == '합성':
+                word = 'ä'
+            pieces.append(word + noise.choice(['', '', '\r\n', '\n', '\r']))
+            size += len(pieces[-1])
+        body = ''.join(pieces)
+        raw = body.encode('utf-8' if charset == 'x-unknown' else charset)
+        if transfer == 'base64':
+            raw = base64.b64encode(raw)  # one long line: decoded, it has no line break to cut at for HTML
+            raw = b'\r\n'.join(raw[n:n + 76] for n in range(0, len(raw), 76))
+        data = (f'From: a@example.com\r\nSubject: s\r\nContent-Type: {kind}; charset={charset}\r\n'
+                f'Content-Transfer-Encoding: {transfer}\r\n\r\n').encode() + raw
+        result = parsers.parse(data, '.eml', Limits(max_units=10**6, max_text_chars=10**8))
+        assert result.status == 'ok', (charset, kind, transfer, result.error)
+        got = [(u.unit['line'], u.text) for u in result.units[1:]]
+        assert got == reference_mail_lines(data), (charset, kind, transfer)
+
+
+def test_eml_html_part_memory_follows_the_lines_not_the_part():
+    """Review v4 M1-11 (G1): a 90 MiB HTML mail of ordinary paragraphs with one emoji took +1,355 MiB: the
+    message's copy of the part, the decoded text (4 bytes a character once one emoji is in it), every
+    piece the tag stripper kept and their join were alive together. Now only one decoded piece and the
+    units are: a 6 MiB part (one emoji) peaks under twice the units' text."""
+    line = '<p>' + 'Synthetic paragraph text with ordinary words. ' * 40 + '</p>\r\n'
+    body = (line * (6 * 2**20 // len(line))).replace('Synthetic', '\U0001f600', 1)
+    data = (b'From: a@example.com\r\nSubject: s\r\nContent-Type: text/html; charset=utf-8\r\n'
+            b'Content-Transfer-Encoding: 8bit\r\n\r\n' + body.encode())
+    result, peak = peak_of(data, '.eml', Limits())
+    kept = sum(len(u.text) for u in result.units)  # ASCII after the first line: about a byte a character
+    assert result.status == 'ok' and kept > 5 * 2**20 and peak < 2 * len(data) + 2 * kept

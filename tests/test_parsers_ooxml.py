@@ -495,13 +495,40 @@ def test_xlsx_shared_string_references_charge_text_per_cell():
 
 
 def test_xlsx_shared_strings_are_held_memory():
-    """R7: the shared string table is kept for the whole parse, 256 bytes a string and 4 a character in
-    the budget: two strings of 4,000 characters are 32,512 bytes, five are 81,280."""
-    def book(count):
-        shared = SST.format(''.join('<si><t>' + 'v' * 4_000 + '</t></si>' for _ in range(count)))
+    """R7: the shared string table is kept for the whole parse and held at the strings' real size: an
+    ASCII string of 4,000 characters is 4,049 bytes and its list slot 8, a Korean one 8,074 + 8."""
+    def book(count, char='v'):
+        shared = SST.format(''.join('<si><t>' + char * 4_000 + '</t></si>' for _ in range(count)))
         return xlsx_with('<row r="1"><c r="A1" t="s"><v>1</v></c></row>', shared)
-    assert outcome(book(2), '.xlsx', Limits(max_held_bytes=64 * 2**10)) == ('ok', None, 1)
-    assert outcome(book(5), '.xlsx', Limits(max_held_bytes=64 * 2**10)) == ('too_large', 'limit_memory', 0)
+    limits = Limits(max_held_bytes=64 * 2**10)
+    assert outcome(book(12), '.xlsx', limits) == ('ok', None, 1)            # 12 x 4,057 = 48,684 bytes
+    assert outcome(book(20), '.xlsx', limits) == ('too_large', 'limit_memory', 0)
+    assert outcome(book(6, '가'), '.xlsx', limits) == ('ok', None, 1)       # 6 x 8,082 = 48,492 bytes
+    assert outcome(book(10, '가'), '.xlsx', limits) == ('too_large', 'limit_memory', 0)
+    budget = _container.Budget(Limits())
+    xlsx.parse(book(3, '가'), Limits(), budget)
+    import sys
+    assert Limits().max_held_bytes - budget.held_left >= 3 * (sys.getsizeof('가' * 4_000) + 8)
+
+
+def xlsx_rows_of_distinct_strings(rows: int, chars: int) -> bytes:
+    """One sheet, one cell a row, every cell its own shared string of ``chars`` Korean characters (an
+    Excel export of a free-text column)."""
+    text = '합성 자유 텍스트 문장 '
+    items = ''.join('<si><t>' + (f'{n} ' + text * chars)[:chars] + '</t></si>' for n in range(rows))
+    cells = ''.join(f'<row r="{n}"><c r="A{n}" t="s"><v>{n - 1}</v></c></row>' for n in range(1, rows + 1))
+    return xlsx_with(cells, SST.format(items))
+
+
+def test_xlsx_shared_strings_within_the_text_limits_are_not_refused_for_memory():
+    """Review v4 M1-10 (G4): 120,000 rows of 250 characters and 190,000 of 150 (1.6 and 2.4 MB files, 30 M
+    and 28.5 M characters) were limit_memory: the model counted 256 bytes a string and 4 a character, two
+    to three times the real size, so the held-memory limit came before the text limit. Here the same
+    shapes at 1/100 (rows, max_units, max_text_chars and the old 128 MiB limit all divided by 100) pass;
+    at the real scale they are 70 and 73 MB of strings, under the 256 MiB default."""
+    scaled = Limits(max_units=2_000, max_text_chars=500_000, max_held_bytes=128 * 2**20 // 100)
+    for rows, chars in ((1_200, 250), (1_900, 150)):
+        assert outcome(xlsx_rows_of_distinct_strings(rows, chars), '.xlsx', scaled) == ('ok', None, rows)
 
 
 def test_text_pieces_are_joined_so_memory_follows_the_characters():

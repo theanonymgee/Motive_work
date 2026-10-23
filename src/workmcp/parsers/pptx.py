@@ -24,7 +24,7 @@ from . import Limits, ParseFailure, Unit, _container
 from ._container import START, TEXT
 
 NAME = 'pptx'
-VERSION = 'pptx-4'
+VERSION = 'pptx-5'
 
 _P = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
 _A = '{http://schemas.openxmlformats.org/drawingml/2006/main}'

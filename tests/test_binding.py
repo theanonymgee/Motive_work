@@ -44,7 +44,7 @@ def test_fresh_bundle_binds_100_percent(db, bundle):
     assert unverifiable(report) == {'skipped_not_ok': len(expected) - oks}  # the failed/unsupported/encrypted edges
     assert report['units']['bound'] == report['units']['total'] == sum(item.unit_count for item in expected) > 0
     assert report['units']['rate'] == 1.0
-    assert report['scope'] == binding.SCOPE and report['parser_versions']['.txt'] == 'text-2'
+    assert report['scope'] == binding.SCOPE and report['parser_versions']['.txt'] == 'text-3'
     assert set(report['parser_versions']) == parsers.SUPPORTED_EXTENSIONS
     # every one of the nine parsers took part: each has at least one bound version
     bound = {row[0] for row in db.execute("SELECT DISTINCT parser FROM versions WHERE parse_status='ok'")}

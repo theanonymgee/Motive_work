@@ -20,7 +20,7 @@ from . import Limits, ParseFailure, Unit, _container
 from ._container import START, TEXT
 
 NAME = 'docx'
-VERSION = 'docx-4'
+VERSION = 'docx-5'
 
 _W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _MC = '{http://schemas.openxmlformats.org/markup-compatibility/2006}'

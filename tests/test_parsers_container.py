@@ -511,4 +511,14 @@ def test_ole_directory_entries_are_counted_before_olefile_opens_the_file():
     for ext in ('.hwp', '.docx'):
         result = parsers.parse(data, ext, Limits(zip_max_entries=100))
         assert (result.status, result.error) == ('too_large', 'ole_entries')
-    assert _container.ole_entries(parsers.OLE_SIGNATURE + b'\x00' * 2048, 100) is None  # left to olefile
+    lost = data[:0x30] + (10**6).to_bytes(4, 'little') + data[0x34:]  # the directory is past the end
+    assert _container.ole_entries(lost, 100) is None  # left to olefile, which reports the damage
+    assert _container.ole_entries(parsers.OLE_SIGNATURE + b'\x00' * 2048, 100) == _container.BAD_SECTOR_SIZE
+    # Review v4 M1-L19: olefile only notes a sector size other than 512 or 4096 bytes and reads on, so such
+    # a header would bypass the count; it is refused before olefile.
+    for shift in (7, 10, 16):
+        odd = data[:0x1E] + shift.to_bytes(2, 'little') + data[0x20:]
+        assert _container.ole_entries(odd, 10**6) == _container.BAD_SECTOR_SIZE
+        for ext in ('.hwp', '.docx'):
+            assert (parsers.parse(odd, ext, Limits()).status, parsers.parse(odd, ext, Limits()).error) == (
+                'failed', 'ole_invalid')

@@ -37,9 +37,9 @@ from . import Limits, ParseFailure, Unit, _container
 from ._container import START, TEXT
 
 NAME = 'hwp'
-VERSION = f'hwp-4/olefile-{importlib.metadata.version("olefile")}'
+VERSION = f'hwp-5/olefile-{importlib.metadata.version("olefile")}'
 HWPX_NAME = 'hwpx'
-HWPX_VERSION = 'hwpx-4'
+HWPX_VERSION = 'hwpx-5'
 
 _SIGNATURE = b'HWP Document File'
 _HEADER_BYTES = 40

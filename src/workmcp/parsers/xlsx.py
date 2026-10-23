@@ -19,18 +19,20 @@ cannot make more text than ``max_text_chars``. The text of one cell or shared st
 from __future__ import annotations
 
 import re
+import sys
 
 from . import Limits, ParseFailure, Unit, _container
 from ._container import START, TEXT
 
 NAME = 'xlsx'
-VERSION = 'xlsx-4'
+VERSION = 'xlsx-5'
 
 _S = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 _R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
 _REL = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 _CELL = re.compile(r'([A-Z]{1,3})([1-9][0-9]*)')  # same shape as locator._CELL
 _BOOLEANS = {'1': 'TRUE', '0': 'FALSE'}
+_SLOT_BYTES = 8  # a list slot
 _C, _ROW, _V, _IS, _SI, _T, _RUN = _S + 'c', _S + 'row', _S + 'v', _S + 'is', _S + 'si', _S + 't', _S + 'r'
 
 
@@ -80,30 +82,35 @@ def _rich_owner(path: list) -> int | None:
 def _shared_strings(archive, limits: Limits, budget) -> list[str]:
     """Shared strings in order, already stripped (a cell's text is its string stripped, so the cell
     makes no copy). More of them than ``max_units`` is ``too_large/limit_units`` (Excel keeps only the
-    strings its cells use, so each would be at least one cell unit). The table is held memory: a
-    string's characters are held as they are read, the string itself when it ends."""
+    strings its cells use, so each would be at least one cell unit). The table is held memory at the
+    real size of each string (``sys.getsizeof`` and its list slot: 1, 2 or 4 bytes a character as the
+    string needs). While strings are being read, the characters of every open ``si`` together are at
+    most ``max_unit_chars`` (``unit_chars``)."""
     chunks = _container.part_chunks(archive, 'xl/sharedStrings.xml', limits, required=False)
     strings = []
     if chunks is None:
         return strings
     stream = _container.XmlStream(chunks, limits, budget)
     path, most = stream.path, limits.max_unit_chars
-    items = []  # open si: [position in path, pieces, chars]
+    items, gathered = [], 0  # open si: [position in path, pieces, chars]; characters of all open si
     for kind, tag, value in stream:
         if kind is TEXT:
             if path[-1] == _T and items and _rich_owner(path) == items[-1][0]:
                 item = items[-1]
-                budget.hold(0, len(value))
                 item[2] += len(value)
-                if item[2] > most:
+                gathered += len(value)
+                if gathered > most:
                     raise ParseFailure('too_large', 'unit_chars')
                 item[1].append(value)
         elif kind is START:
             if tag == _SI:
                 items.append([len(path), _container.Pieces(), 0])
         elif tag == _SI:
-            budget.hold(1)
-            strings.append(items.pop()[1].text().strip())
+            _, pieces, chars = items.pop()
+            gathered -= chars
+            string = pieces.text().strip()
+            budget.hold_bytes(sys.getsizeof(string) + _SLOT_BYTES)
+            strings.append(string)
             if len(strings) > limits.max_units:
                 raise ParseFailure('too_large', 'limit_units')
     return strings

@@ -11,7 +11,7 @@ from workmcp import parsers
 from workmcp.parsers import Limits, _container, docx, eml, hwp, pdf, pptx, text, xlsx
 
 PARSERS = Path(parsers.__file__).resolve().parent
-METERS = frozenset({'text', 'unit', 'event', 'hold', 'clock'})
+METERS = frozenset({'text', 'unit', 'event', 'hold', 'hold_bytes', 'clock'})
 CHARGING_HELPERS = frozenset({'_keep', 'keep'})  # helpers that charge the budget before they keep a piece
 # Local names that carry document content in the parsers.
 CONTENT = frozenset({'value', 'text', 'data', 'payload', 'raw', 'piece', 'line', 'target', 'rel_id', 'name',
@@ -159,9 +159,9 @@ def test_versions_bumped():
     pypdf, olefile = importlib.metadata.version('pypdf'), importlib.metadata.version('olefile')
     assert {(module.NAME, module.VERSION) for module in (docx, pptx, xlsx, pdf, hwp, text, eml)} | {
         (text.CSV_NAME, text.CSV_VERSION), (hwp.HWPX_NAME, hwp.HWPX_VERSION)} == {
-        ('docx', 'docx-4'), ('pptx', 'pptx-4'), ('xlsx', 'xlsx-4'), ('pdf', f'pdf-3/pypdf-{pypdf}'),
-        ('hwp', f'hwp-4/olefile-{olefile}'), ('text', 'text-2'), ('eml', 'eml-3'), ('csv', 'csv-2'),
-        ('hwpx', 'hwpx-4')}
+        ('docx', 'docx-5'), ('pptx', 'pptx-5'), ('xlsx', 'xlsx-5'), ('pdf', f'pdf-4/pypdf-{pypdf}'),
+        ('hwp', f'hwp-5/olefile-{olefile}'), ('text', 'text-3'), ('eml', 'eml-4'), ('csv', 'csv-3'),
+        ('hwpx', 'hwpx-5')}
 
 
 def test_fixtures_bundle_unchanged():
@@ -176,3 +176,44 @@ def test_fixtures_bundle_unchanged():
         statuses[result.status] += 1
         units += len(result.units)
     assert statuses == {'ok': 26, 'failed': 13, 'unsupported': 7, 'encrypted': 5} and units == 133
+
+
+def test_every_parser_charges_its_own_units_and_text():
+    """Review v4 M1-L18: the dispatcher checks units and text again at the end, so a parser that forgot
+    a charge still gave the right code and every other test passed. Here each bundle document is parsed
+    by its module directly: the units charged must be exactly the units returned, and the text charged at
+    least their text (a shared string or boolean cell charges its text; pieces may count a little more)."""
+    checked = 0
+    for item, data in bundle.documents():
+        if item.status != 'ok' or not data:
+            continue
+        ext = '.' + item.rel_path.rsplit('.', 1)[1]
+        limits = Limits()
+        budget = _container.Budget(limits)
+        units, _ = parsers.parser_for(ext).parse(data, limits, budget)
+        assert limits.max_units - budget.units_left == len(units), item.rel_path
+        assert limits.max_text_chars - budget.text_left >= sum(len(unit.text) for unit in units), item.rel_path
+        checked += 1
+    assert checked >= 25
+
+
+def test_xlsx_sheet_targets_are_held_without_the_dispatcher():
+    """M1-L18: a held table is never checked again by the dispatcher, so the charge is checked directly."""
+    import io
+    import zipfile
+    from fixtures import make_ooxml
+    data = make_ooxml.xlsx_sheets(1)
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    target = 'worksheets/' + 'x' * 50_000 + '/../sheet1.xml'
+    rels = members['xl/_rels/workbook.xml.rels'].decode()
+    members['xl/_rels/workbook.xml.rels'] = rels.replace('worksheets/sheet1.xml', target).encode()
+    data = make_ooxml.zip_bytes(members)
+    limits = Limits(max_held_bytes=150_000)  # the target alone is 4 x 50,000 bytes in the model
+    try:
+        xlsx.parse(data, limits, _container.Budget(limits))
+    except parsers.ParseFailure as failure:
+        assert (failure.status, failure.code) == ('too_large', 'limit_memory')
+    else:
+        raise AssertionError('the relationship target was not held')
+    assert parsers.parse(data, '.xlsx', Limits()).status == 'ok'

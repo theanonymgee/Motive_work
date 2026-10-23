@@ -174,6 +174,41 @@ def long_page_pdf(chars: int) -> bytes:
     return assemble(objects)
 
 
+def object_stream_pdf(kids: int) -> bytes:
+    """PDF 1.5: the page tree node, listing one page ``kids`` times, is inside a Flate object stream
+    (object 6) and the cross-reference table is a stream (object 7)."""
+    import zlib
+    pages = f'<< /Type /Pages /Kids [{" ".join(["4 0 R"] * kids)}] /Count {kids} >>'.encode('ascii')
+    plain = {1: b'<< /Type /Catalog /Pages 2 0 R >>', 3: _HELVETICA, 4: _page(2, 3, 5),
+             5: _stream(b'BT /F1 12 Tf 72 720 Td (packed page) Tj ET')}
+    out, offsets = bytearray(b'%PDF-1.5\n'), {}
+    for number, body in plain.items():
+        offsets[number] = len(out)
+        out += f'{number} 0 obj\n'.encode('ascii') + body + b'\nendobj\n'
+    header = b'2 0 '
+    packed = zlib.compress(header + pages)
+    offsets[6] = len(out)
+    out += (f'6 0 obj\n<< /Type /ObjStm /N 1 /First {len(header)} /Length {len(packed)} /Filter /FlateDecode >>\n'
+            'stream\n').encode('ascii') + packed + b'\nendstream\nendobj\n'
+    offsets[7] = len(out)
+    rows = bytearray(b'\x00\x00\x00\x00\x00\xff\xff')
+    for number in range(1, 8):
+        if number == 2:
+            rows += b'\x02' + (6).to_bytes(4, 'big') + (0).to_bytes(2, 'big')
+        else:
+            rows += b'\x01' + offsets[number].to_bytes(4, 'big') + (0).to_bytes(2, 'big')
+    out += (f'7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R /Length {len(rows)} >>\nstream\n'
+            ).encode('ascii') + bytes(rows) + f'\nendstream\nendobj\nstartxref\n{offsets[7]}\n%%EOF\n'.encode('ascii')
+    return bytes(out)
+
+
+def operands_pdf(operands: int) -> bytes:
+    """One page whose content stream holds ``operands`` numbers before one ``n`` operator (and a line of text)."""
+    body = b'BT /F1 12 Tf 72 720 Td (operand page) Tj ET ' + b'1 ' * operands + b'n'
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', _pages_tree(4, 1), _HELVETICA, _page(2, 3, 5), _flate(body)]
+    return assemble(objects)
+
+
 def cases() -> dict[str, tuple[bytes, Expected]]:
     """``{rel_path: (bytes, Expected)}``: the PDF documents of the synthetic bundle."""
     text_pages = [list(LINES_EN[:3]), [], list(LINES_EN[3:])]

@@ -21,7 +21,10 @@ Resources, charged to the file's budget:
   or that uses such a form XObject, is read as a page without text.
 - After each page the decoded copies of its content streams and form XObjects are dropped, so the
   memory pypdf caches does not grow with the number of pages.
-- A stream that pypdf refuses to decode (over its own 75 MB output limit) is ``too_large/pdf_stream``.
+- A stream that pypdf refuses to decode (over its own 75 MB output limit) is ``too_large/pdf_stream``, and
+  so is decoded syntax over a token budget, measured before pypdf parses it: all object streams together
+  (2 M tokens) and one page's content with its forms (3 M); pypdf makes an object of 35 to 120 bytes a
+  token.
 
 Opening the file and the parts of one page's extraction where pypdf calls no visitor (fonts, image
 data) cannot be interrupted; their memory is bounded by pypdf's stream limit and the file size.
@@ -31,6 +34,7 @@ from __future__ import annotations
 import importlib.metadata
 import io
 import logging
+import re
 
 from pypdf import PdfReader
 from pypdf.errors import LimitReachedError, PdfReadError
@@ -38,7 +42,7 @@ from pypdf.errors import LimitReachedError, PdfReadError
 from . import Limits, ParseFailure, Unit, _container
 
 NAME = 'pdf'
-VERSION = f'pdf-3/pypdf-{importlib.metadata.version("pypdf")}'
+VERSION = f'pdf-4/pypdf-{importlib.metadata.version("pypdf")}'
 
 _logger = logging.getLogger('pypdf')
 _logger.setLevel(logging.CRITICAL)  # pypdf warnings may quote document content
@@ -47,6 +51,14 @@ _logger.addHandler(logging.NullHandler())
 
 _PARENT_STEPS = 64  # /Parent links followed when looking for inherited /Resources
 _TREE_BYTES = 16 * 2**20  # raw bytes of the catalog and page tree objects parsed before the pages are read
+# pypdf turns every token it parses into an object, about 35 to 120 bytes with its list slot (measured:
+# 72 MB of decoded content stream or object stream, a few hundred KiB compressed, took +1.3 to over 4 GiB).
+# Decoded data is measured in tokens before pypdf parses it: all object streams together (pypdf parses a
+# whole object stream when one object of it is needed and keeps it), and one page's content with every form
+# XObject it can draw. Over either is too_large/pdf_stream; at 120 bytes a token they stay under 600 MB.
+_OBJECT_STREAM_TOKENS = 2_000_000
+_PAGE_TOKENS = 3_000_000
+_TOKEN = re.compile(rb'[\x00\t\n\x0c\r ]+|[/\[(<]')  # a run of white space, or a delimiter that starts one
 
 
 class _Stop(Exception):
@@ -173,11 +185,46 @@ def _resources(node, budget) -> tuple[bool, object]:
     return False, None
 
 
+def _tokens(stream, most: int, budget) -> int:
+    """Tokens of a stream's decoded data, counted up to ``most + 1`` (one match at a time, so the count
+    takes no memory of its own) without keeping a decoded copy pypdf had not made (it decodes again when it
+    reads the stream; a stream is at most 75 MB decoded)."""
+    stream = _resolved(stream)
+    if not hasattr(stream, 'get_data') or most < 0:
+        return 0
+    budget.clock()
+    cached = getattr(stream, 'decoded_self', None)
+    count = 0
+    for count, _ in enumerate(_TOKEN.finditer(stream.get_data()), 1):
+        if count > most:
+            break
+    if cached is None and getattr(stream, 'decoded_self', None) is not None:
+        stream.decoded_self = None
+    budget.event(count // 8 + 1)  # a counted token is about a tenth of the work of an event
+    return count
+
+
+def _check_object_streams(reader: PdfReader, budget) -> None:
+    """Before any object is resolved: the tokens of every object stream together (``pdf_stream``)."""
+    left = _OBJECT_STREAM_TOKENS
+    for number in sorted({entry[0] for entry in reader.xref_objStm.values()}):
+        left -= _tokens(reader.get_object(number), left, budget)
+        if left < 0:
+            raise ParseFailure('too_large', 'pdf_stream')
+
+
 def _readable(page, budget) -> bool:
-    """False when pypdf's ``/Resources`` lookup would loop on the page or on a form XObject it may draw."""
+    """False when pypdf's ``/Resources`` lookup would loop on the page or on a form XObject it may draw.
+    The page's content and every form it can draw are measured in tokens first (``pdf_stream``)."""
     found, resources = _resources(page, budget)
     if not found:
         return False
+    contents = _get(page, '/Contents')
+    left = _PAGE_TOKENS
+    for stream in (contents if isinstance(contents, list) else [contents]):
+        left -= _tokens(stream, left, budget)
+    if left < 0:
+        raise ParseFailure('too_large', 'pdf_stream')
     stack, seen = [resources], set()
     while stack:
         xobjects = _get(stack.pop(), '/XObject')
@@ -191,6 +238,9 @@ def _readable(page, budget) -> bool:
             if key in seen or not isinstance(form, dict) or _get(form, '/Subtype') != '/Form':
                 continue
             seen.add(key)
+            left -= _tokens(form, left, budget)
+            if left < 0:
+                raise ParseFailure('too_large', 'pdf_stream')
             found, inner = _resources(form, budget)
             if not found:
                 return False
@@ -254,6 +304,7 @@ def parse(data: bytes, limits: Limits, budget: _container.Budget) -> tuple[list[
         budget.clock()  # opening cannot be interrupted
         if reader.is_encrypted:
             raise ParseFailure('encrypted', 'pdf_encrypted')
+        _check_object_streams(reader, budget)
         _count_pages(reader, limits, budget, len(data))
         pages = reader.pages
         count = len(pages)

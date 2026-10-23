@@ -59,9 +59,10 @@ class Budget:
     - ``event(n)``: XML events, HWP records and control characters, text lines and rows, PDF operators
       and text pieces (``limit_events``, ``max_events``): work counted the same on every machine. The
       clock is read every 4,096 events;
-    - ``hold(objects, chars)``: approximate bytes of tables kept until the parse ends (shared strings,
-      relationship targets, names) at 256 bytes per object and 4 per character (``limit_memory``,
-      ``max_held_bytes``). Only ``XmlStream`` gives some back (``release``: its per-part name table);
+    - ``hold(objects, chars)``: approximate bytes of tables kept until the parse ends (relationship
+      targets, names) at 256 bytes per object and 4 per character, and ``hold_bytes(n)`` for what is
+      measured on the object (XLSX shared strings) (``limit_memory``, ``max_held_bytes``). Only
+      ``XmlStream`` gives some back (``release``: its per-part name table);
     - ``clock()``: the wall clock (``parse_time``, ``parse_seconds``).
 
     Charging too much only refuses earlier; it never lets memory grow.
@@ -100,6 +101,12 @@ class Budget:
 
     def hold(self, objects: int = 1, chars: int = 0) -> None:
         self.held_left -= _OBJECT_BYTES * objects + _CHAR_BYTES * chars
+        if self.held_left < 0:
+            raise ParseFailure('too_large', 'limit_memory')
+
+    def hold_bytes(self, count: int) -> None:
+        """Hold ``count`` bytes measured on the object itself (``sys.getsizeof``), not by the model."""
+        self.held_left -= count
         if self.held_left < 0:
             raise ParseFailure('too_large', 'limit_memory')
 
@@ -371,6 +378,9 @@ def check_root(tag: str, expected: str) -> None:
         raise ParseFailure('unsupported', 'bad_signature')
 
 
+BAD_SECTOR_SIZE = -1
+
+
 def _u32(data: bytes, offset: int) -> int:
     return int.from_bytes(data[offset:offset + 4], 'little')
 
@@ -378,12 +388,13 @@ def _u32(data: bytes, offset: int) -> int:
 def ole_entries(data: bytes, limit: int) -> int | None:
     """Directory entries of a compound file, counted from its header and FAT without opening it (olefile
     makes an object of about 1.5 KB per entry), or None when the header cannot be followed (olefile then
-    decides). Counting stops past ``limit``."""
+    decides). Counting stops past ``limit``. A sector size other than 512 or 4096 bytes (the only ones the
+    format allows; olefile only notes it and reads on) is ``BAD_SECTOR_SIZE``."""
     if len(data) < 512 or not data.startswith(OLE_SIGNATURE):
         return None
     shift = int.from_bytes(data[0x1E:0x20], 'little')
     if shift not in (9, 12):
-        return None
+        return BAD_SECTOR_SIZE
     size = 1 << shift
     per_sector, entries_per_sector, sectors = size // 4, size // 128, len(data) // size
 

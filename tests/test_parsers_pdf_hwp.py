@@ -150,9 +150,9 @@ def test_every_unit_passes_locator_check_unit(rel):
 
 
 def test_parser_versions_follow_the_format():
-    assert re.fullmatch(r'pdf-3/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
-    assert re.fullmatch(r'hwp-4/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
-    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-4')
+    assert re.fullmatch(r'pdf-4/pypdf-\d+\.\d+\.\d+', pdf.VERSION) and pdf.NAME == 'pdf'
+    assert re.fullmatch(r'hwp-5/olefile-\d+\.\d+', hwp.VERSION) and hwp.NAME == 'hwp'
+    assert (hwp.HWPX_NAME, hwp.HWPX_VERSION) == ('hwpx', 'hwpx-5')
     assert parsers.parser_for('.pdf').version == pdf.VERSION
     assert parsers.parser_for('.hwp').version == hwp.VERSION
     assert parsers.parser_for('.HWPX').version == hwp.HWPX_VERSION
@@ -418,10 +418,11 @@ def test_pdf_time_limit_is_checked_before_each_page(monkeypatch):
     data = make_pdf.latin_pdf([['one'], ['two'], ['three']])
     assert outcome(run(data, '.pdf', Limits(parse_seconds=-1))) == ('too_large', 'parse_time')
     looks = fake_clock(monkeypatch)
-    # The budget is made, the clock is read before and after opening the file, then before each page.
-    assert texts(run(data, '.pdf', Limits(parse_seconds=100))) == ['one', 'two', 'three'] and looks[0] == 1 + 2 + 3
+    # The budget is made, the clock is read before and after opening the file, then before each page and
+    # when its content stream is measured.
+    assert texts(run(data, '.pdf', Limits(parse_seconds=100))) == ['one', 'two', 'three'] and looks[0] == 1 + 2 + 3 * 2
     looks[0] = 0
-    assert outcome(run(data, '.pdf', Limits(parse_seconds=4.5))) == ('too_large', 'parse_time')  # at the third page
+    assert outcome(run(data, '.pdf', Limits(parse_seconds=6.5))) == ('too_large', 'parse_time')  # at the third page
 
 
 def test_pdf_text_limit_stops_while_reading():
@@ -725,3 +726,29 @@ def test_pdf_page_tree_objects_are_measured_before_pypdf_parses_them(monkeypatch
     monkeypatch.setattr(pdf, '_TREE_BYTES', 4_000)  # the /Kids object is about 6,000 bytes
     assert outcome(run(data, '.pdf', Limits(pdf_max_pages=1_000))) == ('too_large', 'pdf_count')
     assert made[-1].flattened_pages is None and 2 not in {key[1] for key in made[-1].resolved_objects}
+
+
+def test_pdf_object_streams_are_measured_before_pypdf_parses_them(monkeypatch):
+    """Review v4 B-1: pypdf parses a whole object stream as soon as one object in it is needed and keeps
+    every object, 35 to 120 bytes a token (a page tree of 12 M references in a 300 KiB file: +1,275 MiB).
+    The decoded object streams are measured in tokens before anything is resolved."""
+    made = readers(monkeypatch)
+    data = make_pdf.object_stream_pdf(100)
+    assert texts(run(data, '.pdf')) == ['packed page'] * 100
+    monkeypatch.setattr(pdf, '_OBJECT_STREAM_TOKENS', 200)  # 100 references are about 300 tokens
+    assert outcome(run(data, '.pdf')) == ('too_large', 'pdf_stream')
+    assert 2 not in {key[1] for key in made[-1].resolved_objects}  # the tree was never parsed
+
+
+def test_pdf_page_content_is_measured_before_pypdf_parses_it(monkeypatch):
+    """Review v4 B-1: pypdf turns a whole content stream into operations before any visitor runs (72 MB of
+    numbers: +2.5 GiB). A page's content and the forms it can draw are measured in tokens first."""
+    data = make_pdf.operands_pdf(10_000)
+    assert texts(run(data, '.pdf')) == ['operand page']
+    monkeypatch.setattr(pdf, '_PAGE_TOKENS', 5_000)
+    assert outcome(run(data, '.pdf')) == ('too_large', 'pdf_stream')
+    forms = make_pdf.form_chain_pdf(3, leaf_chars=10)  # ten draws a level: each form is counted once
+    assert outcome(run(forms, '.pdf')) == ('ok', None)
+    monkeypatch.setattr(pdf, '_PAGE_TOKENS', 60)
+    assert outcome(run(forms, '.pdf')) == ('too_large', 'pdf_stream')
+    assert pdf._TOKEN.subn(b'', b'1 2  3\n/a/b [(x) <00>]')[1] == 10  # 5 white space runs, 5 starting delimiters

@@ -18,10 +18,10 @@ from workmcp.parsers import Limits, ParseFailure, Parser, ParseResult, Unit
 PYPDF = importlib.metadata.version('pypdf')
 OLEFILE = importlib.metadata.version('olefile')
 EXPECTED_PARSERS = {
-    '.txt': ('text', 'text-2'), '.md': ('text', 'text-2'), '.csv': ('csv', 'csv-2'),
-    '.pdf': ('pdf', f'pdf-3/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-4'), '.pptx': ('pptx', 'pptx-4'),
-    '.xlsx': ('xlsx', 'xlsx-4'), '.eml': ('eml', 'eml-3'), '.hwp': ('hwp', f'hwp-4/olefile-{OLEFILE}'),
-    '.hwpx': ('hwpx', 'hwpx-4')}
+    '.txt': ('text', 'text-3'), '.md': ('text', 'text-3'), '.csv': ('csv', 'csv-3'),
+    '.pdf': ('pdf', f'pdf-4/pypdf-{PYPDF}'), '.docx': ('docx', 'docx-5'), '.pptx': ('pptx', 'pptx-5'),
+    '.xlsx': ('xlsx', 'xlsx-5'), '.eml': ('eml', 'eml-4'), '.hwp': ('hwp', f'hwp-5/olefile-{OLEFILE}'),
+    '.hwpx': ('hwpx', 'hwpx-5')}
 SIGNED = {'.pdf': b'%PDF-1.4\n', '.docx': b'PK\x03\x04', '.pptx': b'PK\x03\x04', '.xlsx': b'PK\x05\x06',
           '.hwpx': b'PK\x03\x04'}
 
@@ -293,8 +293,8 @@ def test_limits_defaults_follow_the_design():
                               zip_max_entries=10_000, zip_max_part_bytes=128 * 2**20,
                               zip_max_total_bytes=512 * 2**20, xml_max_depth=256, xml_max_attributes=1_000,
                               xml_max_markup_bytes=2**20, xml_max_names=10_000, max_unit_chars=8 * 2**20,
-                              hwp_max_para_bytes=16 * 2**20, max_events=50_000_000,
-                              max_held_bytes=128 * 2**20, parse_seconds=60.0)
+                              hwp_max_para_bytes=16 * 2**20, max_events=30_000_000,
+                              max_held_bytes=256 * 2**20, parse_seconds=60.0)
     assert Limits().max_unit_chars == Limits().hwp_max_para_bytes // 2  # one unit's text, the same in every format
     with pytest.raises(AttributeError):
         Limits().max_units = 1  # frozen

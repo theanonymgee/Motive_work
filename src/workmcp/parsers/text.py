@@ -16,9 +16,9 @@ from collections.abc import Iterator
 from . import Limits, ParseFailure, Unit, _container
 
 NAME = 'text'
-VERSION = 'text-2'
+VERSION = 'text-3'
 CSV_NAME = 'csv'
-CSV_VERSION = 'csv-2'
+CSV_VERSION = 'csv-3'
 
 _LINE_BREAK = re.compile(r'\r\n|\r|\n')  # not str.splitlines(): it also splits on \x0b, \x1c, U+2028 ...
 _LINE_END = re.compile(r'(\r\n|\r|\n)')

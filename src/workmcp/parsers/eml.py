@@ -6,31 +6,36 @@ position in ``msg.walk()``). A message without such a part gives the text of its
 instead. Attachments are not read, and neither is any part of a message carried inside the
 message (``message/rfc822`` and other ``message/*`` parts, attached or inline).
 
-Resources (parser resource design §3.10): the body lines are read like TXT lines (``text.lines``: one
-event each, at most ``max_unit_chars`` a line) and HTML is fed to the tag stripper 1 Mi characters at
-a time with the clock read in between, every piece of text it keeps being one event. The message
-parser reads the bytes 8 KiB at a time with the clock read on every read; it keeps every line of a
-part as a str and copies a line several times, so before it runs the lines are held memory (64 bytes a
-line in the budget: more than about two million lines is ``too_large/limit_memory``) and events, and a
-raw line over ``max_unit_chars`` is ``too_large/unit_chars``.
+Resources (parser resource design §3.10, M1 design §15.2): a part's text is never held whole. Its
+payload is decoded 1 MiB at a time (cut after a line break; for UTF-8 also before any character), fed
+to the tag stripper when it is HTML (1 Mi characters at a time, the clock read in between, every piece
+it keeps one event), and cut into lines as it comes: the same lines and numbers as splitting the whole
+text, one event each, at most ``max_unit_chars`` a line. The message's own copy of the payload is
+dropped once it has been read. The message parser reads the bytes 8 KiB at a time with the clock read
+on every read; it keeps every line of a part as a str and copies a line several times, so before it
+runs the lines are held memory (64 bytes a line in the budget: more than about two million lines is
+``too_large/limit_memory``) and events, and a raw line over ``max_unit_chars`` is
+``too_large/unit_chars``.
 """
 from __future__ import annotations
 
-import io
 import re
+from collections.abc import Iterator
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
 
-from . import Limits, ParseFailure, Unit, _container, text
+from . import Limits, ParseFailure, Unit, _container
 
 NAME = 'eml'
-VERSION = 'eml-3'
+VERSION = 'eml-4'
 
 HEADERS = ('From', 'To', 'Cc', 'Subject', 'Date')
 _FEED_CHARS = 1 << 20  # HTML characters given to the tag stripper at a time
 _LINE_OBJECTS = 4      # the message parser keeps each line as a str (about 64 bytes): a quarter of a held object
 _RAW_BREAK = re.compile(rb'\r\n|\r|\n')
+_LINE_BREAK = re.compile(r'\r\n|\r|\n')  # as text.lines: \x0b, \x1c, U+2028 ... do not end a line
+_DECODE_BYTES = 1 << 20  # payload bytes decoded at a time
 _SKIPPED = frozenset({'script', 'style', 'title'})
 _BLOCKS = frozenset({
     'p', 'div', 'br', 'li', 'tr', 'table', 'ul', 'ol', 'blockquote', 'pre', 'hr', 'section', 'article',
@@ -43,7 +48,7 @@ class _HtmlText(HTMLParser):
 
     def __init__(self, budget):
         super().__init__(convert_charrefs=True)
-        self.out = _container.Pieces()
+        self.out = []  # the text since the caller last took it
         self._skip = 0
         self._budget = budget
 
@@ -74,25 +79,21 @@ class _HtmlText(HTMLParser):
             self._keep(data)
 
 
-class _Reader(io.BytesIO):
-    """The message bytes for ``BytesParser.parse``, which reads them 8 KiB at a time; the clock is read
-    on every read, so parsing a message can be interrupted."""
+class _Reader:
+    """The message for the text parser behind ``BytesParser``, which reads it 8 KiB at a time: the bytes
+    as ``parsebytes`` hands them over (ASCII with surrogate escapes, line ends untouched, unlike
+    ``BytesParser.parse``, whose text wrapper turns every CR and CRLF into LF). The clock is read on every
+    read, so parsing a message can be interrupted."""
 
     def __init__(self, data: bytes, budget):
-        super().__init__(data)
-        self._budget = budget
+        self._data, self._pos, self._budget = data, 0, budget
 
-    def read(self, size=-1):
+    def read(self, size: int = -1) -> str:
         self._budget.clock()
-        return super().read(size)
-
-    def read1(self, size=-1):
-        self._budget.clock()
-        return super().read1(size)
-
-    def readinto(self, buffer):
-        self._budget.clock()
-        return super().readinto(buffer)
+        end = len(self._data) if size is None or size < 0 else self._pos + size
+        piece = self._data[self._pos:end]
+        self._pos += len(piece)
+        return piece.decode('ascii', errors='surrogateescape')
 
 
 def _check_lines(data: bytes, limits: Limits, budget) -> None:
@@ -110,24 +111,89 @@ def _check_lines(data: bytes, limits: Limits, budget) -> None:
         raise ParseFailure('too_large', 'unit_chars')
 
 
-def _html_text(markup: str, budget) -> str:
-    parser = _HtmlText(budget)
-    for start in range(0, len(markup), _FEED_CHARS):
-        parser.feed(markup[start:start + _FEED_CHARS])
-        budget.clock()
-    parser.close()
-    return parser.out.text()
-
-
-def _part_text(part) -> str:
+def _splittable(charset: str) -> bool:
+    """Whether bytes in this charset can be decoded line by line: ASCII-compatible (a line break is the
+    byte 0x0A and never part of another character) and without a state that crosses lines."""
+    name = charset.lower().replace('_', '-')
+    if name.startswith(('iso-2022', 'utf-7', 'utf-16', 'utf-32', 'hz')):
+        return False
     try:
-        return part.get_content()
-    except (LookupError, ValueError):  # unknown charset name or a content-manager failure
-        return (part.get_payload(decode=True) or b'').decode('utf-8', errors='replace')
+        return '\n'.encode(charset) == b'\n' and 'a\n'.encode(charset) == b'a\n'
+    except (LookupError, UnicodeError):
+        return False
 
 
-def _lines(body: str, part_number: int, limits: Limits, units: list, budget) -> None:
-    for number, line in text.lines(body, limits, budget):
+def _part_chunks(part, budget) -> Iterator[str]:
+    """The text of a text part as ``part.get_content()`` decodes it (its charset, ``errors='replace'``,
+    UTF-8 when the charset is unknown), handed out about 1 MiB of payload at a time. The message's own
+    copy of the payload is dropped once the bytes are taken."""
+    data = part.get_payload(decode=True) or b''
+    charset = part.get_content_charset('us-ascii')
+    try:
+        b'a'.decode(charset, errors='replace')
+    except LookupError:
+        charset = 'utf-8'
+    part.set_payload('')
+    splittable, utf8 = _splittable(charset), charset.lower().replace('_', '-') in ('utf-8', 'utf8')
+    pos = 0
+    while pos < len(data):
+        budget.clock()
+        end = len(data)
+        if splittable and pos + _DECODE_BYTES < end:
+            cut = data.find(b'\n', pos + _DECODE_BYTES, pos + 8 * _DECODE_BYTES)
+            if cut >= 0:
+                end = cut + 1
+            elif utf8:
+                end = pos + _DECODE_BYTES
+                while end > pos and 0x80 <= data[end] < 0xC0:  # not inside a character
+                    end -= 1
+        yield data[pos:end].decode(charset, errors='replace')
+        pos = end
+
+
+def _html_chunks(chunks: Iterator[str], budget) -> Iterator[str]:
+    """The visible text of HTML handed in pieces, as the tag stripper gives it piece by piece."""
+    parser = _HtmlText(budget)
+    for chunk in chunks:
+        for start in range(0, len(chunk), _FEED_CHARS):
+            parser.feed(chunk[start:start + _FEED_CHARS])
+            budget.clock()
+            if parser.out:
+                yield ''.join(parser.out)
+                parser.out.clear()
+    parser.close()
+    if parser.out:
+        yield ''.join(parser.out)
+
+
+def _chunk_lines(chunks: Iterator[str], limits: Limits, budget) -> Iterator[tuple[int, str]]:
+    """``(number, line)`` of text handed in pieces: the same lines and numbers as ``text.lines`` gives for
+    the whole text. Only the line still open is kept between pieces, at most ``max_unit_chars``."""
+    number, carry = 0, ''
+    for chunk in chunks:
+        joined = carry + chunk
+        held = joined.endswith('\r')  # it may be the first half of \r\n
+        found = _LINE_BREAK.split(joined[:-1] if held else joined)
+        carry = found.pop() + ('\r' if held else '')
+        budget.event(len(found))
+        for line in found:
+            number += 1
+            if len(line) > limits.max_unit_chars:
+                raise ParseFailure('too_large', 'unit_chars')
+            yield number, line
+        if len(carry) > limits.max_unit_chars + 1:
+            raise ParseFailure('too_large', 'unit_chars')
+    found = _LINE_BREAK.split(carry)
+    budget.event(len(found))
+    for line in found:
+        number += 1
+        if len(line) > limits.max_unit_chars:
+            raise ParseFailure('too_large', 'unit_chars')
+        yield number, line
+
+
+def _lines(lines: Iterator[tuple[int, str]], part_number: int, units: list, budget) -> None:
+    for number, line in lines:
         if line and (line := line.strip()):
             budget.text(len(line))
             budget.unit()
@@ -136,7 +202,7 @@ def _lines(body: str, part_number: int, limits: Limits, units: list, budget) -> 
 
 def parse(data: bytes, limits: Limits, budget: _container.Budget) -> tuple[list[Unit], str | None]:
     _check_lines(data, limits, budget)
-    msg = BytesParser(policy=policy.default).parse(_Reader(data, budget))
+    msg = BytesParser(policy=policy.default).parser.parse(_Reader(data, budget))  # as parsebytes, in pieces
     header_lines = []
     for name in HEADERS:
         value = msg.get(name)
@@ -164,9 +230,10 @@ def parse(data: bytes, limits: Limits, budget: _container.Budget) -> tuple[list[
     plain = [(number, part) for number, part in readable if part.get_content_type() == 'text/plain']
     if plain:
         for number, part in plain:
-            _lines(_part_text(part), number, limits, units, budget)
+            _lines(_chunk_lines(_part_chunks(part, budget), limits, budget), number, units, budget)
     else:
         for number, part in readable:
             if part.get_content_type() == 'text/html':
-                _lines(_html_text(_part_text(part), budget), number, limits, units, budget)
+                chunks = _html_chunks(_part_chunks(part, budget), budget)
+                _lines(_chunk_lines(chunks, limits, budget), number, units, budget)
     return units, 'rfc822'

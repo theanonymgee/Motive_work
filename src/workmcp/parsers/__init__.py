@@ -105,12 +105,16 @@ class Limits:
     max_unit_chars: int = 8 * 2**20
     # One HWP PARA_TEXT record (UTF-16LE, 2 bytes per character): 8M characters.
     hwp_max_para_bytes: int = 16 * 2**20
-    # One file's budget besides text and units (parser resource design §2.3): events (XML events, HWP
-    # records, lines, PDF operators; about 28 s here, so a file is refused by the same code on any
-    # machine before the clock runs out) and the approximate bytes of tables kept until the end of the
-    # parse (shared strings, relationship targets, names).
-    max_events: int = 50_000_000
-    max_held_bytes: int = 128 * 2**20
+    # One file's budget besides text and units (parser resource design §2.3, M1 design §15.2):
+    # - events (XML events, HWP records, lines, PDF operators): the slowest kind measured here is an
+    #   empty XLSX cell, 0.78 us an event, so 30 M events take about 23 s, under half of parse_seconds; a
+    #   PC twice as slow still refuses such a file with limit_events, the same code, before the clock;
+    # - bytes of the tables kept until the end of the parse (shared strings at their real str size,
+    #   relationship targets and names at 256 bytes an object and 4 a character). 256 MiB holds every
+    #   shared string a workbook within max_units and max_text_chars can use (4 bytes a character at most,
+    #   about 84 bytes a string), so this limit is never reached before those two.
+    max_events: int = 30_000_000
+    max_held_bytes: int = 256 * 2**20
     # Wall-clock seconds for one file's parse, the dispatcher's checks included; over it is
     # too_large/parse_time. Unlike every other limit it depends on the machine (see binding 'timeout').
     parse_seconds: float = 60.0
@@ -220,6 +224,8 @@ def parse(data: bytes, ext: str, limits: Limits) -> ParseResult:
     if (ext.lower() == '.hwp' or ext.lower() in ZIP_EXTENSIONS) and data.startswith(OLE_SIGNATURE):
         # olefile makes an object per directory entry before anything can be checked: count them first.
         entries = _container.ole_entries(data, limits.zip_max_entries)
+        if entries == _container.BAD_SECTOR_SIZE:
+            return result('failed', 'ole_invalid')
         if entries is not None and entries > limits.zip_max_entries:
             return result('too_large', 'ole_entries')
     if mismatch := sniff(data, ext):
