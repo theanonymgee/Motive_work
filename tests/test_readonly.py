@@ -17,7 +17,7 @@ import pyexpat
 import pytest
 
 import _audited_server
-from fixtures import SENTINEL, make_text
+from fixtures import SENTINEL, bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = Path(__file__).resolve().parent/'_audited_server.py'
@@ -91,20 +91,12 @@ def fingerprint(root: Path) -> dict:
     return state
 
 
-def write_synthetic_sources(root: Path) -> list:
-    """TXT/CSV bundle (stage 1) plus files the collector must leave alone."""
-    expected = make_text.write(root)
-    (root/'node_modules').mkdir()
-    (root/'node_modules'/'x.txt').write_bytes(SENTINEL.encode('utf-8'))
-    (root/'docs'/'~$lock.docx').write_bytes(b'synthetic office lock')
-    (root/'docs'/'image.png').write_bytes(b'\x89PNG synthetic')
-    return expected
-
-
 def test_scan_and_verify_never_write_to_sources(tmp_path):
-    """Design §4.3 (a)-(f): the collector, the binding check and a second scan under the audit hook."""
+    """Design §4.3 (a)-(f) over the full bundle: the collector, the binding check and a second scan
+    under the audit hook."""
     source = tmp_path/'src'
-    expected = write_synthetic_sources(source)                                      # (a)
+    expected = bundle.write_bundle(source)                                          # (a)
+    want = bundle.totals(bundle.documents())
     files = [p for p in source.rglob('*') if p.is_file()]
     for path in files:
         os.chmod(path, stat.S_IREAD)  # extra belt: any write would also fail at the OS level
@@ -113,7 +105,7 @@ def test_scan_and_verify_never_write_to_sources(tmp_path):
         log = tmp_path/'audit-scan.json'
         env = {**os.environ, 'WORKMCP_HOME': str(tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
         run = subprocess.run([sys.executable, str(WRAPPER), str(log), 'scan', str(source)], env=env, cwd=tmp_path,
-                             capture_output=True, text=True, encoding='utf-8', timeout=120)
+                             capture_output=True, text=True, encoding='utf-8', timeout=180)
         assert run.returncode == 0, run.stderr                                      # (c)
         report = json.loads(log.read_text(encoding='utf-8'))
         assert fingerprint(source) == before                                        # (e)
@@ -122,25 +114,33 @@ def test_scan_and_verify_never_write_to_sources(tmp_path):
             os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
     assert report['completed'] is True
     supported = len(expected)
+    assert supported == want['files'] and len(files) == supported + len(bundle.noise_paths())
     first, second = report['first'], report['second']
-    assert (first['seen'], first['added'], first['excluded'], first['ignored']) == (supported, supported, 2, 1)
+    noise = bundle.noise_counts()
+    assert (first['seen'], first['added'], first['excluded'], first['ignored']) == (
+        supported, supported, noise['excluded'], noise['ignored'])
+    assert {key: first[key] for key in ('parsed_ok', 'reused', 'failed', 'unsupported', 'encrypted', 'units')} == {
+        key: want[key] for key in ('parsed_ok', 'reused', 'failed', 'unsupported', 'encrypted', 'units')}
     assert second['seen'] == second['unchanged'] == supported                       # incremental: nothing re-read
     assert all(second[key] == 0 for key in ('added', 'changed', 'touched', 'restored', 'deleted', 'unstable',
                                             'reparsed', 'new_versions', 'units'))
-    oks = sum(1 for item in expected if item.status == 'ok')
-    assert report['statuses'] == {'ok': oks, 'failed/binary_content': 1, 'failed/encoding_unknown': 1}
+    assert report['statuses'] == dict(want['statuses'])
+    assert report['by_parser'] == want['by_parser'] and len(report['by_parser']) == 9
     verify = report['verify']
-    assert verify['ok'] and verify['versions']['ok'] == oks
-    assert verify['units']['bound'] == verify['units']['total'] == sum(item.unit_count for item in expected) > 0
+    assert verify['ok'] and verify['versions']['ok'] == want['ok']
+    assert verify['units']['bound'] == verify['units']['total'] == want['units'] > 0
     events = report['events']
     assert [e for e in events if e['violation']] == []                              # (d) no write was attempted
     reads = [e for e in events if e.get('source') and e['event'] == 'open']
-    assert len(reads) >= supported + oks                                            # the hook really saw the reads
+    assert len(reads) >= supported + want['ok']                                     # the hook really saw the reads
     assert all(", 'r', " in e['detail'] for e in reads), reads
-    assert not [e for e in events if 'node_modules' in e['detail'] or '~$lock' in e['detail']]
+    noise_names = ('node_modules', '~$lock', '.git', 'hidden_note', 'image.png')
+    assert not [e for e in events if any(name in e['detail'] for name in noise_names)]
     assert not [e for e in events if e['event'].startswith(_audited_server.PROCESS_EVENTS)]   # (f)
     assert not [e for e in events if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
+    assert not [e for e in events if e['event'] in _audited_server.ADDRESS_EVENTS]  # a scan opens no socket at all
     assert SENTINEL not in run.stdout + run.stderr
+    assert SENTINEL not in json.dumps(report, ensure_ascii=False)
 
 
 # Static layer (design §4.2): no write API in the modules that touch sources.

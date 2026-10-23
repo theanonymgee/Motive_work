@@ -4,15 +4,19 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT
 
 - ``serve`` (default): ``workmcp.server.main()``; stdin/stdout are the MCP stdio transport.
 - ``imports``: import every package module, build the server and call ``tools.status``.
-- ``probe``: positive control. Tries a non-loopback connect, a name lookup and a process start
-  (all blocked by the hook before they happen) and one loopback socket pair (allowed); then,
+- ``probe``: positive control. Tries a non-loopback connect, a name lookup, a process start and a
+  fixed-port loopback listener (all blocked by the hook before they happen) and one loopback
+  socket pair on port 0 (allowed); then,
   with a probe folder as the source root, a write and a delete inside it (both blocked).
 - ``scan ROOT``: source-read audit with ROOT as the source root: ``config.validate_root`` ->
   ``collect.scan`` -> ``binding.verify`` -> a second ``collect.scan`` (must be all unchanged).
+  The report has counts only (per status/code and per parser), never document text.
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
 ::1), no name resolution and no process creation. Loopback is allowed only because the
-Windows asyncio event loop makes an internal socket pair for wake-ups. With a source root set,
+Windows asyncio event loop makes an internal socket pair for wake-ups, so a loopback ``bind``
+must ask for port 0 (any free port, as ``socket.socketpair`` does): a fixed-port listener is a
+local server another process could reach and is a violation (M0 review v2 N-L5). With a source root set,
 also no write to anything under it: no ``open`` with a write mode or write flags, no remove,
 rename, utime, chmod, truncate, mkdir, rmdir, link or ``shutil`` call on a path under it.
 A violating event is recorded, then blocked (the hook raises), so it never happens. The event
@@ -32,6 +36,7 @@ NETWORK_EVENTS = ('http.client.', 'urllib.', 'webbrowser.', 'ftplib.', 'smtplib.
                   'telnetlib.', 'nntplib.')
 WATCHED = ('socket.', *PROCESS_EVENTS, *NETWORK_EVENTS)
 PROBE_ADDRESS = ('203.0.113.1', 9)  # TEST-NET-3 documentation address; never actually contacted
+PROBE_LISTEN_PORT = 8765  # a fixed loopback port; the bind is blocked before it happens
 
 # Source-write events (measured on this PC, design M1 §4.3): 'rb' arrives as mode 'r'; os.open has
 # mode None and the flags; Path.touch/os.utime -> os.utime; os.replace -> os.rename; os.unlink -> os.remove.
@@ -50,6 +55,8 @@ def judge(event: str, args: tuple) -> str | None:
     """None when the event is inside the runtime boundary, else the reason it is not."""
     if event in ADDRESS_EVENTS:
         address = args[1] if len(args) > 1 else None
+        if event == 'socket.bind' and is_loopback(address) and address[1] != 0:
+            return f'socket.bind loopback listener on fixed port {address[1]!r}'
         if is_loopback(address) or (event == 'socket.sendmsg' and address is None):  # sendmsg on a connected socket
             return None
         return f'{event} to non-loopback address {address!r}'
@@ -176,6 +183,12 @@ def probe() -> dict:
 
     attempt('loopback', loopback_pair)
 
+    def loopback_listener():
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', PROBE_LISTEN_PORT))
+
+    attempt('loopback_listener', loopback_listener)
+
     source = Path.cwd()/'probe-source'
     source.mkdir(exist_ok=True)
     original = source/'original.txt'
@@ -214,11 +227,20 @@ def scan(root: Path) -> dict:
             second = collect.scan(db, [(ids[spec.key], spec)], settings, partial=True)
             statuses = dict(db.execute("SELECT parse_status || COALESCE('/' || parse_error, ''), COUNT(*) "
                                        "FROM versions GROUP BY 1").fetchall())
+            by_parser = {}
+            for parser, key, files, units in db.execute(
+                    "SELECT parser, parse_status || COALESCE('/' || parse_error, ''), COUNT(*), SUM(unit_count) "
+                    'FROM versions GROUP BY 1, 2'):
+                entry = by_parser.setdefault(parser, {'files': 0, 'units': 0, 'statuses': {}})
+                entry['files'] += files
+                entry['units'] += units
+                entry['statuses'][key] = files
         finally:
             db.close()
     finally:
         store.release_scan_lock(lock)
     return {'root': str(root), 'first': first['total'], 'second': second['total'], 'statuses': statuses,
+            'by_parser': by_parser,
             'verify': {'ok': report['ok'], 'versions': report['versions'], 'units': report['units']}}
 
 

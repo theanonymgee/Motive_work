@@ -1,6 +1,6 @@
 """``workmcp scan``/``verify``/``sources`` output, exit codes and logs (design M1 §9); ``status.last_scan``.
 
-Run in-process with a temporary data home (conftest) and synthetic TXT/CSV sources.
+Run in-process with a temporary data home (conftest) and the full synthetic bundle (``fixtures.bundle``).
 """
 import json
 import re
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures import SENTINEL, make_text
+from fixtures import SENTINEL, bundle
 from workmcp import cli, config, paths, store, tools
 
 UNC = r'\\localhost\C$\synthetic'
@@ -43,8 +43,8 @@ SUMMARY = re.compile(
 
 def test_scan_cli_summary_format_and_exit_codes(home, tmp_path, capsys):
     src = tmp_path/'src'
-    expected = make_text.write(src)
-    (src/'image.png').write_bytes(b'synthetic')
+    expected = bundle.write_bundle(src)
+    want, noise = bundle.totals(bundle.documents()), bundle.noise_counts()
     write_config(home, src)
     code, out, err = run(capsys, 'scan')
     assert (code, err) == (0, '')
@@ -54,7 +54,9 @@ def test_scan_cli_summary_format_and_exit_codes(home, tmp_path, capsys):
     n = len(expected)
     assert match.group(2) == 'full' and Path(match.group(3)) == src.resolve()
     assert numbers[:9] == [n, n, 0, 0, 0, 0, 0, 0, 0]                 # seen added ... reparsed
-    assert numbers[11] == 2 and numbers[18] == 1                       # failed 2 (edge files), ignored 1
+    assert numbers[9:17] == [want['parsed_ok'], want['reused'], want['failed'], 0, 0, want['unsupported'],
+                             want['encrypted'], 0]                     # parsed ok ... skipped
+    assert numbers[17:21] == [noise['excluded'], noise['ignored'], 0, 0]
     assert numbers[21:23] == [n, n] and numbers[23] == sum(item.unit_count for item in expected)
     log = Path(match.groups()[-1])
     assert log.is_file() and log.parent == home/'logs'
@@ -128,7 +130,7 @@ def test_scan_warnings_go_to_stderr(home, tmp_path, capsys, monkeypatch):
 
 def test_scan_output_and_log_carry_no_document_text(home, tmp_path, capsys):
     src = tmp_path/'src'
-    make_text.write(src)
+    bundle.write_bundle(src)
     outputs = []
     for argv in (['scan', '--root', str(src)], ['scan', '--root', str(src)], ['verify'], ['sources']):
         code, out, err = run(capsys, *argv)
@@ -150,15 +152,16 @@ def test_scan_output_and_log_carry_no_document_text(home, tmp_path, capsys):
 def test_verify_cli_output_and_exit_codes(home, tmp_path, capsys):
     assert run(capsys, 'verify')[0] == 4  # no store yet
     src = tmp_path/'src'
-    expected = make_text.write(src)
+    expected = bundle.write_bundle(src)
     assert run(capsys, 'scan', '--root', str(src))[0] == 0
     code, out, err = run(capsys, 'verify')
     oks = sum(item.status == 'ok' for item in expected)
     units = sum(item.unit_count for item in expected)
+    not_ok = len(expected) - oks
     assert (code, err) == (0, '')
     lines = out.splitlines()
-    assert re.fullmatch(rf'verify \S+  versions {len(expected)} checked {oks} ok {oks} failed 0  unverifiable 2 '
-                        r'\(stale 0, missing 0, locked 0, unstable 0, parser 0, not_ok 2\)', lines[0])
+    assert re.fullmatch(rf'verify \S+  versions {len(expected)} checked {oks} ok {oks} failed 0  unverifiable {not_ok} '
+                        rf'\(stale 0, missing 0, locked 0, unstable 0, parser 0, not_ok {not_ok}\)', lines[0])
     assert lines[1:] == [f'units {units}/{units} bound (100.0%)  chunks 0  evidence 0', 'binding ok']
     assert run(capsys, 'verify', '--root', str(src))[0] == 0
     assert run(capsys, 'verify', '--root', str(tmp_path/'elsewhere'))[0] == 4
@@ -228,7 +231,7 @@ def test_status_tool_reports_last_scan(home, tmp_path, capsys):
     before = tools.status(home)
     assert before['ok'] and before['result']['last_scan'] is None and before['notice']
     src = tmp_path/'src'
-    expected = make_text.write(src)
+    expected = bundle.write_bundle(src)
     run(capsys, 'scan', '--root', str(src))
     (src/'docs'/'ascii.txt').unlink()
     run(capsys, 'scan', '--root', str(src))

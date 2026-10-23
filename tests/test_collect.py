@@ -1,6 +1,7 @@
 """Incremental collector (design M1 §2.4, §3). Synthetic TXT/CSV files in temporary folders only.
 
-Stage 1 uses the TXT/CSV generator (``fixtures.make_text``); the full bundle comes in stage 2.
+The bundle tests use the full synthetic bundle (``fixtures.bundle``: nine parsers, edge cases and
+noise); the single-behaviour tests use one or two small text files.
 """
 import json
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures import LINES_KO, SENTINEL, make_text
+from fixtures import LINES_KO, SENTINEL, bundle, make_ooxml
 from workmcp import cli, collect, config, parsers, paths, store
 
 SETTINGS = config.ScanSettings()
@@ -100,42 +101,128 @@ def text_root(db, tmp_path, lines=LINES_KO):
     return root
 
 
-def test_first_scan_adds_every_supported_file(db, tmp_path):
+def bundle_root(db, tmp_path):
+    """The full synthetic bundle (all nine parsers, edge cases and noise) as one source root."""
     root = add_root(db, tmp_path/'src')
-    expected = make_text.write(tmp_path/'src')
+    bundle.write_bundle(tmp_path/'src')
+    return root, bundle.documents()
+
+
+def stored_by_parser(db) -> dict:
+    """``{parser: {'files', 'units', 'statuses'}}`` of the latest versions, as ``bundle.totals`` counts."""
+    out = {}
+    for parser, key, files, units_ in db.execute(
+            "SELECT v.parser, v.parse_status || COALESCE('/' || v.parse_error, ''), COUNT(*), SUM(v.unit_count) "
+            'FROM versions v WHERE v.superseded_at IS NULL GROUP BY 1, 2'):
+        entry = out.setdefault(parser, {'files': 0, 'units': 0, 'statuses': {}})
+        entry['files'] += files
+        entry['units'] += units_
+        entry['statuses'][key] = files
+    return dict(sorted(out.items()))
+
+
+def check_document(db, src: Path, item, data: bytes, seq=1):
+    """The latest version of one bundle file matches its ``Expected`` exactly."""
+    doc = document(db, src/item.rel_path)
+    assert doc is not None and doc[1:3] == ('active', None), item.rel_path
+    version = versions(db, doc[0])[-1]
+    assert version[1:4] == (seq, collect.hashlib.sha256(data).hexdigest(), len(data)), item.rel_path
+    assert version[6:9] == (item.status, item.error, item.unit_count), item.rel_path
+    parser, encoding = db.execute('SELECT parser, encoding FROM versions WHERE id=?', (version[0],)).fetchone()
+    assert parser == item.parser and (item.status != 'ok' or encoding == item.encoding), item.rel_path
+    stored = units(db, version[0])
+    assert len(stored) == item.unit_count, item.rel_path
+    for ordinal, (kind, unit, text) in item.units_sample.items():
+        assert stored[ordinal - 1][:4] == (ordinal, kind, parsers.unit_json(unit), text), (item.rel_path, ordinal)
+    assert [row[0] for row in stored] == list(range(1, len(stored) + 1))
+    assert all(row[4] == collect.hashlib.sha256(row[3].encode('utf-8')).hexdigest() for row in stored)
+    return version
+
+
+TOTAL_KEYS = ('parsed_ok', 'reused', 'failed', 'unsupported', 'encrypted', 'too_large', 'units')
+
+
+def test_first_scan_adds_every_supported_file(db, tmp_path):
+    root, pairs = bundle_root(db, tmp_path)
+    want = bundle.totals(pairs)
     result = scan(db, root)
     total = result['total']
-    assert changes(result) == {'added': len(expected)}
-    assert total['seen'] == total['new_versions'] == len(expected)
-    assert total['parsed_ok'] == sum(item.status == 'ok' for item in expected)
-    assert total['failed'] == sum(item.status == 'failed' for item in expected)
-    assert total['units'] == sum(item.unit_count for item in expected) > 0
-    for item in expected:
-        doc = document(db, tmp_path/'src'/item.rel_path)
-        assert doc[1:3] == ('active', None), item.rel_path
-        [version] = versions(db, doc[0])
-        data = (tmp_path/'src'/item.rel_path).read_bytes()
-        assert version[1:4] == (1, collect.hashlib.sha256(data).hexdigest(), len(data))
-        assert version[6:9] == (item.status, item.error, item.unit_count), item.rel_path
-        stored = units(db, version[0])
-        assert len(stored) == item.unit_count
-        for ordinal, (kind, unit, text) in item.units_sample.items():
-            assert stored[ordinal - 1][:4] == (ordinal, kind, parsers.unit_json(unit), text)
-        assert all(row[4] == collect.hashlib.sha256(row[3].encode('utf-8')).hexdigest() for row in stored)
+    assert changes(result) == {'added': want['files']}
+    assert total['seen'] == total['new_versions'] == want['files'] == 51
+    assert {key: total[key] for key in TOTAL_KEYS} == {key: want[key] for key in TOTAL_KEYS}
+    assert want['reused'] == 1 and want['units'] > 0 and len(want['by_parser']) == 9
+    noise = bundle.noise_counts()
+    assert (total['excluded'], total['ignored']) == (noise['excluded'], noise['ignored'])
+    assert (total['links_skipped'], total['errors'], total['locked'], total['skipped']) == (0, 0, 0, 0)
+    assert stored_by_parser(db) == want['by_parser']  # per format: parse_status/code counts and unit totals
+    for item, data in pairs:
+        check_document(db, tmp_path/'src', item, data)
+    assert db.execute('SELECT COUNT(*) FROM documents').fetchone()[0] == want['files']  # noise has no row
     row = db.execute('SELECT status, partial, finished_at, counts_json FROM scans').fetchone()
     assert row[:2] == ('done', 0) and row[2] and json.loads(row[3])['total'] == total
 
 
 def test_unchanged_files_are_skipped_by_size_and_mtime(db, tmp_path, calls):
-    root = add_root(db, tmp_path/'src')
-    expected = make_text.write(tmp_path/'src')
+    root, pairs = bundle_root(db, tmp_path)
     scan(db, root)
     calls.update(read=0, parse=0)
     result = scan(db, root)
-    assert changes(result) == {'unchanged': len(expected)}
+    assert changes(result) == {'unchanged': len(pairs)}
     assert calls == {'read': 0, 'stream': 0, 'parse': 0}
-    assert result['total']['new_versions'] == 0
-    assert db.execute('SELECT COUNT(*) FROM versions').fetchone()[0] == len(expected)
+    assert result['total']['new_versions'] == 0 and result['total']['units'] == 0
+    assert db.execute('SELECT COUNT(*) FROM versions').fetchone()[0] == len(pairs)
+
+
+CHANGED = 'docs/report.docx'
+DELETED = 'mail/plain_utf8.eml'
+CHANGED_TEXT = f'{SENTINEL} 바뀐 보고서 한 문단'
+
+
+def other_docx() -> bytes:
+    return make_ooxml.docx_package(make_ooxml.w_p(make_ooxml.w_run(CHANGED_TEXT)))
+
+
+def test_bundle_change_delete_restore_and_revert(db, tmp_path, calls):
+    """Whole bundle: A->B is changed (seq 2), a removed file is deleted, B->A is a third version with the
+    first one's units and the removed file comes back as restored; everything else stays unchanged."""
+    src = tmp_path/'src'
+    root, pairs = bundle_root(db, tmp_path)
+    data = {item.rel_path: payload for item, payload in pairs}
+    n = len(pairs)
+    scan(db, root)
+    assert changes(scan(db, root)) == {'unchanged': n}
+
+    rewrite(src/CHANGED, other_docx())
+    (src/DELETED).unlink()
+    calls.update(read=0, parse=0)
+    result = scan(db, root)
+    assert changes(result) == {'changed': 1, 'deleted': 1, 'unchanged': n - 2}
+    assert calls['read'] == 1 and calls['parse'] == 1 and result['total']['new_versions'] == 1
+    first, second = versions(db, document(db, src/CHANGED)[0])
+    assert (first[1], second[1]) == (1, 2) and first[5] and second[5] is None
+    assert [u[3] for u in units(db, second[0])] == [CHANGED_TEXT]
+    doc = document(db, src/DELETED)
+    assert doc[1] == 'deleted' and doc[3] is not None and len(versions(db, doc[0])) == 1
+
+    rewrite(src/CHANGED, data[CHANGED])
+    (src/DELETED).write_bytes(data[DELETED])
+    calls.update(read=0, parse=0)
+    result = scan(db, root)
+    assert changes(result) == {'changed': 1, 'restored': 1, 'unchanged': n - 2}
+    assert result['total']['reused'] == 2 and calls == {'read': 2, 'stream': 0, 'parse': 0}  # units copied
+    rows = versions(db, document(db, src/CHANGED)[0])
+    assert [r[1] for r in rows] == [1, 2, 3] and rows[0][2] == rows[2][2] != rows[1][2]
+    assert [u[:4] for u in units(db, rows[2][0])] == [u[:4] for u in units(db, rows[0][0])]
+    assert rows[1][5] and rows[2][5] is None
+    restored = document(db, src/DELETED)
+    assert restored[1:] == ('active', None, None)
+    rows = versions(db, restored[0])
+    assert [r[1] for r in rows] == [1, 2] and rows[0][2] == rows[1][2] and rows[0][5] and rows[1][5] is None
+    by_path = {item.rel_path: item for item, _ in pairs}
+    check_document(db, src, by_path[CHANGED], data[CHANGED], seq=3)
+    check_document(db, src, by_path[DELETED], data[DELETED], seq=2)
+    assert stored_by_parser(db) == bundle.totals(pairs)['by_parser']
+    assert changes(scan(db, root)) == {'unchanged': n}
 
 
 def test_touched_file_with_same_hash_updates_mtime_only(db, tmp_path, calls):
@@ -547,8 +634,7 @@ def test_a_scan_left_running_is_marked_aborted(db, tmp_path):
 
 
 def test_events_carry_no_document_text(db, tmp_path):
-    root = add_root(db, tmp_path/'src')
-    make_text.write(tmp_path/'src')
+    root, _ = bundle_root(db, tmp_path)
     result = scan(db, root)
     assert result['events'] and SENTINEL not in json.dumps(result, ensure_ascii=False)
     assert all(set(e) == {'event', 'path', 'sha12', 'status', 'code'} for e in result['events'])

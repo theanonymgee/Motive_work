@@ -8,6 +8,7 @@ rules apply to our storage only, never to the source folders we read.
 from __future__ import annotations
 
 import os
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path, PurePath
 
@@ -16,11 +17,12 @@ APP_DIR = 'Motive_work'
 SUBDIRS = ('db', 'models', 'logs', 'tmp')
 
 # Compared after casefold + strip, and again with inner spaces removed. Google Drive for desktop
-# mirrors into 'My Drive' ('내 드라이브' in the Korean UI); Dropbox team folders are 'Dropbox (team)'.
+# mirrors into 'My Drive' ('내 드라이브' in the Korean UI) and streams team drives under 'Shared drives'
+# ('공유 드라이브'); Dropbox team folders are 'Dropbox (team)'. Names are compared in NFC form.
 SYNC_NAMES = frozenset({
     'onedrive', 'onedrive - personal', 'dropbox', 'googledrive', 'google drive', 'mygoogledrive', 'my drive',
-    '내 드라이브', 'googledrivefs', 'iclouddrive', 'icloud drive', 'box', 'boxsync', 'sync', 'seafile', 'nextcloud',
-    'owncloud', 'mega', 'pcloud', 'tresorit', 'synologydrive', 'mybox'})
+    '내 드라이브', 'shared drives', '공유 드라이브', 'googledrivefs', 'iclouddrive', 'icloud drive', 'box', 'boxsync',
+    'sync', 'seafile', 'nextcloud', 'owncloud', 'mega', 'pcloud', 'tresorit', 'synologydrive', 'mybox'})
 SYNC_NAMES_COMPACT = frozenset(name.replace(' ', '') for name in SYNC_NAMES)
 SYNC_PREFIXES = ('onedrive', 'dropbox')  # 'OneDrive - 회사', 'Dropbox (팀)'
 SYNC_ENV = ('OneDrive', 'OneDriveConsumer', 'OneDriveCommercial', 'OneDriveCommercial2')
@@ -86,7 +88,7 @@ def _file_attributes(path: Path) -> int | None:
 
 def _sync_component(path: Path) -> str | None:
     for part in path.parts:
-        name = part.casefold().strip()
+        name = unicodedata.normalize('NFC', part).casefold().strip()
         if name in SYNC_NAMES or name.replace(' ', '') in SYNC_NAMES_COMPACT or name.startswith(SYNC_PREFIXES):
             return part
     return None

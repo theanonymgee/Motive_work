@@ -1,12 +1,16 @@
-"""Binding check (design M1 §6): stored units and quotes re-derive from the current files. Synthetic files only."""
+"""Binding check (design M1 §6): stored units and quotes re-derive from the current files.
+
+Runs over the full synthetic bundle (``fixtures.bundle``: nine parsers, edge cases, noise).
+"""
 import hashlib
 import json
 import os
 
 import pytest
 
-from fixtures import LINES_KO, SENTINEL, make_text
-from test_collect import add_root, document, rewrite, scan, versions
+from fixtures import LINES_KO, SENTINEL
+from fixtures import bundle as synthetic_bundle
+from test_collect import CHANGED, DELETED, add_root, document, other_docx, rewrite, scan, versions
 from workmcp import binding, locator, parsers, paths, store
 
 
@@ -21,7 +25,7 @@ def db(workmcp_home):
 @pytest.fixture
 def bundle(db, tmp_path):
     root = add_root(db, tmp_path/'src')
-    expected = make_text.write(tmp_path/'src')
+    expected = synthetic_bundle.write_bundle(tmp_path/'src')
     scan(db, root)
     return root, expected
 
@@ -37,10 +41,38 @@ def test_fresh_bundle_binds_100_percent(db, bundle):
     assert report['ok'] and report['failures'] == [] and report['notice'] == []
     assert report['versions'] | {'unverifiable': None} == {'total': len(expected), 'checked': oks, 'ok': oks,
                                                             'failed': 0, 'unverifiable': None}
-    assert unverifiable(report) == {'skipped_not_ok': len(expected) - oks}  # the two failed edge files
+    assert unverifiable(report) == {'skipped_not_ok': len(expected) - oks}  # the failed/unsupported/encrypted edges
     assert report['units']['bound'] == report['units']['total'] == sum(item.unit_count for item in expected) > 0
     assert report['units']['rate'] == 1.0
     assert report['scope'] == binding.SCOPE and report['parser_versions']['.txt'] == 'text-1'
+    assert set(report['parser_versions']) == parsers.SUPPORTED_EXTENSIONS
+    # every one of the nine parsers took part: each has at least one bound version
+    bound = {row[0] for row in db.execute("SELECT DISTINCT parser FROM versions WHERE parse_status='ok'")}
+    assert bound == {'text', 'csv', 'eml', 'docx', 'pptx', 'xlsx', 'pdf', 'hwp', 'hwpx'}
+
+
+def test_bundle_history_binds_after_change_delete_and_restore(db, bundle, tmp_path):
+    """After A->B->A on one file and delete+restore on another, every version whose bytes are on disk binds;
+    the B version is stale (its bytes are gone), which is not a failure and needs no notice."""
+    root, expected = bundle
+    src = tmp_path/'src'
+    original = {rel: (src/rel).read_bytes() for rel in (CHANGED, DELETED)}
+    rewrite(src/CHANGED, other_docx())
+    (src/DELETED).unlink()
+    scan(db, root)
+    report = binding.verify(db)
+    assert report['ok'] and unverifiable(report)['stale'] == 1 and unverifiable(report)['missing'] == 1
+    assert report['notice'] == [] and report['versions']['ok'] == report['versions']['checked']  # B binds
+    rewrite(src/CHANGED, original[CHANGED])
+    (src/DELETED).write_bytes(original[DELETED])
+    scan(db, root)
+    report = binding.verify(db)
+    oks = sum(item.status == 'ok' for item in expected)
+    assert report['ok'] and report['failures'] == [] and report['notice'] == []
+    assert report['versions']['total'] == len(expected) + 3      # B, A again, the restored file
+    assert report['versions']['ok'] == oks + 2                    # A again and the restored file bind
+    assert unverifiable(report) == {'stale': 1, 'skipped_not_ok': len(expected) - oks}
+    assert report['units']['bound'] == report['units']['total'] > sum(item.unit_count for item in expected)
 
 
 def test_modified_file_is_stale_not_failed_and_notice_says_scan(db, bundle, tmp_path):
@@ -102,7 +134,7 @@ def test_missing_and_extra_units_are_detected(db, bundle, tmp_path):
 
 def test_parser_version_mismatch_is_unverifiable_until_reparse(db, bundle, tmp_path):
     root, _ = bundle
-    doc = document(db, tmp_path/'src'/'docs'/'notes_utf8.txt')[0]
+    doc = document(db, tmp_path/'src'/'docs'/'notes_crlf.txt')[0]  # no copy in the bundle: really re-parsed
     db.execute("UPDATE versions SET parser_version='text-0' WHERE document_id=?", (doc,))
     report = binding.verify(db)
     assert report['ok'] and unverifiable(report)['parser_version_mismatch'] == 1

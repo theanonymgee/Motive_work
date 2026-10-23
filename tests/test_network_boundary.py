@@ -15,6 +15,7 @@ Ported in part from Motive_vari ``services/kakao_evidence/tests/test_kakao_isola
 (tag kakao-p1-complete-20261022).
 """
 import ast
+import importlib.machinery
 import json
 import os
 import re
@@ -40,6 +41,7 @@ COMMON_IMPORTS = frozenset({'__future__', 'argparse', 'collections.abc', 'datacl
 # M1 parsers: the exact import lines of design M1 §8.1 (zip/XML/OLE/PDF/mail only where they are read).
 MODULE_IMPORTS = {
     'server.py': frozenset({'mcp.server.MCPServer'}),
+    'paths.py': frozenset({'unicodedata'}),  # NFC before comparing sync folder names (M0 review v2 N-L8)
     'config.py': frozenset({'tomllib'}),
     'collect.py': frozenset({'fnmatch'}),
     'cli.py': frozenset({'logging'}),
@@ -62,12 +64,25 @@ OS_PROCESS_CALLS = ('system', 'popen', 'startfile', 'fork', 'forkpty', 'exec', '
 NON_STDIO_RUNNERS = frozenset({'run_sse_async', 'run_streamable_http_async', 'sse_app', 'streamable_http_app'})
 # Network parts of an allowlisted package (``logging`` is allowed for log files and the pypdf logger only).
 NETWORK_SUBMODULES = (('logging', 'handlers'), ('logging', 'config'))
+# Process pools start processes; banned even if ``concurrent.futures`` is allowlisted one day (review v2 N-L7).
+PROCESS_POOLS = frozenset({'ProcessPoolExecutor'})
 GUARDED_MODULES = ('os', 'sys')  # may not be passed around or rebound (aliasing hides later calls)
 NETWORK_CLIENT_PACKAGES = {'httpx', 'httpx2', 'requests', 'aiohttp', 'huggingface_hub', 'urllib3'}
 
 
 def package_sources():
     return sorted(PACKAGE.rglob('*.py'))
+
+
+def importable_non_sources(folder: Path) -> list[str]:
+    """Files Python could import that the ``*.py`` checks never read (review v2 N-L3).
+
+    ``.pyw`` (a Windows source suffix), extension modules (``.pyd``) and sourceless ``.pyc``
+    outside ``__pycache__`` (a ``.pyc`` inside ``__pycache__`` is only used next to its ``.py``).
+    """
+    suffixes = tuple(sorted(set(importlib.machinery.all_suffixes()) - {'.py'}))
+    return sorted(path.relative_to(folder).as_posix() for path in folder.rglob('*')
+                  if path.is_file() and path.name.endswith(suffixes) and '__pycache__' not in path.parts)
 
 
 def rel(path: Path) -> str:
@@ -129,15 +144,24 @@ def qualify(node, bound) -> str | None:
 
 
 def models_aliases(tree) -> set[str]:
-    """Local names that refer to the models module."""
+    """Local names that refer to the models module.
+
+    Any name ``models`` imported from inside the package counts, whichever module it is taken from
+    (``from .cli import models`` is the same module object as ``from . import models``, review v2 N-L2).
+    """
     aliases = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             aliases |= {a.asname for a in node.names if a.name == MODELS_DOTTED and a.asname}
             aliases |= {'workmcp' for a in node.names if a.name == MODELS_DOTTED and not a.asname}
-        elif isinstance(node, ast.ImportFrom) and ((node.level >= 1 and not node.module) or node.module == 'workmcp'):
+        elif isinstance(node, ast.ImportFrom) and (node.level >= 1 or (node.module or '').split('.')[0] == 'workmcp'):
             aliases |= {a.asname or a.name for a in node.names if a.name == 'models'}
     return aliases
+
+
+def is_package_name(dotted: str) -> bool:
+    """A qualified name inside the package (relative import or ``workmcp.``)."""
+    return dotted.startswith('.') or dotted.split('.')[0] == 'workmcp'
 
 
 def banned_qualified(dotted: str) -> str | None:
@@ -148,6 +172,8 @@ def banned_qualified(dotted: str) -> str | None:
         return 'sys.modules access'
     if tuple(parts[:2]) in NETWORK_SUBMODULES:
         return f'network submodule {dotted}'
+    if PROCESS_POOLS & set(parts) or parts[:3] == ['concurrent', 'futures', 'process']:
+        return f'process pool {dotted}'
     if parts[-1] in DYNAMIC_LOADERS:
         return f'dynamic code loading {dotted}'
     if parts[-1] in ESCAPE_ATTRS:
@@ -225,6 +251,13 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
             if name != 'models.py' and dotted == f'{MODELS_DOTTED}' and isinstance(parent, ast.Attribute) \
                     and parent.attr in models_network:
                 found.append(f'models network function {MODELS_DOTTED}.{parent.attr}')
+            # Through another package module: ``cli.models.fetch``, ``workmcp.tools.models.download_file``.
+            parts = dotted.split('.') if dotted else []
+            if name != 'models.py' and len(parts) >= 2 and parts[-2] == 'models' and parts[-1] in models_network:
+                found.append(f'models network function through {dotted}')
+            if (name != 'models.py' and node.attr == 'models' and dotted and is_package_name(dotted)
+                    and not (isinstance(parent, ast.Attribute) and parent.value is node)):
+                found.append(f'module {dotted} used as a value')
             if node.attr == 'run' and id(node) not in call_funcs:
                 found.append('run used as a value')
         elif isinstance(node, ast.Call):
@@ -242,6 +275,8 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
                         found.append(f'{func.id}: {reason}')
                     if key.value in models_network:
                         found.append('getattr on models network function')
+                    if key.value == 'models' and name != 'models.py':
+                        found.append('getattr on the models module')
     return found
 
 
@@ -268,6 +303,19 @@ def test_package_has_sources():
         'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
         'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py',
         'config.py', 'collect.py', 'binding.py'}
+
+
+def test_package_has_no_importable_file_other_than_py():
+    assert importable_non_sources(PACKAGE) == []
+
+
+def test_importable_non_source_check_flags_every_form(tmp_path):
+    for rel_path in ('a.pyw', 'sub/b.pyd', 'c.pyc', 'sub/d.cp312-win_amd64.pyd', '__pycache__/e.cpython-312.pyc',
+                     'f.py', 'g.txt', 'sub/__pycache__/h.cpython-312.pyc'):
+        (tmp_path/rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path/rel_path).write_bytes(b'')
+    assert importable_non_sources(tmp_path) == ['a.pyw', 'c.pyc', 'sub/b.pyd', 'sub/d.cp312-win_amd64.pyd']
+    assert {'.pyw', '.pyc'} <= set(importlib.machinery.all_suffixes()) or os.name != 'nt'
 
 
 # 1
@@ -412,6 +460,21 @@ MORE_BYPASSES = [
     'import logging as lg\ngetattr(lg, "handlers")',
 ]
 
+# Review v2 N-L2: models network functions reached through another package module.
+THROUGH_OTHER_MODULES = [
+    'from . import cli\ncli.models.fetch("m")',
+    'from .cli import models\nmodels.fetch("m")',
+    'from .tools import models as mm\nmm.download_file("u", None, None, 0, "")',
+    'import workmcp.cli\nworkmcp.cli.models.fetch("m")',
+    'from workmcp import tools\ntools.models.main()',
+    'from workmcp.cli import models as m\nm.fetch("m")',
+    'from .. import cli\ncli.models.fetch("m")',
+    'from . import cli\nm = cli.models\nm.fetch("m")',
+    'from . import cli\ngetattr(cli, "models").fetch("m")',
+    'from . import cli\ngetattr(cli.models, "fetch")("m")',
+    'from .cli import models\nm = models',
+]
+
 
 @pytest.mark.parametrize('snippet', EARLIER_CONTROLS)
 def test_checks_flag_earlier_violation_snippets(snippet):
@@ -419,9 +482,44 @@ def test_checks_flag_earlier_violation_snippets(snippet):
 
 
 @pytest.mark.parametrize('module', ['search.py', 'server.py'])
-@pytest.mark.parametrize('snippet', REVIEW_BYPASSES + MORE_BYPASSES)
+@pytest.mark.parametrize('snippet', REVIEW_BYPASSES + MORE_BYPASSES + THROUGH_OTHER_MODULES)
 def test_checks_flag_bypass_snippets(module, snippet):
     assert violations(module, snippet, {'fetch', 'download_file', 'main'})
+
+
+@pytest.mark.parametrize('snippet', THROUGH_OTHER_MODULES)
+def test_models_through_other_modules_is_flagged_in_a_subpackage_too(snippet):
+    assert violations('parsers/text.py', snippet, {'fetch', 'download_file', 'main'})
+
+
+def test_models_through_other_modules_keeps_offline_functions_usable():
+    network = {'fetch', 'download_file', 'main'}
+    assert violations('tools.py', 'from . import models\nmodels.quick_status(models.DEFAULT_MODEL, h)\n', network) == []
+    assert violations('tools.py', 'from . import cli\ncli.models.quick_status("m", h)\n', network) == []
+    assert violations('tools.py', 'from . import cli\ncli.models.fetch("m", h)\n', network)
+
+
+@pytest.mark.parametrize('snippet, banned', [
+    ('from concurrent.futures import ProcessPoolExecutor', True),
+    ('import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor()', True),
+    ('import concurrent.futures as cf\ncf.ProcessPoolExecutor(2)', True),
+    ('from concurrent.futures import process', True),
+    ('import concurrent.futures.process', True),
+    ('import concurrent.futures\ngetattr(concurrent.futures, "ProcessPoolExecutor")', True),
+    ('from concurrent.futures import ThreadPoolExecutor', False),
+    ('import logging\nlogging.getLogger("x")', False),
+    ('import logging\nlogging.handlers.SocketHandler("example.invalid", 9020)', True),
+    ('from logging.handlers import SysLogHandler', True),
+    ('from logging import handlers', True),
+    ('import logging\nlogging.config.listen(9030)', True),
+    ('from logging.config import listen', True),
+])
+def test_process_pools_and_logging_network_parts_stay_banned_when_their_parent_is_allowlisted(
+        monkeypatch, snippet, banned):
+    """Allowlist entries match by prefix, so allowing ``concurrent.futures`` or ``logging`` would open their
+    children; these stay banned whatever the allowlist says (review v2 N-L7)."""
+    monkeypatch.setitem(MODULE_IMPORTS, 'search.py', frozenset({'concurrent.futures', 'logging'}))
+    assert bool(violations('search.py', snippet)) is banned
 
 
 def test_review_bypass_list_is_complete():
@@ -573,6 +671,8 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     for e in events:
         if e['event'] in _audited_server.ADDRESS_EVENTS:
             assert re.search(r"\('(127\.0\.0\.1|::1)', \d+", e['detail']), e
+    binds = [e for e in events if e['event'] == 'socket.bind']
+    assert all(re.search(r"\('(127\.0\.0\.1|::1)', 0[,)]", e['detail']) for e in binds), binds  # port 0 only
     assert not [e for e in events if e['event'].startswith(_audited_server.PROCESS_EVENTS)]  # (c)
     assert not [e for e in events if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
 
@@ -580,6 +680,11 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
 @pytest.mark.parametrize('event, args, outside', [
     ('socket.connect', (None, ('127.0.0.1', 50000)), False),
     ('socket.bind', (None, ('127.0.0.1', 0)), False),
+    ('socket.bind', (None, ('::1', 0, 0, 0)), False),
+    ('socket.bind', (None, ('127.0.0.1', 8765)), True),     # fixed-port loopback listener (review v2 N-L5)
+    ('socket.bind', (None, ('::1', 8765, 0, 0)), True),
+    ('socket.bind', (None, ('127.0.0.1', '0')), True),
+    ('socket.bind', (None, ('127.0.0.1',)), True),
     ('socket.connect', (None, ('::1', 50000, 0, 0)), False),
     ('socket.sendmsg', (None, None), False),
     ('socket.__new__', (None, 2, 1, 0), False),
@@ -606,12 +711,15 @@ def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
     """Positive control through the real hook: outside attempts are recorded and blocked before they happen."""
     _, report = run_wrapper(tmp_path, 'probe')
     assert report['blocked'] == {'connect': True, 'getaddrinfo': True, 'subprocess': True, 'loopback': False,
-                                 'source_read': False, 'source_write': True, 'source_create': True,
-                                 'source_remove': True, 'source_utime': True}
+                                 'loopback_listener': True, 'source_read': False, 'source_write': True,
+                                 'source_create': True, 'source_remove': True, 'source_utime': True}
     assert report['source_unchanged'] is True
     flagged = {e['event'] for e in report['events'] if e['violation']}
-    assert {'socket.connect', 'socket.getaddrinfo', 'subprocess.Popen'} <= flagged
-    loopback = [e for e in report['events'] if e['event'] in ('socket.bind', 'socket.connect') and '127.0.0.1' in e['detail']]
+    assert {'socket.connect', 'socket.getaddrinfo', 'subprocess.Popen', 'socket.bind'} <= flagged
+    listener = [e for e in report['events'] if e['event'] == 'socket.bind' and e['violation']]
+    assert len(listener) == 1 and str(_audited_server.PROBE_LISTEN_PORT) in listener[0]['detail']
+    loopback = [e for e in report['events'] if e['event'] in ('socket.bind', 'socket.connect')
+                and '127.0.0.1' in e['detail'] and e not in listener]
     assert loopback and all(e['violation'] is None for e in loopback)
 
 

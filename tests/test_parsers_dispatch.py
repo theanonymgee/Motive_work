@@ -4,12 +4,14 @@ The format parsers are tested by their own files (``test_parsers_*.py``); here o
 dispatcher contract is checked, with a fake parser standing in where a case needs one.
 """
 import importlib.metadata
+import os
 import re
 
 import pytest
 
-from fixtures import SENTINEL
+from fixtures import SENTINEL, bundle, cfb
 from workmcp import parsers, store
+from workmcp.parsers import _container
 from workmcp.parsers import Limits, ParseFailure, Parser, ParseResult, Unit
 
 PYPDF = importlib.metadata.version('pypdf')
@@ -81,6 +83,44 @@ OLE_JUNK = parsers.OLE_SIGNATURE + b'\x00' * 1024
 ])
 def test_sniff(ext, data, expected):
     assert parsers.sniff(data, ext) == expected
+
+
+OLE_CASES = bundle.ole_cases()
+
+
+@pytest.mark.parametrize('item, data', OLE_CASES, ids=[item.rel_path for item, _ in OLE_CASES])
+def test_ole_container_behind_an_ooxml_extension(item, data, monkeypatch):
+    """Encrypted OOXML packages and old binary Office files renamed to .docx/.xlsx/.pptx/.hwpx (design §5.2)
+    are judged by the dispatcher from the OLE streams; the format parser is never called."""
+    ext = os.path.splitext(item.rel_path)[1]
+    assert parsers.sniff(data, ext) == (item.status, item.error)
+    result = parsers.parse(data, ext, Limits())
+    assert (result.parser, result.status, result.error, result.units, result.encoding) == (
+        item.parser, item.status, item.error, (), None)
+    real = parsers.parser_for(ext)
+    monkeypatch.setattr(parsers, 'parser_for', lambda e: Parser(real.name, real.version, lambda d, l: 1 / 0))
+    assert parsers.parse(data, ext, Limits()).error == item.error  # not 'exception:ZeroDivisionError'
+
+
+def test_ole_cases_are_real_compound_files():
+    data = {item.rel_path: payload for item, payload in OLE_CASES}
+    assert _container.ole_streams(data['edge/ooxml_encrypted.docx']) == {'EncryptionInfo', 'EncryptedPackage'}
+    assert _container.ole_streams(data['edge/legacy_word.docx']) == {'WordDocument', '1Table', 'CompObj'}
+    assert _container.ole_streams(data['edge/legacy_powerpoint.pptx']) == {'PowerPoint Document', 'Current User'}
+    assert _container.ole_streams(data['edge/ole_damaged.docx']) is None
+    assert all(payload.startswith(cfb.SIGNATURE) for payload in data.values())
+
+
+def test_ooxml_encryption_is_judged_by_the_stream_whatever_the_extension():
+    encrypted = cfb.write_cfb({'EncryptionInfo': b'\x04\x00synthetic', 'EncryptedPackage': b'synthetic' * 600})
+    for ext in ('.docx', '.pptx', '.xlsx', '.hwpx', '.DOCX'):
+        assert parsers.sniff(encrypted, ext) == ('encrypted', 'ooxml_encrypted')
+    assert parsers.sniff(encrypted, '.hwp') == ('unsupported', 'hwp_bad_header')   # OLE, but no FileHeader
+    assert parsers.sniff(encrypted, '.pdf') == ('unsupported', 'pdf_bad_signature')
+    nested = cfb.write_cfb({'Storage/EncryptedPackage': b'synthetic'})
+    assert parsers.sniff(nested, '.docx') == ('unsupported', 'legacy_ole')  # only a root stream marks encryption
+    empty_stream = cfb.write_cfb({'WordDocument': b''})
+    assert parsers.sniff(empty_stream, '.docx') == ('unsupported', 'legacy_ole')
 
 
 def test_signature_mismatch_is_reported_without_calling_the_parser(monkeypatch):

@@ -1,5 +1,6 @@
 """Data home rules (design §2.2, §8.4 A). Cases call ``validate_home`` directly with explicit env."""
 import os
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -38,12 +39,12 @@ def test_explicit_home_is_returned_resolved(tmp_path):
     assert validate_home(str(tmp_path/'wk'), {}, REPO_ROOT) == (tmp_path/'wk').resolve()
 
 
-@pytest.mark.parametrize('raw', ['data', r'.\data', '~/wk', r'C:relative'])
+@pytest.mark.parametrize('raw', ['data', r'.\data', '~/wk', r'C:relative', 'C:', r'\x'])
 def test_relative_path_is_refused(raw):
     assert code_of(raw) == 'home_relative'
 
 
-@pytest.mark.parametrize('raw', [r'\\server\share\x', '//server/share/x'])
+@pytest.mark.parametrize('raw', [r'\\server\share\x', '//server/share/x', r'\\localhost\C$\x'])
 def test_unc_path_is_refused(raw):
     assert code_of(raw) == 'home_unc'
 
@@ -66,7 +67,10 @@ def test_repo_check_ignores_case_on_windows():
 @pytest.mark.parametrize('folder', ['OneDrive - 회사', 'OneDrive', 'onedrive - personal', 'Dropbox', 'Google Drive',
                                     'GoogleDrive', 'iCloudDrive', 'iCloud Drive', 'Nextcloud', 'Box',
                                     'Dropbox (회사)', 'Dropbox (팀)', 'Dropbox (Personal)', 'My Drive', 'my drive',
-                                    'MyDrive', '내 드라이브', '내드라이브', 'GoogleDriveFS', 'MYBOX', 'MyBox'])
+                                    'MyDrive', '내 드라이브', '내드라이브', 'GoogleDriveFS', 'MYBOX', 'MyBox',
+                                    'Shared drives', 'shared drives', 'SharedDrives', '공유 드라이브', '공유드라이브',
+                                    unicodedata.normalize('NFD', '내 드라이브'),
+                                    unicodedata.normalize('NFD', '공유 드라이브')])
 def test_sync_folder_component_is_refused(tmp_path, folder):
     assert code_of(str(tmp_path/folder/'x')) == 'home_sync_component'
 
