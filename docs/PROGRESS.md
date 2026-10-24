@@ -1,5 +1,13 @@
 # 진행·재개 기록
 
+### 2026-10-24 — M3 진행 (MCP 서버 v1, 1단계)
+
+- 설계(`M3-설계_v1`, `ccb6fd9`): 읽기 도구 5개(search·get_snippet·list_documents·recent_changes·status), 응답마다 `delivered_sources`와 로컬 `tool_calls`/`deliveries` 기록, 응답 크기 상한 40,000자, 오래 사는 서버의 모델 수명(lifespan ticker), 앱 가상화 탐침·doctor 경고, 클라이언트 설정과 연결 확인 절차(§11.4). 0단계(스키마 v2·도구 봉투·5개 도구 서버 껍데기) `b7217cb`, 1324 passed.
+- 1단계 병렬: A 서버·도구·기록·감사, B 검색(N1·N2·접기·신호)·`get_snippet`·신호 측정, C 설정 템플릿·연결 확인 틀(`doc/examples/`, `doc/validation/2026-10-24_M3-연결확인_v1.md`, `2b475d1`).
+- 발견(이 PC): Claude 데스크톱 앱 안 프로세스의 `%LOCALAPPDATA%\Motive_work` 쓰기가 `Packages\Claude_…\LocalCache\Local\Motive_work`로 돌려짐(탐침 확인). Codex 앱도 MSIX라 다른 홈을 볼 수 있음 → 두 클라이언트 설정 `env`에 AppData 밖 `WORKMCP_HOME` 명시.
+- 설정 방침: 프로젝트 범위 파일(`.mcp.json`, `.codex/config.toml`)만, 커밋하지 않음(`.gitignore`), 전역 설정 편집 없음. 피터가 누를 승인: Claude Code 프로젝트 서버 승인, Codex 폴더 신뢰 승인.
+- 다음: A·B 완료 → 2단계(통합·감사) → 총괄이 연결 확인(⑤) → 검토.
+
 ### 2026-10-24 — M2 완료 (색인·검색)
 
 - 설계(`M2-설계_v1`, §14 반영 기록) → 0단계(의존성·스키마·서명) → 1단계 병렬(A 청크·색인, B 임베더·오프라인 반입, C 검색·코퍼스·평가) → 2단계(통합·실측) → 검토 v1 조건부(중간 2: 오래 사는 엔진의 옛 버전 hit, FTS 불일치 미검출) → 수정 → **검토 v2 통과**.
