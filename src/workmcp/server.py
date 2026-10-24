@@ -1,39 +1,280 @@
-"""MCP stdio transport adapter; business behavior lives in ``tools.py`` (design §1.1, §8.5).
+"""MCP stdio transport adapter; business behavior lives in ``tools.py`` (design M0 §1.1, M3 §1, §6).
 
-stdout carries MCP JSON-RPC only: nothing here prints to stdout, logs go to stderr.
-The server runs the stdio transport only and makes no outbound calls.
+Five read tools, each an ``async def`` without ``await`` (the SDK runs a sync tool on a worker
+thread and every request in its own task; an async tool runs to the end on the event loop thread,
+so tool calls never overlap and ``search.Engine`` needs no lock). Every tool returns one string,
+the compact JSON envelope (``structured_output=False``: the SDK sends it as one text content as is).
+``handle`` is the common path: idle release, the tool function, the size budget, the local call
+log (``tool_calls`` + ``deliveries``, no query or body text) and a last guard that turns any
+exception into ``internal_error`` with the exception class name only (traceback to stderr).
+
+stdout carries MCP JSON-RPC only: nothing here prints to stdout, logs go to stderr. The server
+runs the stdio transport only and makes no outbound calls; ``anyio`` is used for the idle-release
+ticker (``sleep``, ``create_task_group``) and nothing else.
 """
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import re
+import sqlite3
 import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 
-from . import __version__, paths, store, tools
+from . import __version__, config, locator, paths, search, snippet, store, tools
+
+LOG = logging.getLogger('workmcp.server')
+LOG_FORMAT = '%(asctime)s %(name)s %(levelname)s %(message)s'
+INSTRUCTIONS = ('응답의 delivered_sources가 이번 응답으로 PC를 떠난 원문 조각의 출처 전부다. '
+                '검색 결과 없음 ≠ 회사에 그 정보가 없음.')
+CLIENT_MAX_CHARS = 64
+UNKNOWN_CLIENT = 'unknown'
+LOG_FAILED_NOTICE = '로컬 전달 기록(deliveries) 실패: {}'
+MODEL_LOADED_NOTICE = '의미 검색 모델을 이 호출에서 처음 로드했습니다(+{} ms); 다음 질의부터 빠릅니다'
+_CONTROL = re.compile('[\x00-\x1f\x7f-\x9f]')
 
 
-def build_server(home: Path) -> MCPServer:
-    server = MCPServer('workmcp', version=__version__)
+@dataclass
+class ServerState:
+    """What one server process keeps: the search engine, the write connection for the call log
+    (None: calls are not logged, tests only), the response budget and the idle-release tick."""
+    home: Path
+    engine: search.Engine
+    write_db: sqlite3.Connection | None = None
+    budget: int = tools.RESPONSE_MAX_CHARS - tools.NOTICE_RESERVE
+    tick: float = 30.0
+    started_at: str = field(default_factory=store.now)
+    unloads: int = 0
 
-    @server.tool()
-    def status() -> dict[str, Any]:
-        """Data home, store counts, model availability and FTS5 support. Returns no document text."""
-        return tools.status(home)
 
+def make_state(home: Path, *, engine: search.Engine | None = None, write_db: sqlite3.Connection | None = None,
+               settings: config.Config | None = None) -> ServerState:
+    """State from ``<home>/config.toml`` (raises ``config.ConfigError``); ``engine`` is injected by
+    tests (``HashEmbedder`` factory), else the manifest model, loaded on first semantic use."""
+    settings = settings or config.load(home)
+    return ServerState(home=Path(home), engine=engine or search.Engine(home, settings.search), write_db=write_db,
+                       budget=settings.server.response_max_chars - tools.NOTICE_RESERVE,
+                       tick=float(settings.server.unload_tick_seconds))
+
+
+def _clean(text, limit: int = CLIENT_MAX_CHARS) -> str:
+    return _CONTROL.sub('', text if isinstance(text, str) else '')[:limit]
+
+
+def client_of(ctx) -> tuple[str, str]:
+    """``(name, version)`` from the client's ``clientInfo`` (``initialize``, or the request envelope on
+    newer protocols), ``('unknown', '')`` without one; at most 64 characters, no control characters."""
+    try:
+        params = ctx.session.client_params if ctx is not None else None
+    except (ValueError, AttributeError):  # a Context outside a request
+        params = None
+    info = getattr(params, 'client_info', None)
+    return _clean(getattr(info, 'name', None)) or UNKNOWN_CLIENT, _clean(getattr(info, 'version', None))
+
+
+# Each takes the state and the tool arguments and returns an envelope.
+TOOLS = {
+    'search': lambda state, **args: tools.search(state.home, state.engine, **args),
+    'get_snippet': lambda state, **args: tools.get_snippet(state.home, **args),
+    'list_documents': lambda state, **args: tools.list_documents(state.home, **args),
+    'recent_changes': lambda state, **args: tools.recent_changes(state.home, **args),
+    'status': lambda state, **args: tools.status(state.home, state.engine, started_at=state.started_at,
+                                                 unloads=state.unloads),
+}
+
+
+def unload_if_idle(state: ServerState) -> bool:
+    """``engine.maybe_unload()``; counts and reports a release (ticker and the start of every call)."""
+    released = state.engine.maybe_unload()
+    if released:
+        state.unloads += 1
+        print('workmcp: unloaded model after idle', file=sys.stderr)
+    return released
+
+
+def _annotate_engine(envelope: dict, engine: search.Engine, loads_before: int) -> None:
+    """``meta.engine`` on a search result, and a notice when this call loaded the model (design M3 §6.3)."""
+    meta = (envelope.get('result') or {}).get('meta') if envelope.get('ok') else None
+    if not isinstance(meta, dict):
+        return
+    loaded_now = engine.loads > loads_before and engine.status()['loaded']
+    load_ms = getattr(engine, 'last_load_ms', None) if loaded_now else 0
+    meta['engine'] = {'model_loaded_now': loaded_now, 'load_ms': load_ms}
+    if loaded_now:
+        envelope['notice'].append(MODEL_LOADED_NOTICE.format(load_ms))
+
+
+def _record(state: ServerState, call_id: str, client: tuple[str, str], tool: str, args: dict, envelope: dict,
+            began: float) -> None:
+    """One ``tool_calls`` row and one ``deliveries`` row per delivered piece, in one transaction."""
+    if state.write_db is None:
+        return
+    pieces = tools.pieces_of(envelope)
+    at = store.now()
+    call = {'at': at, 'client': client[0], 'client_version': client[1], 'tool': tool, 'call_id': call_id,
+            'args_json': tools.summarize_args(tool, args), 'pieces': len(pieces),
+            'chars': sum(len(text) for _, text in pieces), 'ok': envelope['ok'],
+            'error_code': None if envelope['ok'] else envelope['error']['code'],
+            'elapsed_ms': round((time.perf_counter() - began) * 1000, 1), 'pid': os.getpid()}
+    rows = [{'at': at, 'client': client[0], 'tool': tool, 'locator_json': obj, 'chars': len(text)}
+            for obj, text in pieces]
+    db = state.write_db
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        store.record_call(db, call)
+        store.record_deliveries(db, call_id, rows)
+        db.execute('COMMIT')
+    except BaseException:
+        db.execute('ROLLBACK')
+        raise
+
+
+def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -> str:
+    """Run one tool call and return the serialized envelope (never raises for an ordinary error)."""
+    began = time.perf_counter()
+    call_id = os.urandom(8).hex()
+    try:
+        unload_if_idle(state)
+        loads_before = state.engine.loads
+        envelope = TOOLS[tool](state, **args)
+        envelope = tools.fit(envelope, tools.SHRINK[tool], state.budget)
+        _annotate_engine(envelope, state.engine, loads_before)
+    except search.SearchError as exc:
+        envelope = tools.error(exc.code, exc.message)
+    except locator.LocatorError as exc:
+        envelope = tools.error('locator_invalid', str(exc))
+    except snippet.NotFound as exc:
+        envelope = tools.error('not_found', str(exc))
+    except FileNotFoundError as exc:
+        envelope = tools.error('store_missing', str(exc))
+    except sqlite3.OperationalError as exc:
+        if 'locked' in str(exc) or 'busy' in str(exc):
+            envelope = tools.error('store_busy', 'the store is busy; try again', retryable=True)
+        else:
+            LOG.exception('tool %s failed', tool)
+            envelope = tools.error('internal_error', type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001 - last guard: class name only to the client, traceback to stderr
+        LOG.exception('tool %s failed', tool)
+        envelope = tools.error('internal_error', type(exc).__name__)
+    for attempt in (1, 2):
+        try:
+            _record(state, call_id, client, tool, args, envelope, began)
+            break
+        except sqlite3.Error as exc:
+            if attempt == 2:
+                print(f'workmcp: call log failed for {tool}: {type(exc).__name__}', file=sys.stderr)
+                if envelope.get('ok'):
+                    envelope['notice'].append(LOG_FAILED_NOTICE.format(type(exc).__name__))
+    return tools.dumps(envelope)
+
+
+async def _ticker(state: ServerState) -> None:
+    while True:
+        await anyio.sleep(state.tick)
+        try:
+            unload_if_idle(state)
+        except Exception:  # noqa: BLE001 - the ticker must keep running
+            LOG.exception('idle release failed')
+
+
+def _lifespan(state: ServerState):
+    """Per connection (stdio: once): the idle-release ticker runs beside the session (design M3 §6.2)."""
+    @contextlib.asynccontextmanager
+    async def lifespan(_server):
+        async with anyio.create_task_group() as group:
+            group.start_soon(_ticker, state)
+            try:
+                yield {}
+            finally:
+                group.cancel_scope.cancel()
+    return lifespan
+
+
+def build_server(home: Path, *, engine: search.Engine | None = None, state: ServerState | None = None) -> MCPServer:
+    """The MCP server with the five read tools; ``server.workmcp_state`` is its ``ServerState``."""
+    state = state or make_state(home, engine=engine)
+    server = MCPServer('workmcp', version=__version__, instructions=INSTRUCTIONS, lifespan=_lifespan(state))
+
+    @server.tool(name='search', structured_output=False)
+    async def search_tool(query: str, mode: str = 'hybrid', limit: int = 10, path_prefix: str | None = None,
+                          ext: list[str] | None = None, since: str | None = None, until: str | None = None,
+                          collapse_by_document: bool = False, ctx: Context | None = None) -> str:
+        """Hybrid (lexical + semantic) search over the collected documents. Returns up to `limit` hits, each
+        with a snippet of document text (at most 600 characters) and its exact source locator;
+        delivered_sources lists the source of every snippet in this response. mode: hybrid|lexical|semantic;
+        since/until filter on when a file version was observed, not dates inside documents."""
+        return handle(state, 'search', {'query': query, 'mode': mode, 'limit': limit, 'path_prefix': path_prefix,
+                                        'ext': ext, 'since': since, 'until': until,
+                                        'collapse_by_document': collapse_by_document}, client_of(ctx))
+
+    @server.tool(name='get_snippet', structured_output=False)
+    async def get_snippet_tool(chunk_id: int | None = None, locator: dict[str, Any] | None = None,
+                               context_units: int = 0, max_chars: int = tools.PIECE_MAX_CHARS,
+                               ctx: Context | None = None) -> str:
+        """Document text of one search hit (chunk_id) or one locator, as pieces per stored unit with exact
+        locators, plus up to 5 whole units of context before and after (context_units). Returns document
+        text; delivered_sources lists every piece. A piece over max_chars (200-4000) is cut at a word
+        boundary and its locator names the cut range."""
+        return handle(state, 'get_snippet', {'chunk_id': chunk_id, 'locator': locator, 'context_units': context_units,
+                                             'max_chars': max_chars}, client_of(ctx))
+
+    @server.tool(name='list_documents', structured_output=False)
+    async def list_documents_tool(path_prefix: str | None = None, ext: list[str] | None = None, status: str = 'active',
+                                  changed_since: str | None = None, limit: int = tools.LIST_LIMIT_DEFAULT,
+                                  offset: int = 0, ctx: Context | None = None) -> str:
+        """Collected documents with their latest version (path, hash, size, parse status, indexed or not).
+        Returns no document text. status: active|deleted|skipped|all; limit 1-500, offset for paging."""
+        return handle(state, 'list_documents', {'path_prefix': path_prefix, 'ext': ext, 'status': status,
+                                                'changed_since': changed_since, 'limit': limit, 'offset': offset},
+                      client_of(ctx))
+
+    @server.tool(name='recent_changes', structured_output=False)
+    async def recent_changes_tool(since: str | None = None, until: str | None = None, kinds: list[str] | None = None,
+                                  path_prefix: str | None = None, ext: list[str] | None = None,
+                                  limit: int = tools.LIST_LIMIT_DEFAULT, offset: int = 0,
+                                  ctx: Context | None = None) -> str:
+        """Documents added, changed, restored, deleted or reparsed by scans, newest first (default: the last
+        30 days). Returns no document text. kinds: added|changed|restored|deleted|reparsed."""
+        return handle(state, 'recent_changes', {'since': since, 'until': until, 'kinds': kinds,
+                                                'path_prefix': path_prefix, 'ext': ext, 'limit': limit,
+                                                'offset': offset}, client_of(ctx))
+
+    @server.tool(name='status', structured_output=False)
+    async def status_tool(ctx: Context | None = None) -> str:
+        """Data home, store counts, last scan and index run, model and search engine state, app
+        virtualization of the data home, tool calls per client. Returns no document text."""
+        return handle(state, 'status', {}, client_of(ctx))
+
+    server.workmcp_state = state
     return server
 
 
 def main(argv=None) -> int:
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format=LOG_FORMAT)
     try:
         home = paths.resolve_home()
     except paths.DataPathError as exc:
         print(exc, file=sys.stderr)
         return 2
     paths.ensure_home(home)
-    store.open_home(home).close()
-    build_server(home).run(transport='stdio')
+    try:
+        settings = config.load(home)
+    except config.ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 4
+    write_db = store.open_home(home)  # migrates once; kept open for the call log
+    try:
+        build_server(home, state=make_state(home, write_db=write_db, settings=settings)).run(transport='stdio')
+    finally:
+        write_db.close()
     return 0
 
 

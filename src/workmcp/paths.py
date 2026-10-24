@@ -150,6 +150,39 @@ def drive_warning(home: Path, env: Mapping[str, str]) -> str | None:
             f'local disk (not a Google Drive streaming, network or removable drive)')
 
 
+VIRTUALIZATION_KEYS = ('checked', 'under_appdata', 'redirected_to', 'package')
+APPDATA_ENV = ('LOCALAPPDATA', 'APPDATA')
+
+
+def _appdata_roots(env: Mapping[str, str]) -> list[Path]:
+    roots = [Path(env[name]) for name in APPDATA_ENV if env.get(name) and Path(env[name]).is_absolute()]
+    if env.get('USERPROFILE') and Path(env['USERPROFILE']).is_absolute():
+        roots.append(Path(env['USERPROFILE'])/'AppData')
+    return roots
+
+
+def virtualization_probe(home: Path, env: Mapping[str, str]) -> dict:
+    """Does a packaged (MSIX) app redirect writes to ``home`` into its own folder (design M3 §10.3)?
+
+    ``{'checked', 'under_appdata', 'redirected_to', 'package'}`` (``VIRTUALIZATION_KEYS``). A home
+    outside ``AppData`` is never virtualised: ``checked`` True, nothing redirected. Stage 0 fixes the
+    signature only: a home under ``AppData`` comes back ``checked`` False until the marker probe lands
+    (stage 1: marker in ``home/tmp``, looked up under ``%LOCALAPPDATA%\\Packages\\*\\LocalCache``).
+    """
+    under = any(_within(Path(home), root) for root in _appdata_roots(env))
+    return {'checked': not under, 'under_appdata': under, 'redirected_to': None, 'package': None}
+
+
+def appdata_warning(home: Path, env: Mapping[str, str]) -> str | None:
+    """``doctor`` warning when the home itself lies in an app package folder (removed with the app)."""
+    parts = [os.path.normcase(part) for part in Path(home).parts]
+    for at in range(len(parts) - 2):
+        if parts[at] == os.path.normcase('Packages') and parts[at + 2] == os.path.normcase('LocalCache'):
+            return (f'warning: data home {home} is inside the app package folder {Path(*Path(home).parts[:at + 2])} '
+                    f'(removed with the app); set {HOME_ENV} outside AppData')
+    return None
+
+
 def ensure_home(home: Path) -> Path:
     """Create the sub-folders of an already validated home."""
     for name in SUBDIRS:

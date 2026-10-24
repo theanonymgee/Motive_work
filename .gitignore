@@ -29,3 +29,7 @@ inbox/
 
 # Model weight side files (data home only)
 *.onnx_data
+
+# MCP client project configs: absolute paths and PC values (templates in doc/examples/, design M3 §11.2)
+/.mcp.json
+/.codex/

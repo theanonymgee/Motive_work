@@ -63,11 +63,17 @@ SCORE_KEYS = frozenset({'bm25', 'lexical_rank', 'cosine', 'semantic_rank', 'fusi
                         'score_is_probability'})
 HIT_REASONS = ('both', 'lexical', 'semantic')
 META_KEYS = frozenset({'mode', 'search_version', 'lexical', 'semantic', 'semantic_note', 'eligible_chunks',
-                       'filters', 'elapsed_ms'})
+                       'filters', 'elapsed_ms', 'collapsed', 'signals'})  # collapsed, signals: M3 §2.2, §9.3
 LEXICAL_META_KEYS = frozenset({'engine', 'terms', 'candidates'})          # engine: 'fts5' | 'like' | 'none'
 SEMANTIC_META_KEYS = frozenset({'model', 'model_key', 'real_model', 'vectors', 'candidates', 'streamed'})
 FILTER_KEYS = frozenset({'path_prefix', 'ext', 'since', 'until'})
 ELAPSED_KEYS = frozenset({'lexical', 'embed_query', 'semantic', 'total'})
+# Facts for an "absent information" judgement (design M3 §9.3). Stage 0 fills the defaults below;
+# stage 1 (B) computes them and the ``low`` rule.
+SIGNAL_KEYS = frozenset({'lexical_candidates', 'exact_phrase_hits', 'cosine_top1', 'cosine_top10', 'cosine_gap',
+                         'low'})
+DEFAULT_SIGNALS = {'lexical_candidates': None, 'exact_phrase_hits': None, 'cosine_top1': None, 'cosine_top10': None,
+                   'cosine_gap': None, 'low': False}
 UNAVAILABLE = 'unavailable'     # meta['semantic'] when there is no usable model
 NOT_REQUESTED = 'not_requested'  # meta['semantic'] in lexical mode (the model is not even looked at)
 
@@ -524,8 +530,11 @@ def _ms(seconds: float) -> float:
 def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: VectorCache | None = None,
            settings: SearchSettings = SearchSettings(), mode: str = 'hybrid', limit: int = LIMIT_DEFAULT,
            path_prefix: str | None = None, ext: Sequence[str] | None = None, since: str | None = None,
-           until: str | None = None, semantic_note: str | None = None) -> dict:
+           until: str | None = None, semantic_note: str | None = None, collapse_by_document: bool = False) -> dict:
     """One search on a read-only connection; returns ``{'hits', 'meta', 'notice'}`` (``RESULT_KEYS``).
+
+    ``collapse_by_document`` (design M3 §2.2): keep the first hit per document, ``meta.collapsed`` the
+    number skipped. Stage 0 accepts it and reports ``collapsed`` 0 (stage 1, B, implements it).
 
     ``embedder``/``vectors`` None means lexical only (``semantic_note`` says why); with an embedder
     and no ``vectors`` the cache is loaded here. Raises ``SearchError`` for bad input. Pure apart
@@ -631,7 +640,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
                         'terms': {'match': list(terms.match) if engine == 'fts5' else [], 'short': list(terms.short)},
                         'candidates': len(lexical)},
             'semantic': semantic_meta, 'semantic_note': semantic_note, 'eligible_chunks': eligible,
-            'filters': filters, 'elapsed_ms': elapsed}
+            'filters': filters, 'elapsed_ms': elapsed, 'collapsed': 0, 'signals': dict(DEFAULT_SIGNALS)}
     return {'hits': hits, 'meta': meta, 'notice': notice}
 
 
@@ -671,7 +680,7 @@ class Engine:
 
     def search(self, query: str, *, mode: str = 'hybrid', limit: int = LIMIT_DEFAULT,
                path_prefix: str | None = None, ext: Sequence[str] | None = None, since: str | None = None,
-               until: str | None = None) -> dict:
+               until: str | None = None, collapse_by_document: bool = False) -> dict:
         """Open ``store.open_read(home)``, run ``search(...)``, close; returns ``RESULT_KEYS``.
         Input is checked before the model is touched; lexical mode never loads it."""
         check_input(query, mode, limit)
@@ -682,7 +691,8 @@ class Engine:
             vectors = self.vectors(db) if model is not None else None
             result = search(db, query, embedder=model, vectors=vectors, settings=self.settings, mode=mode,
                             limit=limit, path_prefix=path_prefix, ext=ext, since=since, until=until,
-                            semantic_note=self.load_failure if mode != 'lexical' else None)
+                            semantic_note=self.load_failure if mode != 'lexical' else None,
+                            collapse_by_document=collapse_by_document)
         finally:
             db.close()
         if model is not None:

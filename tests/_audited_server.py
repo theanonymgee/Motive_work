@@ -1,8 +1,11 @@
 """Test-only wrapper: install an audit hook, then run the package (design M0 §7.2, M1 §4.3).
 
-Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT|index ROOT|search ROOT|embed]``
+Usage: ``python tests/_audited_server.py LOG_JSON [serve [ROOT]|imports|probe|scan ROOT|index ROOT|search ROOT|embed]``
 
-- ``serve`` (default): ``workmcp.server.main()``; stdin/stdout are the MCP stdio transport.
+- ``serve [ROOT]`` (default): ``workmcp.server.main()``; stdin/stdout are the MCP stdio transport. With
+  ROOT (the source folder the test scanned into the data home beforehand), ROOT is the source root of
+  the source-write judgement and every open under it is counted (``source_opens``, must be 0: the tools
+  read the store, never the originals; design M3 §12).
 - ``imports``: import every package module, build the server and call ``tools.status``.
 - ``probe``: positive control. Tries a non-loopback connect, a name lookup, a process start and a
   fixed-port loopback listener (all blocked by the hook before they happen) and one loopback
@@ -426,7 +429,10 @@ def main(argv) -> int:
     try:
         if mode == 'serve':
             from workmcp import server
+            if len(argv) > 3:
+                SOURCE_ROOT.append(str(Path(argv[3]).resolve()))
             code = server.main()
+            report['source_opens'] = _source_opens(0)
         elif mode == 'imports':
             report.update(imports())
             code = 0

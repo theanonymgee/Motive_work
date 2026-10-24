@@ -19,6 +19,7 @@ import importlib.machinery
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -41,7 +42,10 @@ COMMON_IMPORTS = frozenset({'__future__', 'argparse', 'collections.abc', 'datacl
                             'importlib.metadata', 'io', 'json', 'os', 'pathlib', 're', 'sqlite3', 'sys', 'typing'})
 # M1 parsers: the exact import lines of design M1 §8.1 (zip/XML/OLE/PDF/mail only where they are read).
 MODULE_IMPORTS = {
-    'server.py': frozenset({'mcp.server.MCPServer'}),
+    # M3 (design M3 §6.2, appendix C): the request Context (client name), anyio for the idle-release
+    # ticker (sleep, create_task_group), contextlib for the lifespan, time for elapsed, logging to stderr.
+    'server.py': frozenset({'mcp.server.MCPServer', 'mcp.server.mcpserver.Context', 'anyio', 'contextlib', 'time',
+                            'logging'}),
     'paths.py': frozenset({'unicodedata'}),  # NFC before comparing sync folder names (M0 review v2 N-L8)
     'config.py': frozenset({'tomllib'}),
     'collect.py': frozenset({'fnmatch'}),
@@ -57,6 +61,7 @@ MODULE_IMPORTS = {
     'embedder.py': frozenset({'numpy'}),
     'index.py': frozenset({'numpy', 'time'}),  # time: elapsed seconds of the run
     'search.py': frozenset({'numpy', 'time', 'gc'}),
+    'store.py': frozenset({'time'}),  # M3: retry the WAL switch when two servers open a new store together
 }
 # Inside function bodies only: the explicit model download, and the ONNX runtime and tokenizer
 # loaded in ``OnnxEmbedder.__init__`` (their DLLs never load on import, status or lexical search).
@@ -81,6 +86,9 @@ NETWORK_CLIENT_PACKAGES = {'httpx', 'httpx2', 'requests', 'aiohttp', 'huggingfac
 # Hub download APIs, banned by name whatever they are called on (design M2 §7.1): tokenizers'
 # ``Tokenizer.from_pretrained`` and huggingface_hub's helpers fetch files over the network.
 HUB_DOWNLOADS = frozenset({'from_pretrained', 'hf_hub_download', 'snapshot_download'})
+# anyio network and thread APIs, banned by name wherever they appear (design M3 §6.2): server.py may
+# import anyio for its ticker only, and tools never run on a worker thread.
+ANYIO_BANNED = frozenset({'open_tcp_stream', 'connect_tcp', 'create_tcp_listener', 'to_thread'})
 # Heavy runtimes the import audit must not see loaded (lazy import, design M2 §7.2).
 LAZY_RUNTIMES = ('onnxruntime', 'tokenizers', 'huggingface_hub')
 
@@ -197,6 +205,8 @@ def banned_qualified(dotted: str) -> str | None:
         return f'non-stdio transport {dotted}'
     if parts[-1] in HUB_DOWNLOADS:
         return f'hub download API {dotted}'
+    if ANYIO_BANNED & set(parts):
+        return f'anyio network or thread API {dotted}'
     return None
 
 
@@ -254,7 +264,7 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
             dotted = qualify(node, bound)
             if dotted and (reason := banned_qualified(dotted)):
                 found.append(reason)
-            elif node.attr in DYNAMIC_LOADERS | ESCAPE_ATTRS | NON_STDIO_RUNNERS | HUB_DOWNLOADS:
+            elif node.attr in DYNAMIC_LOADERS | ESCAPE_ATTRS | NON_STDIO_RUNNERS | HUB_DOWNLOADS | ANYIO_BANNED:
                 found.append(f'banned attribute {node.attr}')
             root = node
             while isinstance(root, ast.Attribute):
@@ -321,7 +331,7 @@ def test_package_has_sources():
         '__init__.py', '__main__.py', 'cli.py', 'paths.py', 'store.py', 'locator.py', 'models.py', 'tools.py',
         'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
         'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py',
-        'config.py', 'collect.py', 'binding.py', 'chunks.py', 'embedder.py', 'index.py', 'search.py'}
+        'config.py', 'collect.py', 'binding.py', 'chunks.py', 'embedder.py', 'index.py', 'search.py', 'snippet.py'}
 
 
 def test_package_has_no_importable_file_other_than_py():
@@ -471,7 +481,6 @@ MORE_BYPASSES = [
     'server.run_sse_async()',
     'import mcp.server.sse',
     'from mcp.server.streamable_http import StreamableHTTPSessionManager',
-    'import anyio',
     'import threading',
     'import json\nimport socket',
     'def f():\n    import socket',
@@ -636,10 +645,53 @@ def test_m1_collector_imports_are_allowed_only_in_their_modules():
 
 def test_server_may_use_mcp_but_not_other_transports():
     assert violations('server.py', 'from mcp.server import MCPServer\nserver.run(transport="stdio")\n') == []
+    ticker = ('import anyio\nimport contextlib\nfrom mcp.server.mcpserver import Context\n'
+              '@contextlib.asynccontextmanager\nasync def life(s):\n'
+              '    async with anyio.create_task_group() as group:\n        group.start_soon(tick)\n'
+              '        yield {}\n        group.cancel_scope.cancel()\n'
+              'async def tick():\n    await anyio.sleep(30)\n')
+    assert violations('server.py', ticker) == []  # design M3 §6.2: import anyio alone is allowed here
     assert violations('server.py', 'server.run(transport="sse")')
     assert violations('server.py', 'import anyio\nanyio.run(server.run_sse_async)')
     assert violations('server.py', 'import socket')
     assert violations('tools.py', 'from mcp.server import MCPServer')
+
+
+# M3 (design M3 §6.2, appendix C): anyio, contextlib and Context only in server.py; no anyio network or
+# thread API anywhere; no new process, thread or id modules.
+M3_BYPASSES = [
+    ('tools.py', 'import anyio'),
+    ('search.py', 'import anyio'),
+    ('snippet.py', 'import anyio'),
+    ('tools.py', 'import contextlib'),
+    ('snippet.py', 'import contextlib'),
+    ('tools.py', 'from mcp.server.mcpserver import Context'),
+    ('tools.py', 'import time'),
+    ('server.py', 'from anyio import to_thread'),
+    ('server.py', 'from anyio.to_thread import run_sync'),
+    ('server.py', 'import anyio\nanyio.to_thread.run_sync(f)'),
+    ('server.py', 'import anyio\nasync def g():\n    await anyio.to_thread.run_sync(f)'),
+    ('server.py', 'import anyio as a\na.to_thread.run_sync(f)'),
+    ('server.py', 'import anyio\ngetattr(anyio, "to_thread")'),
+    ('server.py', 'import anyio\nanyio.open_tcp_stream("example.invalid", 443)'),
+    ('server.py', 'from anyio import connect_tcp'),
+    ('server.py', 'import anyio\nanyio.create_tcp_listener(local_port=8000)'),
+    ('server.py', 'x.open_tcp_stream("example.invalid", 443)'),
+    ('server.py', 'import anyio\nanyio.run(main)'),
+    ('server.py', 'import asyncio'),
+    ('server.py', 'import threading'),
+    ('server.py', 'import uuid'),
+    ('server.py', 'import subprocess'),
+    ('server.py', 'import ctypes'),
+    ('server.py', 'import logging.handlers'),
+    ('tools.py', 'import uuid'),
+    ('tools.py', 'import threading'),
+]
+
+
+@pytest.mark.parametrize('module, snippet', M3_BYPASSES)
+def test_checks_flag_m3_snippets(module, snippet):
+    assert violations(module, snippet, {'fetch', 'download_file', 'main'})
 
 
 # 4
@@ -670,7 +722,7 @@ def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
             'workmcp.parsers.text', 'workmcp.parsers.eml', 'workmcp.parsers.docx', 'workmcp.parsers.pptx',
             'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp', 'workmcp.config', 'workmcp.collect',
             'workmcp.binding', 'workmcp.chunks', 'workmcp.embedder', 'workmcp.index',
-            'workmcp.search'} <= set(report['modules'])
+            'workmcp.search', 'workmcp.snippet'} <= set(report['modules'])
     # the parser libraries and numpy really were imported under the hook (their import side effects are audited)
     assert {'pypdf', 'olefile', 'xml.parsers.expat', 'zipfile', 'email.parser', 'numpy'} <= set(report['loaded'])
     # ... and the heavy runtimes were not: they load inside OnnxEmbedder only (design M2 §7.2)
@@ -735,20 +787,43 @@ def test_tokenizers_and_onnxruntime_imports_do_not_load_a_hub_client():
     assert json.loads(run.stdout) == []
 
 
+SERVE_TOOLS = {'search', 'get_snippet', 'list_documents', 'recent_changes', 'status'}
+# Arguments of each tool's input schema (design M3 §2); ctx is injected by the SDK, not an argument.
+SERVE_ARGUMENTS = {
+    'search': {'query', 'mode', 'limit', 'path_prefix', 'ext', 'since', 'until', 'collapse_by_document'},
+    'get_snippet': {'chunk_id', 'locator', 'context_units', 'max_chars'},
+    'list_documents': {'path_prefix', 'ext', 'status', 'changed_since', 'limit', 'offset'},
+    'recent_changes': {'since', 'until', 'kinds', 'path_prefix', 'ext', 'limit', 'offset'},
+    'status': set(),
+}
+
+
+def tool_call(number, name, arguments):
+    return {'jsonrpc': '2.0', 'id': number, 'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
+
+
 MCP_SESSION = [
     {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
      'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'audit-test', 'version': '0'}}},
     {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
     {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
-    {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'status', 'arguments': {}}},
+    tool_call(3, 'status', {}),
+    # Stage 0 (design M3 §14.1): the other four answer not_implemented; stage 1 replaces these calls (§12).
+    tool_call(4, 'search', {'query': 'SENTINEL-합성-질의', 'limit': 5}),
+    tool_call(5, 'get_snippet', {'chunk_id': 1}),
+    tool_call(6, 'list_documents', {'limit': 3}),
+    tool_call(7, 'recent_changes', {}),
+    tool_call(8, 'search', {'query': 'x', 'limit': 'x'}),  # SDK argument validation: isError, not our envelope
 ]
+SERVE_IDS = set(range(1, 9))
 
 
-def serve_session(tmp_path, messages, expected_ids, timeout=60):
-    """Run the wrapper in ``serve`` mode; keep stdin open until every expected reply arrived, then close it."""
+def serve_session(tmp_path, messages, expected_ids, timeout=60, root=None):
+    """Run the wrapper in ``serve [ROOT]`` mode; keep stdin open until every expected reply arrived, then close it."""
     log = tmp_path/'audit-serve.json'
     env = {**os.environ, 'WORKMCP_HOME': str(tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
-    proc = subprocess.Popen([sys.executable, str(WRAPPER), str(log), 'serve'], stdin=subprocess.PIPE,
+    extra = [str(root)] if root is not None else []
+    proc = subprocess.Popen([sys.executable, str(WRAPPER), str(log), 'serve', *extra], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=tmp_path,
                             text=True, encoding='utf-8')
     watchdog = threading.Timer(timeout, proc.kill)
@@ -779,8 +854,11 @@ def serve_session(tmp_path, messages, expected_ids, timeout=60):
 
 
 def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
-    """Real ``serve`` over stdio: stdout is JSON-RPC only, sockets loopback only, no process, exit 0."""
-    lines, stderr, report = serve_session(tmp_path, MCP_SESSION, {1, 2, 3})
+    """Real ``serve`` over stdio: stdout is JSON-RPC only, sockets loopback only, no process, no open under
+    the source root, exit 0; five unstructured tools; every call our code handles is logged once."""
+    src = tmp_path/'src'
+    bundle.write_bundle(src)
+    lines, stderr, report = serve_session(tmp_path, MCP_SESSION, SERVE_IDS, root=src)
     stdout = ''.join(lines)
     assert stdout.endswith('\n'), stdout[-200:]  # every message, the last one too, ends with a newline
     records = stdout[:-1].split('\n')  # only that final newline is dropped; blank lines stay and fail below
@@ -788,11 +866,35 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     messages = [json.loads(record) for record in records]  # ... every stdout line parses ...
     assert all(isinstance(m, dict) and m.get('jsonrpc') == '2.0' for m in messages)  # ... as a JSON-RPC object
     replies = {m['id']: m for m in messages if 'id' in m}
-    assert set(replies) == {1, 2, 3}, stderr
+    assert set(replies) == SERVE_IDS, stderr
     assert replies[1]['result']['serverInfo']['name'] == 'workmcp'
-    assert 'status' in {tool['name'] for tool in replies[2]['result']['tools']}
+    assert 'delivered_sources' in replies[1]['result']['instructions']
+    listed = {tool['name']: tool for tool in replies[2]['result']['tools']}
+    assert set(listed) == SERVE_TOOLS
+    assert {name: set(tool['inputSchema'].get('properties', {})) for name, tool in listed.items()} == SERVE_ARGUMENTS
+    assert all('outputSchema' not in tool for tool in listed.values())  # structured_output=False
+    for number in range(3, 8):
+        result = replies[number]['result']
+        assert 'structuredContent' not in result and len(result['content']) == 1 and not result.get('isError')
     status = json.loads(replies[3]['result']['content'][0]['text'])
-    assert status['ok'] and status['result']['schema_version'] == 1 and status['delivered_sources'] == []
+    assert status['ok'] and status['result']['schema_version'] == 2 and status['delivered_sources'] == []
+    assert set(status['result']) == STATUS_RESULT_KEYS
+    for number in range(4, 8):  # stage 0
+        envelope = json.loads(replies[number]['result']['content'][0]['text'])
+        assert envelope['ok'] is False and envelope['error']['code'] == 'not_implemented'
+    assert replies[8]['result']['isError'] is True  # rejected by the SDK before our code runs
+    assert report['source_opens'] == 0  # (c) the tools never open the originals
+    log = sqlite3.connect(tmp_path/'home'/'db'/'work.sqlite3')
+    try:
+        calls = log.execute('SELECT client, client_version, tool, ok, error_code, args_json FROM tool_calls '
+                            'ORDER BY id').fetchall()
+        deliveries = log.execute('SELECT COUNT(*) FROM deliveries').fetchone()[0]
+    finally:
+        log.close()
+    assert [(c[0], c[1], c[2], c[3]) for c in calls] == [('audit-test', '0', name, ok) for name, ok in (
+        ('status', 1), ('search', 0), ('get_snippet', 0), ('list_documents', 0), ('recent_changes', 0))]
+    assert deliveries == 0  # nothing carried document text
+    assert 'SENTINEL' not in stderr and not any('SENTINEL' in c[5] for c in calls)  # no query text logged
     events = report['events']
     assert [e for e in events if e['violation']] == []  # (b) loopback only, no name resolution
     for e in events:
@@ -858,6 +960,10 @@ def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
 
 
 # 6
+STATUS_RESULT_KEYS = {'home', 'schema_version', 'db', 'model', 'fts5', 'last_scan', 'index', 'delivery_log_count',
+                      'engine', 'home_virtualization', 'calls', 'process'}
+
+
 def requirement_name(spec: str) -> str:
     return re.split(r'[<>=!~;\[\s@]', spec, maxsplit=1)[0].strip().lower().replace('-', '_')
 

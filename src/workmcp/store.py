@@ -6,10 +6,10 @@ FTS5 index ``chunks_fts`` are derived and may be rebuilt. ``chunks_fts`` is crea
 the migration ledger only when this SQLite has FTS5 with the trigram tokenizer, so a
 Python without FTS5 still opens the store (lexical search then falls back to LIKE).
 
-Schema v1 is edited in place until the first real install (M5): no data home has been created
-from it yet (design M1 §10.1), and a development store made from an earlier v1 is refused by
-the checksum check (delete it and scan again). From the M5 install on, v1 is frozen and every
-change is a new migration.
+Schema v1 was edited in place through M2 (design M1 §10.1); a development store made from an
+earlier v1 is refused by the checksum check (delete it and scan again). From M3 on v1 is frozen
+and every change is a new migration: v2 adds the tool call log, ``deliveries.call_id`` and
+``document_events`` (design M3 §3.4).
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -175,8 +176,54 @@ CREATE TABLE index_runs(id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finish
   model_key TEXT, chunk_version TEXT NOT NULL, counts_json TEXT NOT NULL DEFAULT '{}', note TEXT);
 """
 
+# M3 (design M3 §3.4): tool call log, delivery rows tied to their call, document change events.
+# Additive only: v1 above is not edited for M3, so two serve processes that start together apply this
+# once (BEGIN IMMEDIATE) and a store made before M3 is upgraded in place. All three tables are
+# append-only; tool_calls has a second unique key (call_id), guarded like versions (document_id, seq).
+SCHEMA_V2 = """
+CREATE TABLE tool_calls(id INTEGER PRIMARY KEY, at TEXT NOT NULL, client TEXT NOT NULL,
+  client_version TEXT NOT NULL DEFAULT '', tool TEXT NOT NULL, call_id TEXT NOT NULL UNIQUE,
+  args_json TEXT NOT NULL DEFAULT '{}', pieces INTEGER NOT NULL DEFAULT 0, chars INTEGER NOT NULL DEFAULT 0,
+  ok INTEGER NOT NULL, error_code TEXT, elapsed_ms REAL, pid INTEGER);
+CREATE INDEX tool_calls_at ON tool_calls(at, id);
+CREATE TRIGGER tool_calls_no_update BEFORE UPDATE ON tool_calls BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER tool_calls_no_delete BEFORE DELETE ON tool_calls BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER tool_calls_no_replace BEFORE INSERT ON tool_calls
+  WHEN EXISTS(SELECT 1 FROM tool_calls WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER tool_calls_no_replace_call BEFORE INSERT ON tool_calls
+  WHEN EXISTS(SELECT 1 FROM tool_calls WHERE call_id = NEW.call_id)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+ALTER TABLE deliveries ADD COLUMN call_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX deliveries_call ON deliveries(call_id);
+CREATE TRIGGER deliveries_no_update BEFORE UPDATE ON deliveries BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER deliveries_no_delete BEFORE DELETE ON deliveries BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER deliveries_no_replace BEFORE INSERT ON deliveries
+  WHEN EXISTS(SELECT 1 FROM deliveries WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+CREATE TABLE document_events(id INTEGER PRIMARY KEY, at TEXT NOT NULL,
+  scan_id INTEGER REFERENCES scans(id), document_id INTEGER NOT NULL REFERENCES documents(id),
+  version_id INTEGER REFERENCES versions(id),
+  kind TEXT NOT NULL CHECK(kind IN ('added','changed','restored','deleted','reparsed')));
+CREATE INDEX document_events_at ON document_events(at, id);
+CREATE INDEX document_events_doc ON document_events(document_id, id);
+CREATE TRIGGER document_events_no_update BEFORE UPDATE ON document_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER document_events_no_delete BEFORE DELETE ON document_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER document_events_no_replace BEFORE INSERT ON document_events
+  WHEN EXISTS(SELECT 1 FROM document_events WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+"""
+
 # (version, name, sql). Never edit an applied entry; append a new one.
-MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1)]
+MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1), (2, 'tool_calls_events_v2', SCHEMA_V2)]
+SCHEMA_VERSION = MIGRATIONS[-1][0]
+EVENT_KINDS = ('added', 'changed', 'restored', 'deleted', 'reparsed')
+DOCUMENT_STATUSES = ('active', 'deleted', 'skipped')
+CALL_COLUMNS = ('at', 'client', 'client_version', 'tool', 'call_id', 'args_json', 'pieces', 'chars', 'ok',
+                'error_code', 'elapsed_ms', 'pid')
+DELIVERY_COLUMNS = ('at', 'client', 'tool', 'locator_json', 'chars')
 
 LOCK_NAME = 'scan.lock'
 INDEX_LOCK_NAME = 'index.lock'
@@ -244,11 +291,29 @@ def migrate(db: sqlite3.Connection) -> list[int]:
     return applied
 
 
+WAL_ATTEMPTS = 50               # x WAL_RETRY_SECONDS: two serve processes opening a new store together
+WAL_RETRY_SECONDS = 0.1
+
+
+def _wal(db: sqlite3.Connection) -> None:
+    """``journal_mode=WAL``. Switching a new database into WAL needs an exclusive lock and SQLite answers
+    "database is locked" at once, without the busy handler, when another connection does the same (two
+    clients starting their servers together, design M3 §7); so retry for up to 5 seconds."""
+    for attempt in range(WAL_ATTEMPTS):
+        try:
+            db.execute('PRAGMA journal_mode=WAL')
+            return
+        except sqlite3.OperationalError as exc:
+            if 'locked' not in str(exc) or attempt == WAL_ATTEMPTS - 1:
+                raise
+            time.sleep(WAL_RETRY_SECONDS)
+
+
 def connect(path: Path) -> sqlite3.Connection:
     """Open (creating if needed) the store at ``path``: WAL, foreign keys, busy timeout, schema."""
     db = sqlite3.connect(path, isolation_level=None)
     db.execute('PRAGMA busy_timeout=5000')
-    db.execute('PRAGMA journal_mode=WAL')
+    _wal(db)
     db.execute('PRAGMA foreign_keys=ON')
     migrate(db)
     if fts5_available():
@@ -551,3 +616,132 @@ def fts_status(db: sqlite3.Connection) -> dict:
     return {'available': available, 'rows': rows, 'chunks': chunks, 'missing': missing, 'extra': extra,
             'synced_at': synced_at, 'dirty': dirty,
             'consistent': available and missing == 0 and extra == 0 and not dirty}
+
+
+# -- M3: tool call log, delivery rows, document events (design M3 §2.4, §2.5, §3) -----------------
+# No transaction control here either: ``server`` wraps one call's rows in BEGIN IMMEDIATE ... COMMIT,
+# ``collect`` adds events inside its own transaction. Nothing here stores query or document text.
+
+def _json(value) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, separators=(',', ':'),
+                                                           sort_keys=True)
+
+
+def record_call(db: sqlite3.Connection, row) -> int:
+    """Insert one ``tool_calls`` row (keys ``CALL_COLUMNS``; ``at, client, tool, call_id, ok`` required,
+    ``args_json`` a summary without query or body text, str or JSON-able); returns its id."""
+    values = {'client_version': '', 'args_json': '{}', 'pieces': 0, 'chars': 0, 'error_code': None,
+              'elapsed_ms': None, 'pid': None, **row}
+    if unknown := set(values) - set(CALL_COLUMNS):
+        raise ValueError(f'unknown tool_calls columns {sorted(unknown)}')
+    values['args_json'] = _json(values['args_json'])
+    values['ok'] = int(bool(values['ok']))
+    return db.execute(f'INSERT INTO tool_calls({",".join(CALL_COLUMNS)}) VALUES({",".join("?" * len(CALL_COLUMNS))})',
+                      [values[k] for k in CALL_COLUMNS]).lastrowid
+
+
+def record_deliveries(db: sqlite3.Connection, call_id: str, rows) -> int:
+    """Insert one ``deliveries`` row per delivered piece (keys ``DELIVERY_COLUMNS``; ``locator_json`` a
+    locator dict or its JSON) under ``call_id``; returns the number of rows."""
+    batch = []
+    for row in rows:
+        if unknown := set(row) - set(DELIVERY_COLUMNS):
+            raise ValueError(f'unknown deliveries columns {sorted(unknown)}')
+        batch.append((row['at'], row['client'], row['tool'], _json(row['locator_json']), int(row['chars']), call_id))
+    if batch:
+        db.executemany('INSERT INTO deliveries(at, client, tool, locator_json, chars, call_id) VALUES(?,?,?,?,?,?)',
+                       batch)
+    return len(batch)
+
+
+def call_counts(db: sqlite3.Connection) -> dict:
+    """``{'total', 'by_client'}`` over ``tool_calls`` (client names as the clients sent them)."""
+    by_client = dict(db.execute('SELECT client, COUNT(*) FROM tool_calls GROUP BY client ORDER BY client'))
+    return {'total': sum(by_client.values()), 'by_client': by_client}
+
+
+def add_document_event(db: sqlite3.Connection, scan_id: int | None, document_id: int, version_id: int | None,
+                       kind: str, at: str | None = None) -> int:
+    """Record one document change (``EVENT_KINDS``) found by a scan; returns the event id."""
+    if kind not in EVENT_KINDS:
+        raise ValueError(f'unknown document event kind {kind!r}')
+    return db.execute('INSERT INTO document_events(at, scan_id, document_id, version_id, kind) VALUES(?,?,?,?,?)',
+                      (at or now(), scan_id, document_id, version_id, kind)).lastrowid
+
+
+def _document_filter_sql(filters) -> tuple[str, list]:
+    """``AND ...`` on alias ``d`` for already checked ``path_prefix`` (normcased) and ``ext`` filters
+    (``search.check_filters``), as ``search._filter_sql`` does."""
+    sql, params = '', []
+    if filters.get('path_prefix'):
+        escaped = filters['path_prefix'].replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        sql += " AND d.path_key LIKE ? ESCAPE '\\'"
+        params.append(escaped + '%')
+    if filters.get('ext'):
+        sql += f" AND d.ext IN ({','.join('?' * len(filters['ext']))})"
+        params += list(filters['ext'])
+    return sql, params
+
+
+def documents_query(db: sqlite3.Connection, filters, limit: int, offset: int, *,
+                    chunk_version: str) -> tuple[list[dict], int]:
+    """``(rows, total)`` for ``list_documents`` (design M3 §2.4), ordered by ``path_key``.
+
+    ``filters``: ``path_prefix``/``ext`` (checked), ``status`` (``DOCUMENT_STATUSES`` or ``'all'``),
+    ``changed_since`` (checked ISO: latest version observed or document deleted at or after it).
+    ``latest`` is the highest-seq version or None; ``indexed`` means it has chunks of ``chunk_version``."""
+    where, params = _document_filter_sql(filters)
+    status = filters.get('status') or 'active'
+    if status != 'all':
+        where += ' AND d.status = ?'
+        params.append(status)
+    if filters.get('changed_since'):
+        where += ' AND (julianday(v.observed_at) >= julianday(?) OR julianday(d.deleted_at) >= julianday(?))'
+        params += [filters['changed_since']] * 2
+    body = ('FROM documents d LEFT JOIN versions v ON v.id = '
+            '(SELECT id FROM versions WHERE document_id = d.id ORDER BY seq DESC LIMIT 1) '
+            f'WHERE 1 = 1{where}')
+    total = db.execute(f'SELECT COUNT(*) {body}', params).fetchone()[0]
+    latest_keys = ('version_id', 'seq', 'sha256', 'size', 'observed_at', 'parse_status', 'parse_error',
+                   'unit_count', 'text_chars')
+    rows = []
+    for row in db.execute(
+            'SELECT d.id, d.path, d.ext, d.status, d.skip_reason, d.root_id, d.first_seen_at, d.last_seen_at, '
+            'd.deleted_at, v.id, v.seq, v.sha256, v.size, v.observed_at, v.parse_status, v.parse_error, '
+            'v.unit_count, v.text_chars, '
+            'EXISTS(SELECT 1 FROM chunks c WHERE c.version_id = v.id AND c.chunk_version = ?) '
+            f'{body} ORDER BY d.path_key LIMIT ? OFFSET ?', [chunk_version, *params, limit, offset]):
+        rows.append({'id': row[0], 'path': row[1], 'ext': row[2], 'status': row[3], 'skip_reason': row[4],
+                     'root_id': row[5], 'first_seen_at': row[6], 'last_seen_at': row[7], 'deleted_at': row[8],
+                     'latest': None if row[9] is None else dict(zip(latest_keys, row[9:18])),
+                     'indexed': bool(row[18])})
+    return rows, total
+
+
+def document_events_query(db: sqlite3.Connection, filters, limit: int, offset: int) -> tuple[list[dict], int]:
+    """``(rows, total)`` for ``recent_changes`` (design M3 §2.5), newest first.
+
+    ``filters``: ``since``/``until`` (checked ISO, on the event time), ``kinds`` (subset of
+    ``EVENT_KINDS``), ``path_prefix``/``ext`` (checked)."""
+    where, params = _document_filter_sql(filters)
+    if filters.get('since'):
+        where += ' AND julianday(e.at) >= julianday(?)'
+        params.append(filters['since'])
+    if filters.get('until'):
+        where += ' AND julianday(e.at) <= julianday(?)'
+        params.append(filters['until'])
+    if filters.get('kinds'):
+        where += f" AND e.kind IN ({','.join('?' * len(filters['kinds']))})"
+        params += list(filters['kinds'])
+    body = ('FROM document_events e JOIN documents d ON d.id = e.document_id '
+            f'LEFT JOIN versions v ON v.id = e.version_id WHERE 1 = 1{where}')
+    total = db.execute(f'SELECT COUNT(*) {body}', params).fetchone()[0]
+    rows = [{'id': row[0], 'at': row[1], 'kind': row[2],
+             'doc': {'id': row[3], 'path': row[4], 'ext': row[5], 'status': row[6]},
+             'version_id': row[7], 'seq': row[8], 'sha256': row[9], 'parse_status': row[10], 'parse_error': row[11],
+             'scan_id': row[12]}
+            for row in db.execute(
+                'SELECT e.id, e.at, e.kind, d.id, d.path, d.ext, d.status, e.version_id, v.seq, v.sha256, '
+                f'v.parse_status, v.parse_error, e.scan_id {body} ORDER BY julianday(e.at) DESC, e.id DESC '
+                'LIMIT ? OFFSET ?', [*params, limit, offset])]
+    return rows, total

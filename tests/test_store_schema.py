@@ -1,17 +1,28 @@
 """Empty schema v1, migration ledger and append-only triggers (design §3.2), the M2 schema edits and the
-chunk/FTS functions (design M2 §1.4, §4.3). Synthetic rows only."""
+chunk/FTS functions (design M2 §1.4, §4.3), migration v2 (design M3 §3.4): tool call log, delivery rows,
+document events and their queries. Synthetic rows only."""
+import json
+import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from workmcp import paths, store, tools
 
 TABLES = {'schema_migrations', 'source_roots', 'documents', 'versions', 'units', 'chunks', 'chunk_vectors',
-          'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans', 'meta', 'index_runs'}
+          'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans', 'meta', 'index_runs',
+          'tool_calls', 'document_events'}
 TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_status_guard', 'assertions_no_delete',
             'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace',
-            'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq'}
-INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunks_text'}
+            'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq',
+            'tool_calls_no_update', 'tool_calls_no_delete', 'tool_calls_no_replace', 'tool_calls_no_replace_call',
+            'deliveries_no_update', 'deliveries_no_delete', 'deliveries_no_replace',
+            'document_events_no_update', 'document_events_no_delete', 'document_events_no_replace'}
+INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunks_text', 'tool_calls_at', 'deliveries_call',
+           'document_events_at', 'document_events_doc'}
 H = '0' * 64
 NOW = '2026-10-23T09:00:00+09:00'
 LATER = '2026-10-23T10:00:00+09:00'
@@ -29,14 +40,15 @@ def names(db, kind):
     return {r[0] for r in db.execute('SELECT name FROM sqlite_master WHERE type=?', (kind,))}
 
 
-def test_empty_db_has_schema_v1(db):
+def test_empty_db_has_schema_v1_and_v2(db):
     assert TABLES <= names(db, 'table')
     assert TRIGGERS <= names(db, 'trigger')
     assert INDEXES <= names(db, 'index')
     assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
     assert db.execute('PRAGMA foreign_keys').fetchone()[0] == 1
     rows = db.execute('SELECT version, name FROM schema_migrations').fetchall()
-    assert rows == [(1, 'initial_schema_v1')]
+    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2')]
+    assert store.SCHEMA_VERSION == 2
     assert all(db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] == 0 for t in TABLES - {'schema_migrations'})
     if store.fts5_available():
         assert 'chunks_fts' in names(db, 'table')
@@ -47,7 +59,7 @@ def test_migrate_is_idempotent_and_detects_edited_migration(db, monkeypatch):
     monkeypatch.setattr(store, 'MIGRATIONS', [(1, 'initial_schema_v1', store.SCHEMA_V1 + '\n-- edited\n')])
     with pytest.raises(RuntimeError, match='checksum changed'):
         store.migrate(db)
-    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 1
+    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 2
 
 
 def test_statement_splitter_keeps_trigger_bodies():
@@ -313,7 +325,7 @@ def test_status_tool_reads_without_migrating(tmp_path):
     response = tools.status(home)
     assert response['ok'] and response['delivered_sources'] == []
     result = response['result']
-    assert result['schema_version'] == 1
+    assert result['schema_version'] == 2
     assert result['db'] == {'documents': 0, 'versions': 0, 'chunks': 0, 'vectors': 0}
     assert result['model']['name'] == 'bge-m3' and result['model']['available'] is False
 
@@ -667,3 +679,185 @@ def test_fts_differences_count_missing_and_stale_ids(db):
     db.execute('INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)', first)
     db.execute("INSERT INTO chunks_fts(rowid, text) VALUES(9999, '유령 항목')")
     assert store.fts_differences(db) == (0, 1) and not store.fts_status(db)['consistent']
+
+
+# Migration v2 (design M3 §3.4)
+ROOT = Path(__file__).resolve().parents[1]
+CALL = {'at': NOW, 'client': 'test-client', 'client_version': '1.0', 'tool': 'search', 'call_id': 'c' * 16,
+        'args_json': {'mode': 'hybrid', 'query_chars': 5}, 'pieces': 2, 'chars': 30, 'ok': True, 'elapsed_ms': 1.5,
+        'pid': 1}
+
+
+def test_migration_v2_adds_tool_calls_events_and_call_id(db):
+    assert columns(db, 'tool_calls') == ['id', 'at', 'client', 'client_version', 'tool', 'call_id', 'args_json',
+                                         'pieces', 'chars', 'ok', 'error_code', 'elapsed_ms', 'pid']
+    assert columns(db, 'deliveries') == ['id', 'at', 'client', 'tool', 'locator_json', 'chars', 'call_id']
+    assert columns(db, 'document_events') == ['id', 'at', 'scan_id', 'document_id', 'version_id', 'kind']
+    unique = {r[1] for r in db.execute('PRAGMA index_list(tool_calls)') if r[2]}
+    assert [[c[2] for c in db.execute(f'PRAGMA index_info({name})')] for name in unique] == [['call_id']]
+
+
+def test_migration_v2_upgrades_a_v1_store_in_place(tmp_path, monkeypatch):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    monkeypatch.setattr(store, 'MIGRATIONS', store.MIGRATIONS[:1])
+    old = store.open_home(home)
+    old.execute("INSERT INTO deliveries(at, client, tool, locator_json, chars) VALUES(?, 'c', 't', '{}', 3)", (NOW,))
+    old.close()
+    monkeypatch.undo()
+    upgraded = store.open_home(home)
+    try:
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2]
+        assert upgraded.execute('SELECT chars, call_id FROM deliveries').fetchall() == [(3, '')]
+        assert store.migrate(upgraded) == []
+    finally:
+        upgraded.close()
+
+
+def test_migration_v2_applies_once_under_two_processes(tmp_path):
+    """Two serve processes may start together; BEGIN IMMEDIATE lets one apply v2 (design M3 §7)."""
+    home = tmp_path/'home'
+    code = ('import sys\nfrom workmcp import paths, store\n'
+            'home = paths.ensure_home(paths.validate_home(sys.argv[1], {}, None))\n'
+            'db = store.open_home(home)\n'
+            'print(db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])\ndb.close()\n')
+    env = {**os.environ, 'PYTHONPATH': str(ROOT/'src')}
+    runs = [subprocess.Popen([sys.executable, '-c', code, str(home)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, env=env) for _ in range(2)]
+    outputs = [run.communicate(timeout=120) for run in runs]
+    assert [run.returncode for run in runs] == [0, 0], outputs
+    assert [out.strip() for out, _ in outputs] == ['2', '2']
+    check = sqlite3.connect(paths.db_path(home))
+    try:
+        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,)]
+    finally:
+        check.close()
+
+
+def add_call(db, **changes):
+    return store.record_call(db, {**CALL, **changes})
+
+
+@pytest.mark.parametrize('table', ['tool_calls', 'deliveries', 'document_events'])
+def test_v2_tables_are_append_only(db, table):
+    doc = add_document(db)
+    if table == 'tool_calls':
+        key = add_call(db)
+    elif table == 'deliveries':
+        store.record_deliveries(db, 'c' * 16, [{'at': NOW, 'client': 'c', 'tool': 't', 'locator_json': {}, 'chars': 1}])
+        key = db.execute('SELECT id FROM deliveries').fetchone()[0]
+    else:
+        key = store.add_document_event(db, None, doc, None, 'deleted', NOW)
+    before = full_row(db, table, key)
+    column = {'tool_calls': 'client', 'deliveries': 'client', 'document_events': 'kind'}[table]
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute(f"UPDATE {table} SET {column}='added' WHERE id=?", (key,))
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute(f'DELETE FROM {table} WHERE id=?', (key,))
+    names = [c for c in columns(db, table) if c != 'id']
+    values = [v for c, v in zip(columns(db, table), before) if c != 'id']
+    for verb in ('INSERT OR REPLACE INTO', 'REPLACE INTO'):
+        with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+            db.execute(f"{verb} {table}(id, {', '.join(names)}) VALUES(?{', ?' * len(names)})", (key, *values))
+    assert full_row(db, table, key) == before
+    assert db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 1
+
+
+def test_tool_call_cannot_be_replaced_through_its_call_id(db):
+    add_call(db)
+    before = db.execute('SELECT * FROM tool_calls').fetchall()
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute("INSERT OR REPLACE INTO tool_calls(at, client, tool, call_id, ok) VALUES(?, 'other', 'status', ?, 1)",
+                   (LATER, CALL['call_id']))
+    assert db.execute('SELECT * FROM tool_calls').fetchall() == before
+
+
+def test_record_call_and_deliveries_keep_summaries_under_one_call_id(db):
+    call = add_call(db)
+    obj = {'v': 1, 'doc': 1, 'path': 'C:\\synthetic\\a.txt', 'sha256': H, 'unit': {'kind': 'line', 'line': 1},
+           'chars': [0, 5], 'text_sha256': H}
+    assert store.record_deliveries(db, CALL['call_id'], [
+        {'at': NOW, 'client': 'test-client', 'tool': 'search', 'locator_json': obj, 'chars': 5},
+        {'at': NOW, 'client': 'test-client', 'tool': 'search', 'locator_json': json.dumps(obj), 'chars': 25}]) == 2
+    assert store.record_deliveries(db, 'none', []) == 0
+    row = db.execute('SELECT client, client_version, tool, args_json, pieces, chars, ok, error_code FROM tool_calls '
+                     'WHERE id=?', (call,)).fetchone()
+    assert row == ('test-client', '1.0', 'search', '{"mode":"hybrid","query_chars":5}', 2, 30, 1, None)
+    rows = db.execute('SELECT locator_json, chars FROM deliveries WHERE call_id=? ORDER BY id',
+                      (CALL['call_id'],)).fetchall()
+    assert [json.loads(text) for text, _ in rows] == [obj, obj] and [n for _, n in rows] == [5, 25]
+    add_call(db, call_id='d' * 16, client='other', ok=False, error_code='empty_query', pieces=0, chars=0)
+    assert store.call_counts(db) == {'total': 2, 'by_client': {'other': 1, 'test-client': 1}}
+
+
+def test_record_functions_refuse_unknown_columns(db):
+    with pytest.raises(ValueError, match='unknown tool_calls columns'):
+        add_call(db, query='합성 질의')
+    with pytest.raises(ValueError, match='unknown deliveries columns'):
+        store.record_deliveries(db, 'x', [{'at': NOW, 'client': 'c', 'tool': 't', 'locator_json': {}, 'chars': 1,
+                                           'text': '합성 본문'}])
+    with pytest.raises(ValueError, match='unknown document event kind'):
+        store.add_document_event(db, None, add_document(db), None, 'locked')
+
+
+def add_named_document(db, root, name, ext='.txt', status='active', deleted_at=None):
+    path = f'C:\\synthetic\\{name}'
+    return db.execute('INSERT INTO documents(root_id, path, path_key, ext, status, first_seen_at, last_seen_at, '
+                      'deleted_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                      (root, path, os.path.normcase(path), ext, status, NOW, NOW, deleted_at)).lastrowid
+
+
+def test_documents_query_filters_pages_latest_and_indexed(db):
+    root = db.execute(r"INSERT INTO source_roots(path, added_at) VALUES('C:\synthetic', ?)", (NOW,)).lastrowid
+    a = add_named_document(db, root, 'a.txt')
+    b = add_named_document(db, root, 'b.md', '.md')
+    c = add_named_document(db, root, 'sub\\c.txt', status='deleted', deleted_at=LATER)
+    add_named_document(db, root, 'd.pdf', '.pdf', status='skipped')
+    eligible_version(db, a, 1, 'a' * 64)
+    db.execute('UPDATE versions SET superseded_at=? WHERE document_id=? AND seq=1', (LATER, a))
+    newest = eligible_version(db, a, 2, 'b' * 64)
+    eligible_version(db, b, 1, 'c' * 64)
+    eligible_version(db, c, 1, 'd' * 64)
+    store.insert_chunks(db, newest, 'cv1', [chunk_spec(1, '합성자료 하나')])
+    rows, total = store.documents_query(db, {}, 10, 0, chunk_version='cv1')
+    assert total == 2 and [r['id'] for r in rows] == [a, b]
+    assert set(rows[0]) == {'id', 'path', 'ext', 'status', 'skip_reason', 'root_id', 'first_seen_at', 'last_seen_at',
+                            'deleted_at', 'latest', 'indexed'}
+    assert rows[0]['latest']['version_id'] == newest and rows[0]['latest']['seq'] == 2
+    assert [r['indexed'] for r in rows] == [True, False]
+    assert store.documents_query(db, {}, 10, 0, chunk_version='other')[0][0]['indexed'] is False
+    everything, total = store.documents_query(db, {'status': 'all'}, 2, 1, chunk_version='cv1')
+    assert total == 4 and [r['path'] for r in everything] == ['C:\\synthetic\\b.md', 'C:\\synthetic\\d.pdf']
+    assert everything[1]['latest'] is None
+    assert [r['id'] for r in store.documents_query(db, {'status': 'deleted'}, 10, 0, chunk_version='cv1')[0]] == [c]
+    assert store.documents_query(db, {'status': 'all', 'ext': ['.md', '.pdf']}, 10, 0, chunk_version='cv1')[1] == 2
+    prefix = os.path.normcase('C:\\synthetic\\sub')
+    assert store.documents_query(db, {'status': 'all', 'path_prefix': prefix}, 10, 0, chunk_version='cv1')[1] == 1
+    changed = store.documents_query(db, {'status': 'all', 'changed_since': LATER}, 10, 0, chunk_version='cv1')
+    assert [r['id'] for r in changed[0]] == [c]  # deleted at LATER; every version was observed at NOW
+
+
+def test_document_events_query_filters_orders_and_pages(db):
+    root = db.execute(r"INSERT INTO source_roots(path, added_at) VALUES('C:\synthetic', ?)", (NOW,)).lastrowid
+    a = add_named_document(db, root, 'a.txt')
+    b = add_named_document(db, root, 'b.md', '.md')
+    va = eligible_version(db, a, 1, 'a' * 64)
+    vb = eligible_version(db, b, 1, 'b' * 64)
+    scan = db.execute("INSERT INTO scans(started_at, status, roots_json) VALUES(?, 'done', '[]')", (NOW,)).lastrowid
+    first = store.add_document_event(db, scan, a, va, 'added', '2026-10-23T09:00:00+09:00')
+    second = store.add_document_event(db, scan, b, vb, 'added', '2026-10-23T09:00:00+09:00')
+    third = store.add_document_event(db, scan, a, None, 'deleted', '2026-10-23T01:30:00+00:00')  # 10:30 +09:00
+    rows, total = store.document_events_query(db, {}, 10, 0)
+    assert total == 3 and [r['id'] for r in rows] == [third, second, first]  # newest first, by instant
+    assert set(rows[0]) == {'id', 'at', 'kind', 'doc', 'version_id', 'seq', 'sha256', 'parse_status', 'parse_error',
+                            'scan_id'}
+    assert rows[0]['doc'] == {'id': a, 'path': 'C:\\synthetic\\a.txt', 'ext': '.txt', 'status': 'active'}
+    assert rows[0]['version_id'] is None and rows[0]['seq'] is None and rows[0]['scan_id'] == scan
+    assert rows[1]['seq'] == 1 and rows[1]['sha256'] == 'b' * 64 and rows[1]['parse_status'] == 'ok'
+    assert [r['id'] for r in store.document_events_query(db, {'kinds': ['added']}, 10, 0)[0]] == [second, first]
+    assert [r['id'] for r in store.document_events_query(db, {'ext': ['.md']}, 10, 0)[0]] == [second]
+    since = store.document_events_query(db, {'since': '2026-10-23T10:00:00+09:00'}, 10, 0)[0]
+    assert [r['id'] for r in since] == [third]
+    until = store.document_events_query(db, {'until': '2026-10-23T09:30:00+09:00'}, 10, 0)[0]
+    assert [r['id'] for r in until] == [second, first]
+    page, total = store.document_events_query(db, {}, 1, 1)
+    assert total == 3 and [r['id'] for r in page] == [second]

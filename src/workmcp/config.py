@@ -11,6 +11,7 @@ another root. A root inside a sync folder is allowed with a warning.
 
 M2 adds ``[index]`` (``IndexSettings``) and ``[search]`` (``SearchSettings``), design M2 §1.3. The
 index model is a manifest name or ``"none"``; the test-only hash embedder cannot be chosen here.
+M3 adds ``[server]`` (``ServerSettings``), design M3 §1.
 """
 from __future__ import annotations
 
@@ -30,6 +31,9 @@ SOURCE_KEYS = frozenset({'path', 'exclude', 'allow_network'})
 INDEX_KEYS = frozenset({'model', 'embed_batch', 'commit_every', 'threads'})
 SEARCH_KEYS = frozenset({'lexical_candidates', 'semantic_candidates', 'max_vectors_in_memory', 'threads',
                          'model_idle_seconds'})
+SERVER_KEYS = frozenset({'response_max_chars', 'unload_tick_seconds'})
+RESPONSE_MAX_CHARS_RANGE = (4_000, 40_000)    # design M3 §4 (40,000 = tools.RESPONSE_MAX_CHARS)
+UNLOAD_TICK_RANGE = (1, 300)                  # design M3 §6.2
 NO_MODEL = 'none'  # [index] model = "none": chunks and FTS only (lexical search)
 ROOT_CODES = ('source_root_relative', 'source_root_trailing_dot_space', 'source_root_missing', 'source_root_network',
               'source_root_inside_home', 'source_root_contains_home', 'source_root_inside_repo',
@@ -83,6 +87,14 @@ class SearchSettings:
 
 
 @dataclass(frozen=True)
+class ServerSettings:
+    """``[server]`` (design M3 §1): the response budget in characters of the serialized envelope and
+    the idle-release tick of the long-lived server."""
+    response_max_chars: int = 40_000
+    unload_tick_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class SourceEntry:
     """One ``[[sources]]`` table as written (or one ``scan --root``)."""
     raw: str
@@ -98,6 +110,7 @@ class Config:
     sources: tuple[SourceEntry, ...]
     index: IndexSettings = IndexSettings()
     search: SearchSettings = SearchSettings()
+    server: ServerSettings = ServerSettings()
 
 
 @dataclass(frozen=True)
@@ -179,12 +192,28 @@ def _search_settings(table: dict) -> SearchSettings:
                                          '[search] model_idle_seconds'))
 
 
+def _in_range(value, where: str, bounds: tuple[int, int]) -> int:
+    low, high = bounds
+    if type(value) is not int or not low <= value <= high:
+        raise ConfigError(f'{where} must be an integer {low}-{high}')
+    return value
+
+
+def _server_settings(table: dict) -> ServerSettings:
+    d = ServerSettings()
+    return ServerSettings(
+        response_max_chars=_in_range(table.get('response_max_chars', d.response_max_chars),
+                                     '[server] response_max_chars', RESPONSE_MAX_CHARS_RANGE),
+        unload_tick_seconds=_in_range(table.get('unload_tick_seconds', d.unload_tick_seconds),
+                                      '[server] unload_tick_seconds', UNLOAD_TICK_RANGE))
+
+
 def parse_config(text: str, file: Path) -> Config:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f'{file} is not valid TOML ({exc})') from None
-    if unknown := set(data) - {'scan', 'sources', 'index', 'search'}:
+    if unknown := set(data) - {'scan', 'sources', 'index', 'search', 'server'}:
         raise ConfigError(f'{file}: unknown table or key {sorted(unknown)}')
     scan = data.get('scan', {})
     if not isinstance(scan, dict):
@@ -218,7 +247,8 @@ def parse_config(text: str, file: Path) -> Config:
             raise ConfigError(f'{file}: {where} allow_network must be true or false')
         entries.append(SourceEntry(item['path'], _strings(item.get('exclude', []), f'{where} exclude'), allow))
     return Config(file, True, settings, tuple(entries), _index_settings(_table(data, 'index', INDEX_KEYS, file), file),
-                  _search_settings(_table(data, 'search', SEARCH_KEYS, file)))
+                  _search_settings(_table(data, 'search', SEARCH_KEYS, file)),
+                  _server_settings(_table(data, 'server', SERVER_KEYS, file)))
 
 
 def load(home: Path) -> Config:
