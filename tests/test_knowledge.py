@@ -521,7 +521,7 @@ def test_supersede_with_old_valid_to_cuts_the_period(kb):
     assert cut['statement'] == old['statement'] and out['conflicts'] == []
     assert kb.links() == [(cut['id'], old['id'], 'supersedes', 0, None), (new['id'], cut['id'], 'supersedes', 0, None)]
     assert kb.events(cut['id']) == [('recorded', None, old['id'], 'test-client/supersede', 'call-2')]
-    assert kb.events(old['id'])[-1][:3] == ('superseded', '합성 교정', cut['id'])
+    assert kb.events(old['id'])[-1][:3] == ('superseded', '합성 교정', new['id'])
     later = kb.fact(entity, '계속', predicate='단계', valid_from='2026-10-01', valid_to='2026-12-01')['assertion']
     for bad in ('2026-10-01', '2026-09-30', '2026-12-01', '2027-01-01', '2026-13-01'):
         refused(kb, 'argument_invalid', knowledge.supersede, later['id'], reason='합성', recorded_by=BY,

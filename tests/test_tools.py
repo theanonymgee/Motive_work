@@ -1230,6 +1230,35 @@ def test_read_tools_return_entity_and_assertion_keys_and_deliver_only_quotes(kst
     assert [row['id'] for row in tight['result']['facts']] == [row['id'] for row in detail['result']['facts']]
 
 
+def test_a_cut_supersede_answers_the_old_value_before_the_cut_and_the_new_one_after(kstate, monkeypatch):
+    """Coordinator decision 2026-10-25 (design M4 §4.3 record): the cut row C stays open in the record, so
+    current knowledge gives C before old_valid_to and N from it; before the supersede only the old row."""
+    clock = ['2026-10-25T10:00:00+09:00']
+    monkeypatch.setattr(store, 'now', lambda: clock[0])
+    kb = kstate.kb
+    entity = call(kstate, 'record_entity', kind='project', name='합성 과제 31')['result']['entity']['id']
+    clock[0] = '2026-10-25T10:01:00+09:00'
+    old = call(kstate, 'record_fact', entity_id=entity, predicate='계약 상태', value='검토 중', valid_from='2026-10-01',
+               sources=[{'locator': kb.loc('notes.txt', 1), 'quote': '검토 중'}])['result']['assertion']
+    clock[0] = '2026-10-25T10:05:00+09:00'
+    out = call(kstate, 'supersede', assertion_id=old['id'], reason='합성 갱신', value='승인', old_valid_to='2026-10-20',
+               my_note=True)['result']
+    cut, new = out['cut'], out['new']
+    assert (cut['recorded_to'], new['recorded_to'], new['supersedes_id'], cut['supersedes_id']) == \
+        (None, None, cut['id'], old['id'])
+
+    def ids(**args):
+        envelope = call(kstate, 'list_knowledge', entity_id=entity, **args)
+        assert envelope['ok'], envelope
+        return [(row['id'], row['data']['value']) for row in envelope['result']['items']]
+    assert ids(as_of_valid='2026-10-10') == [(cut['id'], '검토 중')]
+    assert ids(as_of_valid='2026-10-20') == ids(as_of_valid='2026-10-25') == [(new['id'], '승인')]
+    assert sorted(ids()) == [(cut['id'], '검토 중'), (new['id'], '승인')]
+    assert ids(as_of_recorded='2026-10-25T10:03:00+09:00') == [(old['id'], '검토 중')]
+    chain = call(kstate, 'get_history', assertion_id=new['id'])['result']['chain']
+    assert [row['id'] for row in chain] == [old['id'], cut['id'], new['id']]
+
+
 def test_no_knowledge_text_in_tool_calls_deliveries_or_stderr(kstate, capsys):
     kb = kstate.kb
     text = f'{SENTINEL} 합성 본문'

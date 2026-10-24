@@ -645,8 +645,8 @@ def record(db, kind: str, *, recorded_by: str, call_id: str | None,
 
 
 CONTENT_FIELDS = {'fact': ('entity_id', 'predicate', 'value', 'unit', 'object_entity_id')}  # remake the statement
-# Events of a supersede: the old row 'superseded' (related: C or N); C 'recorded' (related: old) when cut;
-# N 'recorded' (related: its supersedes_id). Links: C -> old and N -> C, or N -> old ('supersedes').
+# Events of a supersede: the old row 'superseded' (related: N, design M4 §4.3); C 'recorded' (related: old)
+# when cut; N 'recorded' (related: its supersedes_id). Links: C -> old and N -> C, or N -> old ('supersedes').
 
 
 def supersede(db, assertion_id: int, *, reason: str, recorded_by: str, call_id: str | None,
@@ -711,7 +711,7 @@ def supersede(db, assertion_id: int, *, reason: str, recorded_by: str, call_id: 
                                               _copy_evidence(db, assertion_id))
         parent = cut_id or assertion_id
         new_id = add(spec, _statement(db, spec), parent, 'evidence' if bound else 'my_note', bound)
-        _event(db, assertion_id, now, 'superseded', reason=reason, related_id=cut_id or new_id,
+        _event(db, assertion_id, now, 'superseded', reason=reason, related_id=new_id,
                recorded_by=recorded_by, call_id=call_id)
         cleared = _resolve(db, assertion_id, new_id, now, recorded_by, call_id)
         return cut_id, new_id, bound, conflicts, duplicates, cleared
