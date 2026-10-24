@@ -137,7 +137,7 @@ def by_chunk(db: sqlite3.Connection, chunk_id: int, *, context_units: int = 0,
     return {'doc': doc, 'version': version,
             'chunk': {'id': chunk_id, 'ordinal': ordinal, 'unit_first': first, 'unit_last': last,
                       'chunk_version': chunk_version},
-            'pieces': pieces, 'context_before': before, 'context_after': after}
+            'context_before': before, 'pieces': pieces, 'context_after': after}  # reading order (tools.pieces_of)
 
 
 def by_locator(db: sqlite3.Connection, obj: Mapping, *, context_units: int = 0,
@@ -159,7 +159,7 @@ def by_locator(db: sqlite3.Connection, obj: Mapping, *, context_units: int = 0,
     doc, version, facts = _version(db, version_id)
     pieces = [_piece(facts, obj['unit'], text, obj['chars'], max_chars)]
     before, after = _context(db, version_id, ordinal, ordinal, context_units, max_chars, facts)
-    return {'doc': doc, 'version': version, 'chunk': None, 'pieces': pieces, 'context_before': before,
+    return {'doc': doc, 'version': version, 'chunk': None, 'context_before': before, 'pieces': pieces,
             'context_after': after}
 
 

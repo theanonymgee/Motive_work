@@ -14,15 +14,20 @@ from workmcp import paths, store, tools
 
 TABLES = {'schema_migrations', 'source_roots', 'documents', 'versions', 'units', 'chunks', 'chunk_vectors',
           'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans', 'meta', 'index_runs',
-          'tool_calls', 'document_events'}
+          'tool_calls', 'document_events', 'assertion_events'}
 TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_status_guard', 'assertions_no_delete',
             'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace',
             'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq',
             'tool_calls_no_update', 'tool_calls_no_delete', 'tool_calls_no_replace', 'tool_calls_no_replace_call',
             'deliveries_no_update', 'deliveries_no_delete', 'deliveries_no_replace',
-            'document_events_no_update', 'document_events_no_delete', 'document_events_no_replace'}
+            'document_events_no_update', 'document_events_no_delete', 'document_events_no_replace',
+            'assertions_v3_update_guard', 'assertions_v3_dates', 'assertions_v3_shape', 'entities_update_guard',
+            'entities_no_delete', 'entities_no_replace', 'entities_no_replace_name', 'links_update_guard',
+            'links_no_delete', 'links_no_replace', 'assertion_events_no_update', 'assertion_events_no_delete',
+            'assertion_events_no_replace'}
 INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunks_text', 'tool_calls_at', 'deliveries_call',
-           'document_events_at', 'document_events_doc'}
+           'document_events_at', 'document_events_doc', 'assertions_subject', 'assertions_object',
+           'assertions_supersedes', 'links_from', 'links_to', 'assertion_events_assertion'}
 H = '0' * 64
 NOW = '2026-10-23T09:00:00+09:00'
 LATER = '2026-10-23T10:00:00+09:00'
@@ -40,15 +45,15 @@ def names(db, kind):
     return {r[0] for r in db.execute('SELECT name FROM sqlite_master WHERE type=?', (kind,))}
 
 
-def test_empty_db_has_schema_v1_and_v2(db):
+def test_empty_db_has_schema_v1_v2_and_v3(db):
     assert TABLES <= names(db, 'table')
-    assert TRIGGERS <= names(db, 'trigger')
+    assert TRIGGERS == names(db, 'trigger')
     assert INDEXES <= names(db, 'index')
     assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
     assert db.execute('PRAGMA foreign_keys').fetchone()[0] == 1
     rows = db.execute('SELECT version, name FROM schema_migrations').fetchall()
-    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2')]
-    assert store.SCHEMA_VERSION == 2
+    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2'), (3, 'knowledge_v3')]
+    assert store.SCHEMA_VERSION == 3
     assert all(db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] == 0 for t in TABLES - {'schema_migrations'})
     if store.fts5_available():
         assert 'chunks_fts' in names(db, 'table')
@@ -59,7 +64,7 @@ def test_migrate_is_idempotent_and_detects_edited_migration(db, monkeypatch):
     monkeypatch.setattr(store, 'MIGRATIONS', [(1, 'initial_schema_v1', store.SCHEMA_V1 + '\n-- edited\n')])
     with pytest.raises(RuntimeError, match='checksum changed'):
         store.migrate(db)
-    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 2
+    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 3
 
 
 def test_statement_splitter_keeps_trigger_bodies():
@@ -94,7 +99,7 @@ def test_content_returning_to_an_earlier_hash_is_a_new_version(db):
 def insert_assertion(db, statement='합성 사실 A', supersedes=None, status='active'):
     cur = db.execute(
         "INSERT INTO assertions(kind, statement, recorded_from, status, supersedes_id, source_kind, recorded_by) "
-        "VALUES('fact', ?, ?, ?, ?, 'my_note', 'test/record_fact')", (statement, NOW, status, supersedes))
+        "VALUES('decision', ?, ?, ?, ?, 'my_note', 'test/record_fact')", (statement, NOW, status, supersedes))
     return cur.lastrowid
 
 
@@ -181,7 +186,7 @@ def test_assertion_cannot_supersede_itself(db):
     insert_assertion(db)
     with pytest.raises(sqlite3.IntegrityError):
         db.execute("INSERT INTO assertions(id, kind, statement, recorded_from, status, supersedes_id, source_kind, "
-                   "recorded_by) VALUES(50, 'fact', '합성', ?, 'active', 50, 'my_note', 't')", (NOW,))
+                   "recorded_by) VALUES(50, 'decision', '합성', ?, 'active', 50, 'my_note', 't')", (NOW,))
     with pytest.raises(sqlite3.IntegrityError):  # auto id predicted by the writer
         insert_assertion(db, '합성', supersedes=db.execute('SELECT MAX(id) + 1 FROM assertions').fetchone()[0])
 
@@ -256,7 +261,7 @@ def test_assertion_cannot_be_replaced(db, verb, key_column, closed):
     before = full_row(db, 'assertions', assertion)
     columns = ASSERTION_COLUMNS.replace('id', key_column, 1)
     with pytest.raises(sqlite3.IntegrityError, match='append-only'):
-        db.execute(f"{verb} assertions({columns}) VALUES(?, 'fact', '다시 쓴 내용', ?, NULL, 'active', NULL, "
+        db.execute(f"{verb} assertions({columns}) VALUES(?, 'decision', '다시 쓴 내용', ?, NULL, 'active', NULL, "
                    "'my_note', 'test/replace')", (assertion, NOW))
     assert full_row(db, 'assertions', assertion) == before
     assert db.execute('SELECT COUNT(*) FROM assertions').fetchone()[0] == 1
@@ -280,7 +285,7 @@ def test_evidence_cannot_be_replaced(db, verb):
 @pytest.mark.parametrize('sql', [
     "UPDATE OR REPLACE assertions SET id=? WHERE id=?",
     "INSERT INTO assertions(id, kind, statement, recorded_from, status, source_kind, recorded_by) "
-    "SELECT ?, 'fact', '다시', recorded_from, 'active', 'my_note', 't' FROM assertions WHERE id=? "
+    "SELECT ?, 'decision', '다시', recorded_from, 'active', 'my_note', 't' FROM assertions WHERE id=? "
     "ON CONFLICT(id) DO UPDATE SET status='active', recorded_to=NULL"])
 def test_other_conflict_forms_cannot_rewrite_assertions(db, sql):
     closed, other = insert_assertion(db, '합성 A'), insert_assertion(db, '합성 B')
@@ -302,9 +307,9 @@ def test_inserts_without_an_existing_id_still_pass(db):
     version = add_version(db, add_document(db), 1, H)
     first = insert_assertion(db, '합성 A')
     second = db.execute("INSERT OR REPLACE INTO assertions(kind, statement, recorded_from, status, source_kind, "
-                        "recorded_by) VALUES('fact', '합성 B', ?, 'active', 'my_note', 't')", (NOW,)).lastrowid
+                        "recorded_by) VALUES('decision', '합성 B', ?, 'active', 'my_note', 't')", (NOW,)).lastrowid
     third = db.execute("INSERT INTO assertions(id, kind, statement, recorded_from, status, source_kind, recorded_by) "
-                       "VALUES(100, 'fact', '합성 C', ?, 'active', 'my_note', 't')", (NOW,)).lastrowid
+                       "VALUES(100, 'decision', '합성 C', ?, 'active', 'my_note', 't')", (NOW,)).lastrowid
     assert [first, third] == [1, 100] and second == 2
     add_evidence(db, first, version)
     db.execute(f"REPLACE INTO evidence({EVIDENCE_COLUMNS}) VALUES(NULL, ?, ?, '{{}}', '합성 인용 2', ?)",
@@ -325,7 +330,7 @@ def test_status_tool_reads_without_migrating(tmp_path):
     response = tools.status(home)
     assert response['ok'] and response['delivered_sources'] == []
     result = response['result']
-    assert result['schema_version'] == 2
+    assert result['schema_version'] == 3
     assert result['db'] == {'documents': 0, 'versions': 0, 'chunks': 0, 'vectors': 0}
     assert result['model']['name'] == 'bge-m3' and result['model']['available'] is False
 
@@ -706,15 +711,16 @@ def test_migration_v2_upgrades_a_v1_store_in_place(tmp_path, monkeypatch):
     monkeypatch.undo()
     upgraded = store.open_home(home)
     try:
-        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2]
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3]
         assert upgraded.execute('SELECT chars, call_id FROM deliveries').fetchall() == [(3, '')]
         assert store.migrate(upgraded) == []
     finally:
         upgraded.close()
 
 
-def test_migration_v2_applies_once_under_two_processes(tmp_path):
-    """Two serve processes may start together; BEGIN IMMEDIATE lets one apply v2 (design M3 §7)."""
+def test_migrations_apply_once_under_two_processes(tmp_path):
+    """Two serve processes may start together; BEGIN IMMEDIATE lets one apply v2 and v3 (design M3 §7,
+    M4 §2.3)."""
     home = tmp_path/'home'
     code = ('import sys\nfrom workmcp import paths, store\n'
             'home = paths.ensure_home(paths.validate_home(sys.argv[1], {}, None))\n'
@@ -725,10 +731,10 @@ def test_migration_v2_applies_once_under_two_processes(tmp_path):
                              text=True, env=env) for _ in range(2)]
     outputs = [run.communicate(timeout=120) for run in runs]
     assert [run.returncode for run in runs] == [0, 0], outputs
-    assert [out.strip() for out, _ in outputs] == ['2', '2']
+    assert [out.strip() for out, _ in outputs] == ['3', '3']
     check = sqlite3.connect(paths.db_path(home))
     try:
-        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,)]
+        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,)]
     finally:
         check.close()
 
@@ -897,3 +903,193 @@ def test_the_read_only_check_still_refuses_a_changed_checksum(tmp_path):
             store.migrate(db)
     finally:
         db.close()
+
+
+# ---- migration v3: knowledge columns, assertion events, entity/link guards (design M4 §2.3) --------
+
+def add_entity(db, name='합성 과제', kind='project'):
+    return db.execute("INSERT INTO entities(kind, name, created_at, created_by) VALUES(?, ?, ?, 'test/record_entity')",
+                      (kind, name, NOW)).lastrowid
+
+
+def add_fact(db, entity, predicate='담당', value='합성 값', valid_from=None, valid_to=None, object_entity=None):
+    data = json.dumps({'unit': None, 'value': value}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return db.execute(
+        "INSERT INTO assertions(kind, entity_id, predicate, object_entity_id, statement, data_json, valid_from, "
+        "valid_to, recorded_from, status, source_kind, recorded_by) "
+        "VALUES('fact', ?, ?, ?, '합성 사실', ?, ?, ?, ?, 'active', 'my_note', 'test/record_fact')",
+        (entity, predicate, object_entity, data, valid_from, valid_to, NOW)).lastrowid
+
+
+def add_link(db, source, target, relation='conflicts'):
+    return db.execute("INSERT INTO links(from_id, to_id, relation, recorded_at, recorded_by) "
+                      "VALUES(?, ?, ?, ?, 'test/record_fact')", (source, target, relation, NOW)).lastrowid
+
+
+def add_assertion_event(db, assertion, kind='recorded'):
+    return db.execute("INSERT INTO assertion_events(assertion_id, at, kind, recorded_by, call_id) "
+                      "VALUES(?, ?, ?, 'test/record_fact', 'c0')", (assertion, NOW, kind)).lastrowid
+
+
+@pytest.fixture
+def known(db):
+    """Two entities, two facts about the first, a conflict link between them and one event."""
+    first, second = add_entity(db, '합성 과제 A'), add_entity(db, '합성 사람 B', 'person')
+    fact = add_fact(db, first, valid_from='2026-10-01')
+    other = add_fact(db, first, value='다른 합성 값', object_entity=second)
+    return {'entity': first, 'person': second, 'fact': fact, 'other': other, 'link': add_link(db, fact, other),
+            'event': add_assertion_event(db, fact)}
+
+
+def knowledge_rows(db):
+    return {table: db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall()
+            for table in ('entities', 'assertions', 'links', 'assertion_events')}
+
+
+def test_migration_v3_adds_knowledge_columns_tables_triggers_indexes(db):
+    assert store.SCHEMA_VERSION == 3 and store.MIGRATIONS[2][:2] == (3, 'knowledge_v3')
+    assert columns(db, 'assertions')[-2:] == ['predicate', 'object_entity_id']
+    assert columns(db, 'assertion_events') == ['id', 'assertion_id', 'at', 'kind', 'reason', 'related_id',
+                                               'recorded_by', 'call_id']
+    keys = {(r[3], r[2], r[4]) for r in db.execute('PRAGMA foreign_key_list(assertions)')}
+    assert ('object_entity_id', 'entities', 'id') in keys
+    assert {(r[3], r[2]) for r in db.execute('PRAGMA foreign_key_list(assertion_events)')} == {
+        ('assertion_id', 'assertions'), ('related_id', 'assertions')}
+    unique = {table: [[c[2] for c in db.execute(f'PRAGMA index_info({r[1]})')]
+                      for r in db.execute(f'PRAGMA index_list({table})') if r[2]]
+              for table in ('entities', 'links', 'assertion_events')}
+    # every unique key is guarded against REPLACE: entities by id and (kind, name), the others by id only
+    assert unique == {'entities': [['kind', 'name']], 'links': [], 'assertion_events': []}
+    assert [[c[2] for c in db.execute('PRAGMA index_info(assertions_subject)')]] == [['entity_id', 'kind', 'predicate']]
+
+
+def test_migration_v3_upgrades_a_v2_store_in_place(tmp_path, monkeypatch):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    monkeypatch.setattr(store, 'MIGRATIONS', store.MIGRATIONS[:2])
+    old = store.open_home(home)
+    before = old.execute("INSERT INTO assertions(kind, statement, recorded_from, status, source_kind, recorded_by) "
+                         "VALUES('fact', '합성 v2 사실', ?, 'active', 'my_note', 't')", (NOW,)).lastrowid
+    old.close()
+    monkeypatch.undo()
+    upgraded = store.open_home(home)
+    try:
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3]
+        assert upgraded.execute('SELECT predicate, object_entity_id FROM assertions WHERE id=?', (before,)).fetchone() \
+            == (None, None)
+        # a row from before v3 can still be closed (the shape trigger checks inserts only)
+        upgraded.execute("UPDATE assertions SET status='withdrawn', recorded_to=?, change_reason='합성' WHERE id=?",
+                         (LATER, before))
+        assert store.migrate(upgraded) == []
+    finally:
+        upgraded.close()
+
+
+FACT_INSERT = ("INSERT INTO assertions(kind, entity_id, predicate, object_entity_id, statement, valid_from, valid_to, "
+               "recorded_from, status, source_kind, recorded_by) VALUES(?, ?, ?, ?, '합성', ?, ?, ?, 'active', "
+               "'my_note', 't')")
+
+
+def insert_shaped(db, kind, entity, predicate, object_entity=None, valid_from=None, valid_to=None):
+    return db.execute(FACT_INSERT, (kind, entity, predicate, object_entity, valid_from, valid_to, NOW)).lastrowid
+
+
+SHAPE = 'assertion shape'
+DATES = 'valid_from/valid_to'
+
+
+@pytest.mark.parametrize('case, match', [
+    (lambda db, k: insert_shaped(db, 'fact', k['entity'], None), SHAPE),                       # fact without predicate
+    (lambda db, k: insert_shaped(db, 'fact', None, '담당'), SHAPE),                             # fact without subject
+    (lambda db, k: insert_shaped(db, 'todo', None, '담당'), SHAPE),                             # task with predicate
+    (lambda db, k: insert_shaped(db, 'decision', None, None, k['person']), SHAPE),              # decision with object
+    (lambda db, k: insert_shaped(db, 'fact', k['entity'], '담당', valid_from='2026-9-1'), DATES),
+    (lambda db, k: insert_shaped(db, 'fact', k['entity'], '담당', valid_to='2026-10-01T00:00:00'), DATES),
+    (lambda db, k: insert_shaped(db, 'fact', k['entity'], '담당', valid_from='2026-10-01', valid_to='2026-10-01'), DATES),
+    (lambda db, k: insert_shaped(db, 'fact', k['entity'], '담당', valid_from='2026-10-02', valid_to='2026-10-01'), DATES),
+    (lambda db, k: insert_shaped(db, 'decision', None, None, valid_from='어제'), DATES),
+    (lambda db, k: insert_shaped(db, 'fact', k['entity'], '담당', 999), 'FOREIGN KEY'),         # no such object entity
+    (lambda db, k: db.execute("UPDATE assertions SET predicate='담당자' WHERE id=?", (k['fact'],)), 'append-only'),
+    (lambda db, k: db.execute('UPDATE assertions SET predicate=NULL WHERE id=?', (k['fact'],)), 'append-only'),
+    (lambda db, k: db.execute('UPDATE assertions SET object_entity_id=? WHERE id=?', (k['entity'], k['other'])),
+     'append-only'),
+    (lambda db, k: db.execute("UPDATE entities SET name='합성 새 이름' WHERE id=?", (k['entity'],)), 'append-only'),
+    (lambda db, k: db.execute("UPDATE entities SET kind='org' WHERE id=?", (k['entity'],)), 'append-only'),
+    (lambda db, k: db.execute("UPDATE entities SET created_by='x', created_at=? WHERE id=?", (LATER, k['entity'])),
+     'append-only'),
+    (lambda db, k: db.execute('UPDATE entities SET id=50 WHERE id=?', (k['entity'],)), 'append-only'),
+    (lambda db, k: db.execute('DELETE FROM entities WHERE id=?', (k['person'],)), 'append-only'),
+    (lambda db, k: db.execute("REPLACE INTO entities(id, kind, name, created_at, created_by) "
+                              "VALUES(?, 'project', '합성 덮어쓰기', ?, 't')", (k['entity'], NOW)), 'append-only'),
+    (lambda db, k: db.execute("INSERT OR REPLACE INTO entities(kind, name, created_at, created_by) "
+                              "VALUES('project', '합성 과제 A', ?, 't')", (NOW,)), 'append-only'),
+    (lambda db, k: db.execute("INSERT INTO entities(kind, name, created_at, created_by) "
+                              "VALUES('project', '합성 과제 A', ?, 't')", (NOW,)), 'append-only'),
+    (lambda db, k: [db.execute('UPDATE entities SET merged_into=? WHERE id=?', (k['entity'], k['person'])),
+                    db.execute('UPDATE entities SET merged_into=NULL WHERE id=?', (k['person'],))], 'append-only'),
+    (lambda db, k: db.execute("UPDATE links SET relation='supersedes' WHERE id=?", (k['link'],)), 'append-only'),
+    (lambda db, k: db.execute('UPDATE links SET to_id=from_id WHERE id=?', (k['link'],)), 'append-only'),
+    (lambda db, k: db.execute("UPDATE links SET note='합성' WHERE id=?", (k['link'],)), 'append-only'),
+    (lambda db, k: db.execute("UPDATE links SET recorded_by='x' WHERE id=?", (k['link'],)), 'append-only'),
+    (lambda db, k: db.execute('UPDATE links SET resolved_by_id=? WHERE id=?', (k['fact'], k['link'])), 'append-only'),
+    (lambda db, k: [db.execute('UPDATE links SET resolved_at=?, resolved_by_id=? WHERE id=?', (LATER, k['fact'], k['link'])),
+                    db.execute('UPDATE links SET resolved_at=NULL, resolved_by_id=NULL WHERE id=?', (k['link'],))],
+     'append-only'),
+    (lambda db, k: [db.execute('UPDATE links SET resolved_at=? WHERE id=?', (LATER, k['link'])),
+                    db.execute('UPDATE links SET resolved_by_id=? WHERE id=?', (k['other'], k['link']))], 'append-only'),
+    (lambda db, k: db.execute('DELETE FROM links WHERE id=?', (k['link'],)), 'append-only'),
+    (lambda db, k: db.execute("REPLACE INTO links(id, from_id, to_id, relation, recorded_at, recorded_by) "
+                              "VALUES(?, ?, ?, 'supersedes', ?, 't')", (k['link'], k['other'], k['fact'], NOW)),
+     'append-only'),
+    (lambda db, k: db.execute("UPDATE assertion_events SET reason='합성' WHERE id=?", (k['event'],)), 'append-only'),
+    (lambda db, k: db.execute('DELETE FROM assertion_events WHERE id=?', (k['event'],)), 'append-only'),
+    (lambda db, k: db.execute("INSERT OR REPLACE INTO assertion_events(id, assertion_id, at, kind, recorded_by) "
+                              "VALUES(?, ?, ?, 'retracted', 't')", (k['event'], k['fact'], NOW)), 'append-only'),
+    (lambda db, k: db.execute("INSERT INTO assertion_events(assertion_id, at, kind, recorded_by) "
+                              "VALUES(?, ?, 'edited', 't')", (k['fact'], NOW)), 'CHECK'),
+])
+def test_v3_guards_refuse_and_leave_every_row_as_it_was(db, known, case, match):
+    """The refusals of design M4 §2.3 (and the design probe of 2026-10-25); a refused statement inside a
+    transaction keeps every knowledge row as it was."""
+    before = knowledge_rows(db)
+    db.execute('BEGIN')
+    with pytest.raises(sqlite3.IntegrityError, match=match):
+        case(db, known)
+    db.execute('ROLLBACK')
+    assert knowledge_rows(db) == before
+
+
+def test_v3_allows_what_the_knowledge_writer_needs(db, known):
+    decision = insert_shaped(db, 'decision', None, None, valid_from='2026-10-25')           # no subject
+    task = insert_shaped(db, 'todo', known['entity'], None, valid_from='2026-10-25', valid_to='2026-11-01')
+    fact = insert_shaped(db, 'fact', known['entity'], '예산', valid_from='2026-01-01', valid_to='2026-12-31')
+    assert decision and task and fact
+    db.execute("UPDATE assertions SET status='conflict' WHERE id IN (?, ?)", (known['fact'], known['other']))
+    db.execute("UPDATE entities SET aliases_json='[\"A\"]', note='합성 메모' WHERE id=?", (known['entity'],))
+    db.execute("UPDATE entities SET aliases_json='[\"A\",\"에이\"]', note='합성 메모 2' WHERE id=?", (known['entity'],))
+    db.execute('UPDATE entities SET merged_into=? WHERE id=?', (known['entity'], known['person']))  # once (M5)
+    db.execute('UPDATE links SET resolved_at=?, resolved_by_id=? WHERE id=?', (LATER, known['other'], known['link']))
+    db.execute("UPDATE assertions SET status='withdrawn', recorded_to=?, change_reason='합성 철회' WHERE id=?",
+               (LATER, known['other']))
+    db.execute("UPDATE assertions SET status='active' WHERE id=?", (known['fact'],))
+    add_assertion_event(db, known['other'], 'retracted')
+    add_assertion_event(db, known['fact'], 'conflict_cleared')
+    add_link(db, fact, known['fact'], 'supersedes')
+    assert db.execute('SELECT aliases_json, note, merged_into FROM entities ORDER BY id').fetchall() == [
+        ('["A","에이"]', '합성 메모 2', None), ('[]', None, known['entity'])]
+    assert db.execute('SELECT resolved_at, resolved_by_id FROM links WHERE id=?', (known['link'],)).fetchone() == \
+        (LATER, known['other'])
+
+
+def test_knowledge_counts_for_status(db, known):
+    assert store.knowledge_counts(db) == {'entities': 2, 'assertions': {'active': 2, 'conflict': 0, 'withdrawn': 0,
+                                                                        'superseded': 0},
+                                          'tasks_open': 0, 'evidence': 0, 'events': 1}
+    for state in ('open', 'open', 'done'):
+        db.execute("INSERT INTO assertions(kind, statement, data_json, recorded_from, status, source_kind, recorded_by) "
+                   "VALUES('todo', '합성 할 일', ?, ?, 'active', 'my_note', 't')", (json.dumps({'state': state}), NOW))
+    db.execute("UPDATE assertions SET status='withdrawn', recorded_to=?, change_reason='합성' WHERE id=?",
+               (LATER, known['other']))
+    counts = store.knowledge_counts(db)
+    assert counts['tasks_open'] == 2 and counts['assertions'] == {'active': 4, 'conflict': 0, 'withdrawn': 1,
+                                                                  'superseded': 0}
+    assert set(counts) == tools.KNOWLEDGE_STATUS_KEYS

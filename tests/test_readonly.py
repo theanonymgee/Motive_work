@@ -191,7 +191,7 @@ def test_scan_and_verify_never_write_to_sources(tmp_path):
 
 
 # Static layer (design §4.2): no write API in the modules that touch sources.
-READONLY_MODULES = ('collect.py', 'binding.py', 'parsers')
+READONLY_MODULES = ('collect.py', 'binding.py', 'parsers', 'knowledge.py', 'knowledge_query.py')  # M4 §8.1
 WRITE_NAMES = frozenset({'write_text', 'write_bytes', 'touch', 'unlink', 'rename', 'rmdir', 'mkdir', 'makedirs',
                          'removedirs', 'chmod', 'utime', 'truncate', 'link', 'symlink', 'copyfile', 'copy2',
                          'copytree', 'move', 'rmtree', 'mkstemp', 'mkdtemp', 'NamedTemporaryFile', 'TemporaryFile',
@@ -319,7 +319,7 @@ def test_collector_and_parsers_have_no_write_api():
     package = ROOT/'src'/'workmcp'
     names = {p.relative_to(package).as_posix() for p in readonly_sources()}
     assert {'collect.py', 'binding.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py',
-            'parsers/pdf.py', 'parsers/hwp.py'} <= names
+            'parsers/pdf.py', 'parsers/hwp.py', 'knowledge.py', 'knowledge_query.py'} <= names
     offenders = {name: v for p in readonly_sources()
                  if (v := write_api_violations(name := p.relative_to(package).as_posix(), p.read_text(encoding='utf-8')))}
     assert offenders == {}

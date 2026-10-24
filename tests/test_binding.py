@@ -203,7 +203,7 @@ def add_evidence(db, version_id, quote, *, tamper=None):
     if tamper:
         obj = tamper(obj)
     assertion = db.execute("INSERT INTO assertions(kind, statement, recorded_from, status, source_kind, recorded_by) "
-                           "VALUES('fact', '합성 사실', '2026-10-23T09:00:00+09:00', 'active', 'evidence', 'test')"
+                           "VALUES('decision', '합성 사실', '2026-10-23T09:00:00+09:00', 'active', 'evidence', 'test')"
                            ).lastrowid
     db.execute('INSERT INTO evidence(assertion_id, version_id, locator_json, quote, quote_sha256) VALUES(?,?,?,?,?)',
                (assertion, version_id, json.dumps(obj, ensure_ascii=False), quote,

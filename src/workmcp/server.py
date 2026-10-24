@@ -1,6 +1,7 @@
 """MCP stdio transport adapter; business behavior lives in ``tools.py`` (design M0 §1.1, M3 §1, §6).
 
-Five read tools, each an ``async def`` without ``await`` (the SDK runs a sync tool on a worker
+Fifteen tools (the five read tools of M3, six knowledge writers and four knowledge readers of M4), each
+an ``async def`` without ``await`` (the SDK runs a sync tool on a worker
 thread and every request in its own task; an async tool runs to the end on the event loop thread,
 so tool calls never overlap and ``search.Engine`` needs no lock). Every tool returns one string,
 the compact JSON envelope (``structured_output=False``: the SDK sends it as one text content as is).
@@ -13,6 +14,11 @@ The call log never holds a call up (review M3-1): its write waits at most ``LOG_
 store (a running ``scan`` keeps a write transaction open) and a call it could not write stays in a
 queue in this process's memory, written by the next call or the ticker. Entries still queued when
 the server stops are lost; their number goes to stderr.
+
+Knowledge writes use a second write connection (``know_db``, busy timeout ``KNOWLEDGE_BUSY_MS``): a
+write must not be lost, so it waits up to 5 s for the store and otherwise answers ``store_busy`` with
+nothing written (design M4 §8.2). ``handle`` gives the writers ``recorded_by = "<client>/<tool>"`` and
+the call id through ``ServerState.client`` and ``ServerState.call_id`` (set before each call).
 
 Integer and boolean arguments are strict (``StrictInt``/``StrictBool``): the SDK refuses ``true`` or
 ``2.0`` for an integer with its argument validation error (review L1) instead of converting them.
@@ -39,7 +45,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from pydantic import StrictBool, StrictInt
 
-from . import __version__, config, locator, paths, search, snippet, store, tools
+from . import __version__, config, knowledge, locator, paths, search, snippet, store, tools
 
 LOG = logging.getLogger('workmcp.server')
 LOG_FORMAT = '%(asctime)s %(name)s %(levelname)s %(message)s'
@@ -51,6 +57,7 @@ LOG_DELAYED_NOTICE = ('로컬 전달 기록(deliveries)을 대기열에 두었�
                       '서버가 그 전에 끝나면 잃을 수 있음')
 LOG_BUSY_MS = 200           # the call log's busy_timeout: a scan's write transaction never holds a call up
 LOG_QUEUE_MAX = 10_000      # calls kept in memory while the store is busy; older ones are dropped (counted)
+KNOWLEDGE_BUSY_MS = 5000    # the knowledge write connection's busy_timeout (design M4 §8.2)
 MODEL_LOADED_NOTICE = '의미 검색 모델을 이 호출에서 처음 로드했습니다(+{} ms); 다음 질의부터 빠릅니다'
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f]')
 
@@ -58,26 +65,34 @@ _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f]')
 @dataclass
 class ServerState:
     """What one server process keeps: the search engine, the write connection for the call log
-    (None: calls are not logged, tests only), the response budget and the idle-release tick."""
+    (None: calls are not logged, tests only), the knowledge write connection (None: tests without
+    writes), the response budget, the idle-release tick, and the client name and call id of the call
+    being handled (``handle`` sets them; the knowledge writers read them)."""
     home: Path
     engine: search.Engine
     write_db: sqlite3.Connection | None = None
+    know_db: sqlite3.Connection | None = None
     budget: int = tools.RESPONSE_MAX_CHARS - tools.NOTICE_RESERVE
     tick: float = 30.0
     started_at: str = field(default_factory=store.now)
     unloads: int = 0
     pending: list = field(default_factory=list)   # (tool_calls row, deliveries rows) not written yet
     log_dropped: int = 0
+    client: str = UNKNOWN_CLIENT
+    call_id: str | None = None
 
 
 def make_state(home: Path, *, engine: search.Engine | None = None, write_db: sqlite3.Connection | None = None,
-               settings: config.Config | None = None) -> ServerState:
+               know_db: sqlite3.Connection | None = None, settings: config.Config | None = None) -> ServerState:
     """State from ``<home>/config.toml`` (raises ``config.ConfigError``); ``engine`` is injected by
     tests (``HashEmbedder`` factory), else the manifest model, loaded on first semantic use."""
     settings = settings or config.load(home)
     if write_db is not None:
         write_db.execute(f'PRAGMA busy_timeout={LOG_BUSY_MS}')
+    if know_db is not None:
+        know_db.execute(f'PRAGMA busy_timeout={KNOWLEDGE_BUSY_MS}')
     return ServerState(home=Path(home), engine=engine or search.Engine(home, settings.search), write_db=write_db,
+                       know_db=know_db,
                        budget=settings.server.response_max_chars - tools.NOTICE_RESERVE,
                        tick=float(settings.server.unload_tick_seconds))
 
@@ -97,14 +112,31 @@ def client_of(ctx) -> tuple[str, str]:
     return _clean(getattr(info, 'name', None)) or UNKNOWN_CLIENT, _clean(getattr(info, 'version', None))
 
 
-# Each takes the state and the tool arguments and returns an envelope.
+def _writer(tool: str, function):
+    """A knowledge writer on the knowledge write connection with ``recorded_by = "<client>/<tool>"`` and the
+    call id ``handle`` set (design M4 §7.2)."""
+    return lambda st, **args: function(st.know_db, recorded_by=f'{st.client}/{tool}', call_id=st.call_id, **args)
+
+
+# Each takes the state (positionally) and the tool arguments and returns an envelope. The first parameter
+# is not named ``state``: record_task, supersede and list_knowledge have an argument of that name.
 TOOLS = {
-    'search': lambda state, **args: tools.search(state.home, state.engine, **args),
-    'get_snippet': lambda state, **args: tools.get_snippet(state.home, **args),
-    'list_documents': lambda state, **args: tools.list_documents(state.home, **args),
-    'recent_changes': lambda state, **args: tools.recent_changes(state.home, **args),
-    'status': lambda state, **args: tools.status(state.home, state.engine, started_at=state.started_at,
-                                                 unloads=state.unloads, pending=len(state.pending)),
+    'search': lambda st, **args: tools.search(st.home, st.engine, **args),
+    'get_snippet': lambda st, **args: tools.get_snippet(st.home, **args),
+    'list_documents': lambda st, **args: tools.list_documents(st.home, **args),
+    'recent_changes': lambda st, **args: tools.recent_changes(st.home, **args),
+    'status': lambda st, **args: tools.status(st.home, st.engine, started_at=st.started_at,
+                                              unloads=st.unloads, pending=len(st.pending)),
+    'record_entity': _writer('record_entity', tools.record_entity),
+    'record_fact': _writer('record_fact', tools.record_fact),
+    'record_decision': _writer('record_decision', tools.record_decision),
+    'record_task': _writer('record_task', tools.record_task),
+    'supersede': _writer('supersede', tools.supersede),
+    'retract': _writer('retract', tools.retract),
+    'find_entity': lambda st, **args: tools.find_entity(st.home, **args),
+    'get_entity': lambda st, **args: tools.get_entity(st.home, **args),
+    'list_knowledge': lambda st, **args: tools.list_knowledge(st.home, **args),
+    'get_history': lambda st, **args: tools.get_history(st.home, **args),
 }
 
 
@@ -177,12 +209,15 @@ def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -
     """Run one tool call and return the serialized envelope (never raises for an ordinary error)."""
     began = time.perf_counter()
     call_id = os.urandom(8).hex()
+    state.client, state.call_id = client[0], call_id  # the knowledge writers' recorded_by and call id
     try:
         unload_if_idle(state)
         loads_before = state.engine.loads
         envelope = TOOLS[tool](state, **args)
         envelope = tools.fit(envelope, tools.SHRINK[tool], state.budget)
         _annotate_engine(envelope, state.engine, loads_before)
+    except knowledge.KnowledgeError as exc:  # argument names, numbers and labels only, never text
+        envelope = tools.error(exc.code, exc.message, retryable=exc.retryable)
     except search.SearchError as exc:
         envelope = tools.error(exc.code, exc.message)
     except locator.LocatorError as exc:  # a fixed code (shape, hash, range, text mismatch), no text
@@ -243,7 +278,7 @@ def _lifespan(state: ServerState):
 
 
 def build_server(home: Path, *, engine: search.Engine | None = None, state: ServerState | None = None) -> MCPServer:
-    """The MCP server with the five read tools; ``server.workmcp_state`` is its ``ServerState``."""
+    """The MCP server with the fifteen tools; ``server.workmcp_state`` is its ``ServerState``."""
     state = state or make_state(home, engine=engine)
     server = MCPServer('workmcp', version=__version__, instructions=INSTRUCTIONS, lifespan=_lifespan(state))
 
@@ -299,8 +334,140 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
         virtualization of the data home, tool calls per client. Returns no document text."""
         return handle(state, 'status', {}, client_of(ctx))
 
+    _knowledge_tools(server, state)
     server.workmcp_state = state
     return server
+
+
+def _knowledge_tools(server: MCPServer, state: ServerState) -> None:
+    """The ten knowledge tools (design M4 §6). Several have an argument named ``state`` (a task state), so
+    the bodies call ``answer``, which holds the ``ServerState``."""
+
+    def answer(tool: str, args: dict, ctx) -> str:
+        return handle(state, tool, args, client_of(ctx))
+
+    @server.tool(name='record_entity', structured_output=False)
+    async def record_entity_tool(kind: str, name: str, aliases: list[str] | None = None, note: str | None = None,
+                                 ctx: Context | None = None) -> str:
+        """Record a person, project, customer, org, term or other entity (kind) by name, or add aliases to the
+        existing one with the same kind and name (never merged automatically). Returns no document text."""
+        return answer('record_entity', {'kind': kind, 'name': name, 'aliases': aliases, 'note': note}, ctx)
+
+    @server.tool(name='record_fact', structured_output=False)
+    async def record_fact_tool(entity_id: StrictInt, predicate: str, value: str | None = None, unit: str | None = None,
+                               object_entity_id: StrictInt | None = None, statement: str | None = None,
+                               valid_from: str | None = None, valid_to: str | None = None,
+                               sources: list[dict[str, Any]] | None = None, my_note: StrictBool = False,
+                               ctx: Context | None = None) -> str:
+        """Record a fact: subject entity_id, predicate (check predicates_in_use of get_entity first), and a
+        value (+unit) or an object entity. valid_from/valid_to (YYYY-MM-DD, to exclusive) say when it is true.
+        The server finds each quote in the stored text and stores its exact locator; the response returns the
+        stored quotes (delivered_sources). An open fact with the same subject and predicate, an overlapping
+        period and another value is marked as a conflict (both kept). Give exactly one of sources (1-5
+        items {chunk_id or locator, quote}; quote copied exactly from a search snippet or get_snippet text,
+        inside one unit) or my_note: true (stored as "내 메모")."""
+        return answer('record_fact', {'entity_id': entity_id, 'predicate': predicate, 'value': value, 'unit': unit,
+                                   'object_entity_id': object_entity_id, 'statement': statement,
+                                   'valid_from': valid_from, 'valid_to': valid_to, 'sources': sources,
+                                   'my_note': my_note}, ctx)
+
+    @server.tool(name='record_decision', structured_output=False)
+    async def record_decision_tool(statement: str, entity_id: StrictInt | None = None, options: list[str] | None = None,
+                                   chosen: str | None = None, rationale: str | None = None,
+                                   decided_on: str | None = None, valid_to: str | None = None,
+                                   sources: list[dict[str, Any]] | None = None, my_note: StrictBool = False,
+                                   ctx: Context | None = None) -> str:
+        """Record a decision (statement, options, chosen, rationale, decided_on YYYY-MM-DD), optionally about
+        an entity. The response returns the stored quotes (delivered_sources). Give exactly one of sources
+        (1-5 items {chunk_id or locator, quote}, quote copied exactly) or my_note: true."""
+        return answer('record_decision', {'statement': statement, 'entity_id': entity_id, 'options': options,
+                                       'chosen': chosen, 'rationale': rationale, 'decided_on': decided_on,
+                                       'valid_to': valid_to, 'sources': sources, 'my_note': my_note}, ctx)
+
+    @server.tool(name='record_task', structured_output=False)
+    async def record_task_tool(statement: str, entity_id: StrictInt | None = None, due: str | None = None,
+                               owner_entity_id: StrictInt | None = None, state: str = 'open',
+                               done_at: str | None = None, sources: list[dict[str, Any]] | None = None,
+                               my_note: StrictBool = False, ctx: Context | None = None) -> str:
+        """Record a task (statement, due YYYY-MM-DD, owner entity, state open|done|cancelled). Change its state
+        later with supersede. The response returns the stored quotes (delivered_sources). Give exactly one of
+        sources (1-5 items {chunk_id or locator, quote}, quote copied exactly) or my_note: true."""
+        return answer('record_task', {'statement': statement, 'entity_id': entity_id, 'due': due,
+                                   'owner_entity_id': owner_entity_id, 'state': state, 'done_at': done_at,
+                                   'sources': sources, 'my_note': my_note}, ctx)
+
+    @server.tool(name='supersede', structured_output=False)
+    async def supersede_tool(assertion_id: StrictInt, reason: str, sources: list[dict[str, Any]] | None = None,
+                             my_note: StrictBool = False, old_valid_to: str | None = None,
+                             entity_id: StrictInt | None = None, predicate: str | None = None, value: str | None = None,
+                             unit: str | None = None, object_entity_id: StrictInt | None = None,
+                             statement: str | None = None, valid_from: str | None = None, valid_to: str | None = None,
+                             options: list[str] | None = None, chosen: str | None = None,
+                             rationale: str | None = None, decided_on: str | None = None, due: str | None = None,
+                             owner_entity_id: StrictInt | None = None, state: str | None = None,
+                             done_at: str | None = None, ctx: Context | None = None) -> str:
+        """Correct a fact, decision or task: a new row with the given fields changed (the others copied) and
+        the old row closed as superseded (kept in history). Without old_valid_to this corrects the record:
+        the old row leaves current knowledge for every date. With old_valid_to (YYYY-MM-DD) the old content
+        stays true until that date and the new one holds from it. Fields must belong to the row's kind.
+        Sources are never inherited: give exactly one of sources (1-5 items {chunk_id or locator, quote},
+        quote copied exactly) or my_note: true."""
+        return answer('supersede', {'assertion_id': assertion_id, 'reason': reason, 'sources': sources,
+                                 'my_note': my_note, 'old_valid_to': old_valid_to, 'entity_id': entity_id,
+                                 'predicate': predicate, 'value': value, 'unit': unit,
+                                 'object_entity_id': object_entity_id, 'statement': statement,
+                                 'valid_from': valid_from, 'valid_to': valid_to, 'options': options,
+                                 'chosen': chosen, 'rationale': rationale, 'decided_on': decided_on, 'due': due,
+                                 'owner_entity_id': owner_entity_id, 'state': state, 'done_at': done_at}, ctx)
+
+    @server.tool(name='retract', structured_output=False)
+    async def retract_tool(assertion_id: StrictInt, reason: str, ctx: Context | None = None) -> str:
+        """Withdraw a fact, decision or task with a reason; the row stays in history (never deleted) and its
+        conflicts are resolved. Returns no document text."""
+        return answer('retract', {'assertion_id': assertion_id, 'reason': reason}, ctx)
+
+    @server.tool(name='find_entity', structured_output=False)
+    async def find_entity_tool(query: str, kind: str | None = None, limit: StrictInt = tools.FIND_LIMIT_DEFAULT,
+                               ctx: Context | None = None) -> str:
+        """Entities whose name or alias contains query (case-insensitive), exact matches first; limit 1-50.
+        Returns no document text."""
+        return answer('find_entity', {'query': query, 'kind': kind, 'limit': limit}, ctx)
+
+    @server.tool(name='get_entity', structured_output=False)
+    async def get_entity_tool(entity_id: StrictInt | None = None, kind: str | None = None, name: str | None = None,
+                              as_of_valid: str | None = None, as_of_recorded: str | None = None,
+                              include_closed: StrictBool = False, source_kind: str = 'all',
+                              limit: StrictInt = tools.ENTITY_LIMIT_DEFAULT, ctx: Context | None = None) -> str:
+        """One entity (entity_id, or exact kind and name) with its facts, facts naming it, decisions, tasks and
+        predicates_in_use. as_of_valid (YYYY-MM-DD): only what was true that day (default: every period);
+        as_of_recorded (ISO time): what the record knew then (default now). Returns the evidence quotes of
+        each item (document text; delivered_sources lists them). source_kind: evidence|my_note|all."""
+        return answer('get_entity', {'entity_id': entity_id, 'kind': kind, 'name': name, 'as_of_valid': as_of_valid,
+                                  'as_of_recorded': as_of_recorded, 'include_closed': include_closed,
+                                  'source_kind': source_kind, 'limit': limit}, ctx)
+
+    @server.tool(name='list_knowledge', structured_output=False)
+    async def list_knowledge_tool(kind: str = 'all', entity_id: StrictInt | None = None, predicate: str | None = None,
+                                  status: str = 'open', state: str | None = None, due_before: str | None = None,
+                                  source_kind: str = 'all', as_of_valid: str | None = None,
+                                  as_of_recorded: str | None = None, recorded_since: str | None = None,
+                                  limit: StrictInt = tools.KNOWLEDGE_LIMIT_DEFAULT, offset: StrictInt = 0,
+                                  ctx: Context | None = None) -> str:
+        """Facts, decisions and tasks (kind fact|decision|todo|all) filtered by entity, predicate, status
+        (open|conflict|closed|all), task state, due date, source kind and the two time axes (as in
+        get_entity), newest first; limit 1-200, offset for paging. Returns no document text."""
+        return answer('list_knowledge', {'kind': kind, 'entity_id': entity_id, 'predicate': predicate,
+                                      'status': status, 'state': state, 'due_before': due_before,
+                                      'source_kind': source_kind, 'as_of_valid': as_of_valid,
+                                      'as_of_recorded': as_of_recorded, 'recorded_since': recorded_since,
+                                      'limit': limit, 'offset': offset}, ctx)
+
+    @server.tool(name='get_history', structured_output=False)
+    async def get_history_tool(assertion_id: StrictInt, ctx: Context | None = None) -> str:
+        """The supersede chain of one fact, decision or task, oldest first, with its events (recorded,
+        retracted, superseded, conflicts), links and evidence quotes (document text; delivered_sources lists
+        them), and whether a quote from a changed file is still found in its latest version."""
+        return answer('get_history', {'assertion_id': assertion_id}, ctx)
 
 
 def main(argv=None) -> int:
@@ -329,11 +496,13 @@ def main(argv=None) -> int:
             raise
         print(store.DEV_SCHEMA_HINT.format(db=paths.db_path(home)), file=sys.stderr)
         return 2
-    state = make_state(home, write_db=write_db, settings=settings)
+    know_db = store.connect(paths.db_path(home))  # already migrated by write_db: read-only check, no lock
+    state = make_state(home, write_db=write_db, know_db=know_db, settings=settings)
     try:
         build_server(home, state=state).run(transport='stdio')
     finally:
         close_log(state)
+        know_db.close()
         write_db.close()
     return 0
 

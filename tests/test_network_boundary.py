@@ -63,6 +63,9 @@ MODULE_IMPORTS = {
     'index.py': frozenset({'numpy', 'time'}),  # time: elapsed seconds of the run
     'search.py': frozenset({'numpy', 'time', 'gc'}),
     'store.py': frozenset({'time'}),  # M3: retry the WAL switch when two servers open a new store together
+    # M4 (design M4 §10, appendix B): NFC before binding a quote and measuring text; knowledge_query.py
+    # uses the common list only.
+    'knowledge.py': frozenset({'unicodedata'}),
 }
 # Inside function bodies only: the explicit model download, and the ONNX runtime and tokenizer
 # loaded in ``OnnxEmbedder.__init__`` (their DLLs never load on import, status or lexical search).
@@ -788,14 +791,33 @@ def test_tokenizers_and_onnxruntime_imports_do_not_load_a_hub_client():
     assert json.loads(run.stdout) == []
 
 
-SERVE_TOOLS = {'search', 'get_snippet', 'list_documents', 'recent_changes', 'status'}
-# Arguments of each tool's input schema (design M3 §2); ctx is injected by the SDK, not an argument.
+SERVE_TOOLS = {'search', 'get_snippet', 'list_documents', 'recent_changes', 'status',
+               'record_entity', 'record_fact', 'record_decision', 'record_task', 'supersede', 'retract',
+               'find_entity', 'get_entity', 'list_knowledge', 'get_history'}
+# Arguments of each tool's input schema (design M3 §2, M4 §6); ctx is injected by the SDK, not an argument.
+EVIDENCE_ARGUMENTS = {'sources', 'my_note'}
 SERVE_ARGUMENTS = {
     'search': {'query', 'mode', 'limit', 'path_prefix', 'ext', 'since', 'until', 'collapse_by_document'},
     'get_snippet': {'chunk_id', 'locator', 'context_units', 'max_chars'},
     'list_documents': {'path_prefix', 'ext', 'status', 'changed_since', 'limit', 'offset'},
     'recent_changes': {'since', 'until', 'kinds', 'path_prefix', 'ext', 'limit', 'offset'},
     'status': set(),
+    'record_entity': {'kind', 'name', 'aliases', 'note'},
+    'record_fact': {'entity_id', 'predicate', 'value', 'unit', 'object_entity_id', 'statement', 'valid_from',
+                    'valid_to'} | EVIDENCE_ARGUMENTS,
+    'record_decision': {'statement', 'entity_id', 'options', 'chosen', 'rationale', 'decided_on',
+                        'valid_to'} | EVIDENCE_ARGUMENTS,
+    'record_task': {'statement', 'entity_id', 'due', 'owner_entity_id', 'state', 'done_at'} | EVIDENCE_ARGUMENTS,
+    'supersede': {'assertion_id', 'reason', 'old_valid_to', 'entity_id', 'predicate', 'value', 'unit',
+                  'object_entity_id', 'statement', 'valid_from', 'valid_to', 'options', 'chosen', 'rationale',
+                  'decided_on', 'due', 'owner_entity_id', 'state', 'done_at'} | EVIDENCE_ARGUMENTS,
+    'retract': {'assertion_id', 'reason'},
+    'find_entity': {'query', 'kind', 'limit'},
+    'get_entity': {'entity_id', 'kind', 'name', 'as_of_valid', 'as_of_recorded', 'include_closed', 'source_kind',
+                   'limit'},
+    'list_knowledge': {'kind', 'entity_id', 'predicate', 'status', 'state', 'due_before', 'source_kind',
+                       'as_of_valid', 'as_of_recorded', 'recorded_since', 'limit', 'offset'},
+    'get_history': {'assertion_id'},
 }
 
 
@@ -932,7 +954,7 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     for number in set(SERVE_CALLED) - set(SERVE_ERRORS):
         assert envelopes[number]['ok'] is True, envelopes[number]
     status = envelopes[3]['result']
-    assert status['schema_version'] == 2 and set(status) == STATUS_RESULT_KEYS
+    assert status['schema_version'] == 3 and set(status) == STATUS_RESULT_KEYS
     assert status['home'] == str(home) and status['db']['chunks'] > 0
     assert set(status['home_virtualization']) == {'checked', 'under_appdata', 'redirected_to', 'package'}
     hits = envelopes[4]['result']['hits']
@@ -1033,7 +1055,7 @@ def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
 
 # 6
 STATUS_RESULT_KEYS = {'home', 'schema_version', 'db', 'model', 'fts5', 'last_scan', 'index', 'delivery_log_count',
-                      'engine', 'home_virtualization', 'calls', 'process'}
+                      'engine', 'home_virtualization', 'calls', 'process', 'knowledge'}
 
 
 def requirement_name(spec: str) -> str:

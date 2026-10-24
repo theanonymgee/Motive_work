@@ -99,7 +99,7 @@ def test_reparse_drops_chunks_and_their_fts_rows_through_store(workmcp_home, tmp
         store.insert_chunks(db, version, chunks.CHUNK_VERSION, [chunks.ChunkSpec(1, 1, 1, 0, len(text), text)])
         db.execute('UPDATE versions SET parser_version=? WHERE id=?', ('text-0', version))
         db.execute("INSERT INTO assertions(kind, statement, recorded_from, status, source_kind, recorded_by) "
-                   "VALUES('fact', '합성 사실', '2026-10-24T09:00:00+09:00', 'active', 'evidence', 'test')")
+                   "VALUES('decision', '합성 사실', '2026-10-24T09:00:00+09:00', 'active', 'evidence', 'test')")
         chunk_id = db.execute('SELECT id FROM chunks').fetchone()[0]
         db.execute("INSERT INTO evidence(assertion_id, version_id, chunk_id, locator_json, quote, quote_sha256) "
                    "VALUES(1, ?, ?, '{}', '합성', ?)", (version, chunk_id, '0' * 64))

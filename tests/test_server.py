@@ -1,4 +1,4 @@
-"""The MCP adapter (design M3 §1, §6, §8): five async unstructured tools, the common ``handle`` path,
+"""The MCP adapter (design M3 §1, §6, §8, M4 §1): fifteen async unstructured tools, the common ``handle`` path,
 client names, error envelopes, the call log and the idle-release ticker. Synthetic data only; no
 stdio here (``test_network_boundary.py`` runs the real ``serve``)."""
 import inspect
@@ -16,7 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from fixtures import LINES_KO
 from test_collect import add_root, scan
-from workmcp import config, embedder, index, locator, parsers, paths, search, server, snippet, store, tools
+from workmcp import config, embedder, index, knowledge, locator, parsers, paths, search, server, snippet, store, tools
 
 
 class Clock:
@@ -49,11 +49,12 @@ def calls(state):
                                   'ORDER BY id').fetchall()
 
 
-def test_build_server_registers_five_async_unstructured_tools(state):
+def test_build_server_registers_fifteen_async_unstructured_tools(state):
     built = server.build_server(state.home, state=state)
     listed = {tool.name: tool for tool in built._tool_manager.list_tools()}
-    assert set(listed) == set(tools.TOOL_NAMES)
+    assert set(listed) == set(tools.TOOL_NAMES) == set(server.TOOLS) and len(listed) == 15
     for tool in listed.values():
+        assert tool.description  # a docstring, the client's only guide
         assert tool.is_async and inspect.iscoroutinefunction(tool.fn)
         assert tool.output_schema is None          # structured_output=False: one text content, our JSON
         assert tool.context_kwarg == 'ctx'         # the client name comes from the request Context
@@ -107,6 +108,9 @@ def test_client_name_comes_from_client_info_or_unknown():
     (sqlite3.OperationalError('no such table: x'), 'internal_error', False),
     (locator.LocatorError('locator_text_mismatch'), 'locator_invalid', False),
     (snippet.NotFound('chunk 7 not found'), 'not_found', False),
+    (knowledge.KnowledgeError('store_busy', 'the store is busy; try again', retryable=True), 'store_busy', True),
+    (knowledge.KnowledgeError('evidence_quote_not_found', 'sources[1]: no match in line 3'),
+     'evidence_quote_not_found', False),
 ])
 def test_known_errors_become_envelopes(state, monkeypatch, raised, code, retryable):
     def fail(state, **args):
@@ -335,6 +339,47 @@ def test_make_state_shortens_the_log_connection_busy_timeout(state):
     assert state.write_db.execute('PRAGMA busy_timeout').fetchone()[0] == server.LOG_BUSY_MS
 
 
+# ---- M4 stage 0: the knowledge write connection, recorded_by and call id (design M4 §7.2, §8.2) -----
+
+def test_writers_get_the_knowledge_connection_recorded_by_and_the_logged_call_id(home, monkeypatch):
+    write_db, know_db = store.open_home(home), store.open_home(home)
+    seen = []
+
+    def spy(db, **args):
+        seen.append((db, args))
+        return tools.ok({'assertion': None, 'conflicts': [], 'duplicates': []})
+    try:
+        state = server.make_state(home, engine=search.Engine(home), write_db=write_db, know_db=know_db)
+        assert know_db.execute('PRAGMA busy_timeout').fetchone()[0] == server.KNOWLEDGE_BUSY_MS
+        assert write_db.execute('PRAGMA busy_timeout').fetchone()[0] == server.LOG_BUSY_MS
+        monkeypatch.setitem(server.TOOLS, 'record_task', server._writer('record_task', spy))
+        envelope = json.loads(server.handle(state, 'record_task', {'statement': '합성', 'state': 'done', 'my_note': True},
+                                            ('claude-code', '2.0')))
+        assert envelope['ok'] is True
+        [(db, args)] = seen
+        call_id = write_db.execute("SELECT call_id FROM tool_calls WHERE tool='record_task'").fetchone()[0]
+        assert db is know_db and args == {'recorded_by': 'claude-code/record_task', 'call_id': call_id,
+                                          'statement': '합성', 'state': 'done', 'my_note': True}
+    finally:
+        write_db.close()
+        know_db.close()
+
+
+@pytest.mark.parametrize('tool, arguments', [
+    ('record_task', {'statement': '합성 할 일', 'state': 'done', 'my_note': True}),
+    ('supersede', {'assertion_id': 1, 'reason': '합성 완료', 'state': 'done', 'my_note': True}),
+    ('list_knowledge', {'kind': 'todo', 'state': 'open'}),
+])
+def test_a_tool_argument_named_state_reaches_the_tool_function(state, tool, arguments):
+    """Through the SDK (``build_server``): an argument named ``state`` neither shadows the server state nor
+    collides with ``TOOLS``' first parameter (stage 0: the body answers not_implemented)."""
+    built = server.build_server(state.home, state=state)
+    result = anyio.run(built.call_tool, tool, arguments)
+    envelope = json.loads(result.content[0].text)
+    assert envelope['error']['code'] == tools.NOT_IMPLEMENTED, envelope
+    assert calls(state)[-1][2:5] == (tool, 0, tools.NOT_IMPLEMENTED)
+
+
 # ---- review M3-3: every answer, errors too, fits the budget ----------------------------------------
 
 def test_error_answers_fit_the_budget_and_messages_are_short(state, tmp_path):
@@ -368,6 +413,14 @@ def test_the_final_length_check_catches_any_oversized_answer(state, monkeypatch)
     ('get_snippet', {'chunk_id': 1, 'context_units': 1.0}),
     ('list_documents', {'offset': False}),
     ('recent_changes', {'limit': '5'}),
+    ('record_fact', {'entity_id': True, 'predicate': '담당', 'my_note': True}),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'my_note': 'yes'}),
+    ('record_task', {'statement': '합성', 'owner_entity_id': 1.0, 'my_note': True}),
+    ('supersede', {'assertion_id': '1', 'reason': '합성', 'my_note': True}),
+    ('retract', {'assertion_id': 1.0, 'reason': '합성'}),
+    ('get_entity', {'entity_id': 1, 'include_closed': 1}),
+    ('list_knowledge', {'offset': True}),
+    ('get_history', {'assertion_id': False}),
 ])
 def test_integer_and_boolean_arguments_are_strict(state, tool, arguments):
     built = server.build_server(state.home, state=state)

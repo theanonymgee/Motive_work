@@ -9,7 +9,8 @@ Python without FTS5 still opens the store (lexical search then falls back to LIK
 Schema v1 was edited in place through M2 (design M1 §10.1); a development store made from an
 earlier v1 is refused by the checksum check (delete it and scan again). From M3 on v1 is frozen
 and every change is a new migration: v2 adds the tool call log, ``deliveries.call_id`` and
-``document_events`` (design M3 §3.4).
+``document_events`` (design M3 §3.4); v3 adds the knowledge columns, ``assertion_events`` and the
+entity/link guards (design M4 §2.3).
 """
 from __future__ import annotations
 
@@ -216,10 +217,87 @@ CREATE TRIGGER document_events_no_replace BEFORE INSERT ON document_events
   BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 """
 
+# M4 (design M4 §2.3): structured knowledge on the v1 tables. Additive only: assertions get the
+# attribute/relation of a fact (predicate, object_entity_id); assertion_events keeps every state change
+# (recorded, retracted, superseded, conflict marked/cleared) with its reason, actor and time as a new
+# row; entities and links get append-only guards (aliases_json, note and a link's resolution may be set);
+# valid_from/valid_to are dates YYYY-MM-DD with valid_from < valid_to.
+SCHEMA_V3 = """
+ALTER TABLE assertions ADD COLUMN predicate TEXT;
+ALTER TABLE assertions ADD COLUMN object_entity_id INTEGER REFERENCES entities(id);
+CREATE INDEX assertions_subject ON assertions(entity_id, kind, predicate);
+CREATE INDEX assertions_object ON assertions(object_entity_id);
+CREATE INDEX assertions_supersedes ON assertions(supersedes_id);
+-- The v1 update guard does not know the new columns: the same rule (content never changes) for them.
+CREATE TRIGGER assertions_v3_update_guard BEFORE UPDATE ON assertions
+  WHEN NEW.predicate IS NOT OLD.predicate OR NEW.object_entity_id IS NOT OLD.object_entity_id
+  BEGIN SELECT RAISE(ABORT, 'assertion content is append-only'); END;
+-- Dates and their order (M0 appendix B L-13); recorded_to >= recorded_from stays the v1 trigger's.
+CREATE TRIGGER assertions_v3_dates BEFORE INSERT ON assertions
+  WHEN (NEW.valid_from IS NOT NULL AND NEW.valid_from NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')
+    OR (NEW.valid_to IS NOT NULL AND NEW.valid_to NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')
+    OR (NEW.valid_from IS NOT NULL AND NEW.valid_to IS NOT NULL AND NEW.valid_to <= NEW.valid_from)
+  BEGIN SELECT RAISE(ABORT, 'valid_from/valid_to must be YYYY-MM-DD and valid_from < valid_to'); END;
+-- A fact has a subject and a predicate; a decision or a task has neither predicate nor object.
+CREATE TRIGGER assertions_v3_shape BEFORE INSERT ON assertions
+  WHEN (NEW.kind = 'fact' AND (NEW.entity_id IS NULL OR NEW.predicate IS NULL))
+    OR (NEW.kind IN ('decision', 'todo') AND (NEW.predicate IS NOT NULL OR NEW.object_entity_id IS NOT NULL))
+  BEGIN SELECT RAISE(ABORT, 'assertion shape: fact needs entity_id and predicate; decision/todo have neither'); END;
+
+-- Entities: identity (kind, name, created_*) never changes; aliases_json and note may (new aliases);
+-- merged_into is set once (M5).
+CREATE TRIGGER entities_update_guard BEFORE UPDATE ON entities
+  WHEN NEW.id <> OLD.id OR NEW.kind <> OLD.kind OR NEW.name <> OLD.name OR NEW.created_at <> OLD.created_at
+    OR NEW.created_by <> OLD.created_by OR (OLD.merged_into IS NOT NULL AND NEW.merged_into IS NOT OLD.merged_into)
+  BEGIN SELECT RAISE(ABORT, 'entity identity is append-only'); END;
+CREATE TRIGGER entities_no_delete BEFORE DELETE ON entities BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER entities_no_replace BEFORE INSERT ON entities
+  WHEN EXISTS(SELECT 1 FROM entities WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+-- The second unique key (kind, name) too.
+CREATE TRIGGER entities_no_replace_name BEFORE INSERT ON entities
+  WHEN EXISTS(SELECT 1 FROM entities WHERE kind = NEW.kind AND name = NEW.name) BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+-- Supersede and conflict links: content never changes; resolved_at/resolved_by_id go NULL -> value once.
+CREATE INDEX links_from ON links(from_id, relation);
+CREATE INDEX links_to ON links(to_id, relation);
+CREATE TRIGGER links_update_guard BEFORE UPDATE ON links
+  WHEN NEW.id <> OLD.id OR NEW.from_id <> OLD.from_id OR NEW.to_id <> OLD.to_id OR NEW.relation <> OLD.relation
+    OR NEW.note IS NOT OLD.note OR NEW.recorded_at <> OLD.recorded_at OR NEW.recorded_by <> OLD.recorded_by
+    OR (OLD.resolved_at IS NOT NULL AND (NEW.resolved_at IS NOT OLD.resolved_at OR NEW.resolved_by_id IS NOT OLD.resolved_by_id))
+    OR (NEW.resolved_at IS NULL AND NEW.resolved_by_id IS NOT NULL)
+  BEGIN SELECT RAISE(ABORT, 'link is append-only'); END;
+CREATE TRIGGER links_no_delete BEFORE DELETE ON links BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER links_no_replace BEFORE INSERT ON links
+  WHEN EXISTS(SELECT 1 FROM links WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+-- State change history: reason, actor, other row, time. Append-only.
+CREATE TABLE assertion_events(id INTEGER PRIMARY KEY,
+  assertion_id INTEGER NOT NULL REFERENCES assertions(id),
+  at TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('recorded','retracted','superseded','conflict_marked','conflict_cleared')),
+  reason TEXT,
+  related_id INTEGER REFERENCES assertions(id),
+  recorded_by TEXT NOT NULL,
+  call_id TEXT);
+CREATE INDEX assertion_events_assertion ON assertion_events(assertion_id, id);
+CREATE TRIGGER assertion_events_no_update BEFORE UPDATE ON assertion_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER assertion_events_no_delete BEFORE DELETE ON assertion_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER assertion_events_no_replace BEFORE INSERT ON assertion_events
+  WHEN EXISTS(SELECT 1 FROM assertion_events WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+"""
+
 # (version, name, sql). Never edit an applied entry; append a new one.
-MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1), (2, 'tool_calls_events_v2', SCHEMA_V2)]
+MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1), (2, 'tool_calls_events_v2', SCHEMA_V2),
+              (3, 'knowledge_v3', SCHEMA_V3)]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 EVENT_KINDS = ('added', 'changed', 'restored', 'deleted', 'reparsed')
+# Knowledge (design M4 §2): the kinds M4 writes ('term' stays in the v1 CHECK, unused), task states,
+# assertion statuses and assertion event kinds.
+ENTITY_KINDS = ('person', 'project', 'customer', 'org', 'term', 'other')
+ASSERTION_KINDS = ('fact', 'decision', 'todo')
+ASSERTION_STATUSES = ('active', 'conflict', 'withdrawn', 'superseded')
+TASK_STATES = ('open', 'done', 'cancelled')
+EVENT_KINDS_ASSERTION = ('recorded', 'retracted', 'superseded', 'conflict_marked', 'conflict_cleared')
 DOCUMENT_STATUSES = ('active', 'deleted', 'skipped')
 CALL_COLUMNS = ('at', 'client', 'client_version', 'tool', 'call_id', 'args_json', 'pieces', 'chars', 'ok',
                 'error_code', 'elapsed_ms', 'pid')
@@ -776,3 +854,51 @@ def document_events_query(db: sqlite3.Connection, filters, limit: int, offset: i
                 f'v.parse_status, v.parse_error, e.scan_id {body} ORDER BY julianday(e.at) DESC, e.id DESC '
                 'LIMIT ? OFFSET ?', [*params, limit, offset])]
     return rows, total
+
+
+# -- M4: knowledge write transactions and counts (design M4 §6.4, §8.2) ------------------------------
+# ``knowledge`` is a read-only-to-sources module and does not import sqlite3 (tests/test_readonly.py);
+# it opens and ends its one write transaction through these two functions.
+
+class Busy(Exception):
+    """Another connection held the write lock past this connection's busy timeout (``store_busy``)."""
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    return 'locked' in str(exc) or 'busy' in str(exc)
+
+
+def begin_immediate(db: sqlite3.Connection) -> None:
+    """``BEGIN IMMEDIATE`` (the write lock for the whole transaction); ``Busy`` when it does not come free,
+    with no transaction open."""
+    try:
+        db.execute('BEGIN IMMEDIATE')
+    except sqlite3.OperationalError as exc:
+        if not _is_busy(exc):
+            raise
+        raise Busy(str(exc)) from None
+
+
+def commit(db: sqlite3.Connection) -> None:
+    """``COMMIT``; when the store is busy the transaction is rolled back and ``Busy`` raised, so a failed
+    commit always means nothing was written."""
+    try:
+        db.execute('COMMIT')
+    except sqlite3.OperationalError as exc:
+        if not _is_busy(exc):
+            raise
+        db.execute('ROLLBACK')
+        raise Busy(str(exc)) from None
+
+
+def knowledge_counts(db: sqlite3.Connection) -> dict:
+    """``{entities, assertions: {active, conflict, withdrawn, superseded}, tasks_open, evidence, events}``
+    for ``status``: counts only. ``tasks_open``: open task rows whose state is ``open``."""
+    by_status = dict(db.execute('SELECT status, COUNT(*) FROM assertions GROUP BY status'))
+    tasks_open = db.execute("SELECT COUNT(*) FROM assertions WHERE kind = 'todo' AND recorded_to IS NULL "
+                            "AND json_extract(data_json, '$.state') = 'open'").fetchone()[0]
+    return {'entities': db.execute('SELECT COUNT(*) FROM entities').fetchone()[0],
+            'assertions': {status: by_status.get(status, 0) for status in ASSERTION_STATUSES},
+            'tasks_open': tasks_open,
+            'evidence': db.execute('SELECT COUNT(*) FROM evidence').fetchone()[0],
+            'events': db.execute('SELECT COUNT(*) FROM assertion_events').fetchone()[0]}

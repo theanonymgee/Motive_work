@@ -14,8 +14,8 @@ from fixtures import SENTINEL
 from fixtures import bundle as synthetic_bundle
 from fixtures import corpus as corpus_module
 from test_collect import add_root, rewrite, scan
-from workmcp import (binding, collect, config, embedder, index, locator, parsers, paths, search, server, snippet,
-                     store, tools)
+from workmcp import (binding, collect, config, embedder, index, knowledge, knowledge_query, locator, parsers, paths,
+                     search, server, snippet, store, tools)
 
 H = '0' * 64
 DIMS = 64
@@ -43,8 +43,8 @@ def search_envelope(count, size=100):
 def snippet_envelope():
     before, main, after = piece(1, '앞 문맥'), piece(2, '본문 조각'), piece(3, '뒤 문맥')
     as_piece = lambda pair: {'locator': pair[0], 'text': pair[1], 'truncated': False}  # noqa: E731
-    return tools.ok({'doc': {}, 'version': {}, 'chunk': None, 'pieces': [as_piece(main)],
-                     'context_before': [as_piece(before)], 'context_after': [as_piece(after)]}), (before, main, after)
+    return tools.ok({'doc': {}, 'version': {}, 'chunk': None, 'context_before': [as_piece(before)],
+                     'pieces': [as_piece(main)], 'context_after': [as_piece(after)]}), (before, main, after)
 
 
 def test_dumps_is_compact_and_keeps_korean():
@@ -125,7 +125,10 @@ def test_status_has_engine_virtualization_calls_and_process(home):
     engine = search.Engine(home, config.SearchSettings(model_idle_seconds=60),
                            embedder_factory=lambda: embedder.HashEmbedder(64), clock=clock)
     result = tools.status(home, engine, started_at='2026-10-24T09:00:00+09:00', unloads=2)['result']
-    assert set(result) == tools.STATUS_KEYS and result['schema_version'] == store.SCHEMA_VERSION == 2
+    assert set(result) == tools.STATUS_KEYS and result['schema_version'] == store.SCHEMA_VERSION == 3
+    assert result['knowledge'] == {'entities': 0, 'assertions': {'active': 0, 'conflict': 0, 'withdrawn': 0,
+                                                                 'superseded': 0},
+                                   'tasks_open': 0, 'evidence': 0, 'events': 0}
     assert set(result['engine']) >= {'loaded', 'rows', 'load_failure'} | tools.ENGINE_STATUS_EXTRA_KEYS
     assert result['engine']['loaded'] is False and result['engine']['idle_seconds'] is None
     assert (result['engine']['model_idle_seconds'], result['engine']['unloads']) == (60, 2)
@@ -200,7 +203,7 @@ def state(built):
     value.write_db.close()
 
 
-def call(state, tool: str, **args) -> dict:
+def call(state, tool: str, /, **args) -> dict:  # positional: list_knowledge has an argument 'state'
     return json.loads(server.handle(state, tool, args, CLIENT))
 
 
@@ -882,3 +885,191 @@ def test_chunk_ids_keep_growing_after_the_highest_is_dropped(tmp_path):
         assert store.meta_get(db, store.CHUNK_ID_HIGH) == '4'
     finally:
         db.close()
+
+
+# ---- M4 stage 0: recursive pieces, knowledge tool shells, summaries (design M4 §6, §7, §13.1) --------
+
+def m3_pieces_of(envelope):
+    """The M3 implementation of ``tools.pieces_of`` (commit 9d58229), kept to prove the recursive one gives
+    the same pieces in the same order for every M3 response (design M4 §7.1, risk 7)."""
+    if not envelope.get('ok'):
+        return []
+    result = envelope.get('result') or {}
+    if 'hits' in result:
+        return [(hit['locator'], hit['snippet']) for hit in result['hits']]
+    if 'pieces' in result:
+        return [(piece['locator'], piece['text']) for key in ('context_before', 'pieces', 'context_after')
+                for piece in result.get(key) or ()]
+    return []
+
+
+def test_pieces_of_recursive_matches_m3_behaviour(built):
+    roomy, tight = built.state(budget=10**7), built.state(budget=6_000)
+    try:
+        responses = []
+        for state in (roomy, tight):   # tight: shrunk responses (dropped hits, context, cut pieces)
+            for query in ('합성 프로젝트', SENTINEL, '견적', '계약 일정'):
+                for args in ({}, {'mode': 'lexical', 'limit': 20}, {'collapse_by_document': True}):
+                    responses.append(call(state, 'search', query=query, **args))
+            hits = [hit for envelope in responses if envelope['ok'] for hit in envelope['result'].get('hits', ())][:6]
+            for hit in hits:
+                for units in (0, 1, 3):
+                    responses.append(call(state, 'get_snippet', chunk_id=hit['chunk_id'], context_units=units))
+                    responses.append(call(state, 'get_snippet', locator=hit['locator'], context_units=units,
+                                          max_chars=200))
+            for tool, args in (('list_documents', {}), ('recent_changes', {}), ('status', {}),
+                               ('search', {'query': ''}), ('get_snippet', {'chunk_id': 99_999_999})):
+                responses.append(call(state, tool, **args))
+        with_context = [e for e in responses if e['ok'] and e['result'].get('context_before')]
+        assert with_context and any(e['ok'] and e['result'].get('hits') for e in responses)
+        for envelope in responses:
+            assert tools.pieces_of(envelope) == m3_pieces_of(envelope)
+            assert envelope.get('delivered_sources', []) == [locator.display(obj) for obj, _ in m3_pieces_of(envelope)]
+    finally:
+        roomy.write_db.close()
+        tight.write_db.close()
+
+
+def test_pieces_of_finds_quotes_at_any_depth_and_skips_what_is_not_text():
+    (first, text), (second, other) = piece(1, '합성 인용 하나'), piece(2, '합성 인용 둘')
+    envelope = tools.ok({'old': {'id': 1, 'evidence': [{'id': 5, 'locator': first, 'quote': text, 'requote': None}]},
+                         'cut': None,
+                         'new': {'id': 3, 'conflicts': [{'id': 2, 'value': '합성 값'}],
+                                 'evidence': [{'id': 6, 'locator': second, 'quote': other,
+                                               'requote': {'found': True, 'locator': first}},   # no text: not a piece
+                                              {'id': 7, 'locator': first, 'quote': None, 'quote_chars': 7},  # dropped
+                                              {'id': 8, 'locator': first, 'quote': text, 'text': text}]}})  # two texts
+    assert tools.pieces_of(envelope) == [(first, text), (second, other)]
+    assert tools.delivered(envelope) == [locator.display(first), locator.display(second)]
+    assert tools.pieces_of(tools.ok({'items': [{'id': 1, 'evidence': None, 'evidence_count': 2}]})) == []
+
+
+def test_knowledge_constants_match_the_design():
+    assert len(tools.TOOL_NAMES) == len(set(tools.TOOL_NAMES)) == 15 and set(tools.SHRINK) == set(tools.TOOL_NAMES)
+    assert set(knowledge.ERROR_CODES) <= set(tools.ERROR_CODES) and tools.NOT_IMPLEMENTED not in knowledge.ERROR_CODES
+    assert tools.ASSERTION_KEYS >= {'id', 'kind', 'entity_id', 'predicate', 'object_entity_id', 'statement', 'data',
+                                    'valid_from', 'valid_to', 'recorded_from', 'recorded_to', 'status',
+                                    'status_as_of', 'source_kind', 'source_label', 'supersedes_id', 'recorded_by',
+                                    'conflicts', 'evidence', 'evidence_count'}
+    assert 'quote' in tools.EVIDENCE_KEYS and 'locator' in tools.EVIDENCE_KEYS
+    assert set(knowledge.FIELDS) == set(store.ASSERTION_KINDS) and set(knowledge.DATA_KEYS) == set(store.ASSERTION_KINDS)
+    assert (knowledge.SOURCES_MAX, knowledge.QUOTE_MAX, knowledge.STATEMENT_MAX, knowledge.REASON_MAX) == (5, 1000, 1000, 500)
+    assert (tools.FIND_LIMIT_MAX, tools.ENTITY_LIMIT_MAX, tools.KNOWLEDGE_LIMIT_MAX, knowledge_query.HISTORY_MAX) == \
+        (50, 100, 200, 50)
+    assert server.KNOWLEDGE_BUSY_MS == 5000
+
+
+NOTE = {'my_note': True}
+
+
+@pytest.mark.parametrize('tool, args', [
+    ('record_entity', {'kind': 'project', 'name': '합성 P', 'aliases': ['P']}),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'value': '합성 값', 'valid_from': '2026-10-01', **NOTE}),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'object_entity_id': 2,
+                     'sources': [{'chunk_id': 3, 'quote': '합성 인용'}, {'locator': {'v': 1}, 'quote': '합성'}]}),
+    ('record_decision', {'statement': '합성 결정', 'options': ['A', 'B'], 'chosen': 'A', 'decided_on': '2026-10-25', **NOTE}),
+    ('record_task', {'statement': '합성 할 일', 'due': '2026-11-01', 'state': 'done', 'done_at': '2026-10-25', **NOTE}),
+    ('supersede', {'assertion_id': 1, 'reason': '합성 교정', 'value': '새 값', 'old_valid_to': '2026-10-20', **NOTE}),
+    ('supersede', {'assertion_id': 1, 'reason': '합성 완료', 'state': 'done', **NOTE}),
+    ('retract', {'assertion_id': 1, 'reason': '합성 철회'}),
+    ('find_entity', {'query': '합성'}),
+    ('get_entity', {'entity_id': 1, 'as_of_valid': '2026-10-10', 'as_of_recorded': '2026-10-25T10:00:00+09:00'}),
+    ('get_entity', {'kind': 'project', 'name': '합성 P', 'include_closed': True, 'source_kind': 'my_note'}),
+    ('list_knowledge', {'kind': 'todo', 'state': 'open', 'status': 'all', 'due_before': '2026-12-01', 'limit': 200}),
+    ('get_history', {'assertion_id': 1}),
+])
+def test_knowledge_tools_check_arguments_then_answer_not_implemented(state, tool, args):
+    """Stage 0: valid arguments pass the checks and reach the stage-1 body (``not_implemented``); the
+    call is logged with its summary."""
+    envelope = call(state, tool, **args)
+    assert envelope == {'ok': False, 'error': {'code': tools.NOT_IMPLEMENTED, 'message': f'{tool}: M4 stage 1',
+                                               'retryable': False}}
+    _, client, logged_tool, ok, error_code, pieces, chars, args_json = last_call(state)
+    assert (client, logged_tool, ok, error_code, pieces, chars) == (CLIENT[0], tool, 0, tools.NOT_IMPLEMENTED, 0, 0)
+    assert json.loads(args_json) == tools.summarize_args(tool, args)
+
+
+@pytest.mark.parametrize('tool, args, code', [
+    ('record_entity', {'kind': 'team', 'name': '합성'}, 'argument_invalid'),
+    ('record_entity', {'kind': 'project', 'name': '합성', 'aliases': '합성'}, 'argument_invalid'),
+    ('record_fact', {'entity_id': 0, 'predicate': '담당', **NOTE}, 'argument_invalid'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'valid_from': '2026-9-1', **NOTE}, 'argument_invalid'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당'}, 'evidence_required'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'sources': []}, 'evidence_required'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'sources': [{'chunk_id': 1, 'quote': 'x'}], **NOTE},
+     'evidence_required'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'sources': [{'quote': '합성'}]}, 'argument_invalid'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'sources': [{'chunk_id': 1, 'locator': {}, 'quote': 'x'}]},
+     'argument_invalid'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'sources': [{'chunk_id': 1, 'quote': 'x', 'chars': [0, 1]}]},
+     'argument_invalid'),
+    ('record_fact', {'entity_id': 1, 'predicate': '담당', 'sources': [{'chunk_id': 1, 'quote': 'x'}] * 6},
+     'argument_invalid'),
+    ('record_decision', {'statement': None, **NOTE}, 'argument_invalid'),
+    ('record_task', {'statement': '합성', 'state': 'later', **NOTE}, 'argument_invalid'),
+    ('supersede', {'assertion_id': 1, 'reason': '합성', 'state': 'later', **NOTE}, 'argument_invalid'),
+    ('supersede', {'assertion_id': 1, 'reason': '합성'}, 'evidence_required'),
+    ('retract', {'assertion_id': 1, 'reason': None}, 'argument_invalid'),
+    ('find_entity', {'query': '  '}, 'argument_invalid'),
+    ('find_entity', {'query': '합성', 'limit': 51}, 'argument_invalid'),
+    ('get_entity', {}, 'argument_invalid'),
+    ('get_entity', {'entity_id': 1, 'name': '합성'}, 'argument_invalid'),
+    ('get_entity', {'name': '합성'}, 'argument_invalid'),
+    ('get_entity', {'entity_id': 1, 'as_of_recorded': '어제'}, 'argument_invalid'),
+    ('get_entity', {'entity_id': 1, 'limit': 101}, 'argument_invalid'),
+    ('list_knowledge', {'status': 'open-ish'}, 'argument_invalid'),
+    ('list_knowledge', {'as_of_valid': '2026-10-25T00:00:00'}, 'argument_invalid'),
+    ('list_knowledge', {'offset': -1}, 'argument_invalid'),
+    ('get_history', {'assertion_id': -1}, 'argument_invalid'),
+])
+def test_knowledge_tool_argument_errors_are_envelopes_without_text(state, tool, args, code):
+    envelope = call(state, tool, **args)
+    assert envelope['ok'] is False and envelope['error']['code'] == code, envelope
+    assert '합성' not in envelope['error']['message']   # names and ranges, never what the client sent
+
+
+def test_knowledge_summaries_keep_no_text(state):
+    text = f'{SENTINEL} 합성 본문'
+    source = {'locator': {'v': 1, 'doc': 1, 'path': f'C:\\{SENTINEL}.txt'}, 'quote': text}
+    calls = {
+        'record_entity': {'kind': 'person', 'name': text, 'aliases': [text, text], 'note': text},
+        'record_fact': {'entity_id': 4, 'predicate': text, 'value': text, 'unit': text, 'statement': text,
+                        'valid_from': '2026-10-01', 'sources': [source, {'chunk_id': 9, 'quote': text}]},
+        'record_decision': {'statement': text, 'options': [text], 'chosen': text, 'rationale': text, **NOTE},
+        'record_task': {'statement': text, 'state': 'open', 'due': '2026-11-01', **NOTE},
+        'supersede': {'assertion_id': 7, 'reason': text, 'value': text, 'predicate': text, 'old_valid_to': '2026-10-20',
+                      'sources': [source]},
+        'retract': {'assertion_id': 7, 'reason': text},
+        'find_entity': {'query': text, 'kind': 'person', 'limit': 5},
+        'get_entity': {'kind': 'person', 'name': text, 'as_of_valid': '2026-10-01'},
+        'list_knowledge': {'predicate': text, 'entity_id': 4, 'as_of_valid': '2026-10-01', 'kind': 'fact'},
+        'get_history': {'assertion_id': 7},
+    }
+    summaries = {tool: tools.summarize_args(tool, args) for tool, args in calls.items()}
+    assert summaries['record_fact'] == {
+        'kind': 'fact', 'entity': 4, 'object': None, 'predicate_chars': len(text), 'statement_chars': len(text),
+        'value_chars': len(text), 'sources': 2, 'by': ['chunk_id', 'locator'], 'my_note': False,
+        'quote_chars': 2 * len(text), 'valid': [True, False]}
+    assert summaries['supersede'] == {'assertion': 7, 'fields': ['predicate', 'value'], 'old_valid_to': True,
+                                      'sources': 1, 'by': ['locator'], 'my_note': False, 'quote_chars': len(text),
+                                      'reason_chars': len(text)}
+    assert summaries['record_entity'] == {'kind': 'person', 'name_chars': len(text), 'aliases': 2, 'note': True}
+    assert summaries['list_knowledge']['filters'] == ['as_of_valid', 'entity_id', 'predicate']
+    assert summaries['record_task']['state'] == 'open' and summaries['record_decision']['valid'] == [False, False]
+    assert summaries['get_entity'] == {'by': 'name', 'entity': None, 'as_of': [True, False], 'include_closed': False,
+                                       'limit': None}
+    assert SENTINEL not in json.dumps(summaries, ensure_ascii=False)
+    for tool, args in calls.items():           # through handle: stage 0 bodies, nothing with text logged
+        call(state, tool, **args)
+    for row in state.write_db.execute('SELECT * FROM tool_calls'):
+        assert not any(SENTINEL in str(value) for value in row), row
+
+
+def test_knowledge_envelope_moves_notice_and_delivers_the_quotes():
+    obj, text = piece(1, '합성 인용')
+    envelope = tools.knowledge_envelope({'assertion': {'id': 1, 'evidence': [{'id': 2, 'locator': obj, 'quote': text}]},
+                                         'conflicts': [], 'duplicates': [], 'notice': ['합성 안내']})
+    assert envelope == {'ok': True, 'result': {'assertion': {'id': 1, 'evidence': [{'id': 2, 'locator': obj,
+                                                                                    'quote': text}]},
+                                               'conflicts': [], 'duplicates': []},
+                        'delivered_sources': [locator.display(obj)], 'notice': ['합성 안내']}
