@@ -43,3 +43,20 @@ def test_shared_values():
     expected = fixtures.Expected('docs/a.txt', 'text', 'ok', unit_count=1,
                                  units_sample={1: ('line', {'kind': 'line', 'line': 1}, fixtures.LINES_KO[0])})
     assert expected.error is None and expected.encoding is None
+
+
+def test_client_configs_are_never_tracked():
+    """``.mcp.json`` and ``.codex/config.toml`` hold PC-specific paths and the data home; they stay
+    git-ignored (design M3 §11.2, review L4). ``git`` runs here, in test code, never in the package."""
+    import shutil
+    import subprocess
+    git = shutil.which('git')
+    repo = TESTS.parent
+    if git is None or not (repo/'.git').exists():
+        pytest.skip('no git checkout')
+    tracked = subprocess.run([git, 'ls-files', '--', '.mcp.json', '.codex', '**/.mcp.json', '**/.codex/*'],
+                             cwd=repo, capture_output=True, text=True, check=True).stdout.split()
+    assert tracked == []
+    ignored = subprocess.run([git, 'check-ignore', '--', '.mcp.json', '.codex/config.toml'], cwd=repo,
+                             capture_output=True, text=True).stdout.split()
+    assert ignored == ['.mcp.json', '.codex/config.toml']

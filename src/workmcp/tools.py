@@ -77,7 +77,12 @@ def ok(result, *, delivered_sources=(), notice=()) -> dict:
     return {'ok': True, 'result': result, 'delivered_sources': list(delivered_sources), 'notice': list(notice)}
 
 
+ERROR_MESSAGE_MAX = 200  # an error message may name what the client sent; never more than this (review M3-3)
+
+
 def error(code: str, message: str, *, retryable: bool = False) -> dict:
+    if len(message) > ERROR_MESSAGE_MAX:
+        message = message[:ERROR_MESSAGE_MAX - 1] + '…'
     return {'ok': False, 'error': {'code': code, 'message': message, 'retryable': retryable}}
 
 
@@ -292,6 +297,8 @@ def _page_error(limit, offset) -> dict | None:
 
 SEMANTIC_NOTE_NOTICE = '의미 검색 사용 불가({}) — 어휘 결과만'
 _NOTE_CODE = re.compile(r'[a-z_]+')
+CHUNK_GONE_HINT = ('scan/index가 청크를 바꿨을 수 있습니다 — 다시 검색하거나 hit의 locator로 get_snippet을 '
+                   '부르세요(옛 버전도 locator로는 나옵니다)')
 NO_EVENTS_NOTICE = '이 저장소의 과거 scan은 이벤트를 남기지 않았습니다(M3 이전); 다음 scan부터 기록됩니다'
 
 
@@ -342,7 +349,10 @@ def get_snippet(home: Path, *, chunk_id: int | None = None, locator: dict | None
     db = store.open_read(home)
     try:
         if chunk_id is not None:
-            result = snippet.by_chunk(db, chunk_id, context_units=context_units, max_chars=max_chars)
+            try:
+                result = snippet.by_chunk(db, chunk_id, context_units=context_units, max_chars=max_chars)
+            except snippet.NotFound as exc:  # review L5: chunk ids of an older search may be gone
+                raise snippet.NotFound(f'{exc}; {CHUNK_GONE_HINT}') from None
         else:
             result = snippet.by_locator(db, locator, context_units=context_units, max_chars=max_chars)
     finally:

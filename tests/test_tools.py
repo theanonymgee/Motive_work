@@ -824,3 +824,61 @@ def test_long_lived_server_never_returns_superseded_after_scan_and_sees_new_text
     monkeypatch.setattr(store, 'ELIGIBLE_VERSIONS', "d.status = 'active' AND v.parse_status = 'ok' "
                                                     "AND v.unit_count > 0")
     assert third in {h['version_id'] for h in call(state, 'search', query=newer_line, mode='lexical')['result']['hits']}
+
+
+# ---- review M3-2 / L5: a chunk id from an older search never names another text --------------------
+
+@pytest.mark.parametrize('rowid_ids', [False, True])
+def test_a_chunk_id_is_never_given_to_another_text(tmp_path, monkeypatch, rowid_ids):
+    """The reviewer's scenario (M3-2). ``rowid_ids`` is the mutation check: with plain rowid ids (the
+    old behaviour) the freed id goes to z.txt and ``get_snippet`` quietly answers with z.txt's text."""
+    if rowid_ids:
+        monkeypatch.setattr(store, 'take_chunk_ids', lambda db, count: db.execute(
+            'SELECT COALESCE(MAX(id), 0) + 1 FROM chunks').fetchone()[0])
+    home = new_home(tmp_path)
+    folder = tmp_path/'src'
+    folder.mkdir()
+    (folder/'a.txt').write_text('알파 고유어 알파필드 일정', encoding='utf-8')
+    (folder/'b.txt').write_text('베타 고유어 브라보필드 일정', encoding='utf-8')
+    db = store.open_home(home)
+    try:
+        root = add_root(db, folder)
+        scan(db, root)
+    finally:
+        db.close()
+    run_index(home)
+    state = server.make_state(home, engine=hash_engine(home))
+    [hit] = [h for h in first_hits(state, '브라보필드', mode='lexical') if h['doc']['path'].endswith('b.txt')]
+    (folder/'b.txt').unlink()
+    rescan(home, root)
+    run_index(home)                                    # b.txt's chunk (the highest id) is dropped
+    (folder/'z.txt').write_text('제타 전혀 다른 새 파일 내용', encoding='utf-8')
+    rescan(home, root)
+    run_index(home)
+    db = store.open_read(home)
+    try:
+        ids = [row[0] for row in db.execute('SELECT id FROM chunks ORDER BY id')]
+    finally:
+        db.close()
+    if rowid_ids:
+        reused = call(state, 'get_snippet', chunk_id=hit['chunk_id'])
+        assert reused['ok'] and reused['result']['doc']['path'].endswith('z.txt')   # what the fix prevents
+        return
+    assert hit['chunk_id'] not in ids and max(ids) > hit['chunk_id']   # a new id, not the freed one
+    gone = call(state, 'get_snippet', chunk_id=hit['chunk_id'])
+    assert gone['ok'] is False and gone['error']['code'] == 'not_found'
+    assert tools.CHUNK_GONE_HINT in gone['error']['message']   # review L5
+    old = call(state, 'get_snippet', locator=hit['locator'])     # the hit's locator still gives its text
+    assert old['ok'] and old['result']['pieces'][0]['text'] == hit['snippet']
+    assert old['result']['version']['latest_version_id'] is None  # b.txt is deleted
+
+
+def test_chunk_ids_keep_growing_after_the_highest_is_dropped(tmp_path):
+    home = new_home(tmp_path)
+    db = store.open_home(home)
+    try:
+        assert store.take_chunk_ids(db, 3) == 1 and store.take_chunk_ids(db, 1) == 4
+        db.execute("INSERT INTO meta(key, value, updated_at) VALUES('x', '1', 'now')")  # unrelated row
+        assert store.meta_get(db, store.CHUNK_ID_HIGH) == '4'
+    finally:
+        db.close()

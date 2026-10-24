@@ -1,6 +1,6 @@
 [mcp_servers.workmcp]
 command = 'C:\Users\<USER>\Project\Motive_work\.venv\Scripts\python.exe'
-args = ["-m", "workmcp", "serve"]
+args = ["-I", "-m", "workmcp", "serve"]
 tool_timeout_sec = 120
 
 [mcp_servers.workmcp.env]

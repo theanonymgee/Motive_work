@@ -5,15 +5,17 @@ import inspect
 import json
 import logging
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import anyio
 import pytest
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 
 from fixtures import LINES_KO
 from test_collect import add_root, scan
-from workmcp import config, embedder, index, locator, paths, search, server, snippet, store, tools
+from workmcp import config, embedder, index, locator, parsers, paths, search, server, snippet, store, tools
 
 
 class Clock:
@@ -128,8 +130,8 @@ def test_unexpected_exception_becomes_internal_error_with_class_name_only(state,
 def test_call_log_failure_adds_a_notice_but_the_response_goes_out(state, capsys):
     state.write_db.close()
     envelope = json.loads(server.handle(state, 'status', {}, ('c', '')))
-    assert envelope['ok'] and envelope['notice'][-1].startswith('로컬 전달 기록(deliveries) 실패: ')
-    assert 'call log failed for status' in capsys.readouterr().err
+    assert envelope['ok'] and envelope['notice'][-1] == server.LOG_DELAYED_NOTICE.format(1)
+    assert 'call log delayed for status (1 queued)' in capsys.readouterr().err
     state.write_db = store.open_home(state.home)
 
 
@@ -243,3 +245,133 @@ def test_serve_start_reports_app_virtualization_on_stderr(workmcp_home, monkeypa
     [line] = [text for text in captured.err.splitlines() if 'app virtualization' in text]
     assert line.startswith('workmcp: ') and line.endswith(
         paths.virtualization_line(workmcp_home, paths.virtualization_probe(workmcp_home, __import__('os').environ)))
+
+
+# ---- review M3-1: the call log never holds a call up -----------------------------------------------
+
+def logged_calls(home) -> list[tuple]:
+    db = store.open_read(home)
+    try:
+        return db.execute('SELECT tool, call_id FROM tool_calls ORDER BY id').fetchall()
+    finally:
+        db.close()
+
+
+def test_a_running_scan_does_not_hold_tool_calls_up_and_the_log_catches_up(state, tmp_path, monkeypatch, capsys):
+    """A scan in progress keeps its write transaction open (``collect.scan``); a tool call made then
+    answers at once (well under a second), its log rows wait in memory and are written by the next call."""
+    folder = tmp_path/'src'
+    folder.mkdir()
+    for n in range(3):
+        (folder/f'{n}.txt').write_text('\n'.join(f'{n}번 {line}' for line in LINES_KO), encoding='utf-8')
+    scanner = store.open_home(state.home)  # the scan's own connection, as another process would have
+    root = add_root(scanner, folder)
+    real_parse = parsers.parse
+    during = []
+
+    def parse_and_call(data, ext, limits):  # runs inside the scan's BEGIN IMMEDIATE ... COMMIT
+        began = time.perf_counter()
+        envelope = json.loads(server.handle(state, 'list_documents', {}, ('c', '')))
+        during.append((time.perf_counter() - began, envelope))
+        return real_parse(data, ext, limits)
+
+    monkeypatch.setattr(parsers, 'parse', parse_and_call)
+    try:
+        scan(scanner, root)
+    finally:
+        scanner.close()
+    monkeypatch.setattr(parsers, 'parse', real_parse)
+    assert len(during) == 3
+    for seconds, envelope in during:
+        assert seconds < 1.0 and envelope['ok']
+    assert [envelope['notice'][-1] for _, envelope in during] == \
+        [server.LOG_DELAYED_NOTICE.format(n) for n in (1, 2, 3)]
+    assert 'call log delayed for list_documents' in capsys.readouterr().err
+    assert logged_calls(state.home) == [] and len(state.pending) == 3
+    queued = [call['call_id'] for call, _ in state.pending]
+    server.handle(state, 'status', {}, ('c', ''))  # the store is free again: the queue goes first
+    assert state.pending == []
+    assert logged_calls(state.home) == [*(('list_documents', call_id) for call_id in queued),
+                                        ('status', logged_calls(state.home)[-1][1])]
+
+
+def hold_write_lock(home):
+    other = store.open_home(home)
+    other.execute('BEGIN IMMEDIATE')
+    return other
+
+
+def test_ticker_writes_the_queue_and_close_reports_what_is_lost(state, capsys):
+    other = hold_write_lock(state.home)
+    began = time.perf_counter()
+    hits = json.loads(server.handle(state, 'status', {}, ('c', '')))
+    assert time.perf_counter() - began < 1.0 and hits['ok'] and len(state.pending) == 1
+    other.execute('COMMIT')
+    other.close()
+    state.tick = 0.01
+
+    async def session():
+        async with server._lifespan(state)(None):
+            for _ in range(200):
+                if not state.pending:
+                    break
+                await anyio.sleep(0.01)
+
+    anyio.run(session)
+    assert state.pending == [] and [row[0] for row in logged_calls(state.home)] == ['status']
+    other = hold_write_lock(state.home)
+    try:
+        server.handle(state, 'status', {}, ('c', ''))
+        capsys.readouterr()
+        assert server.close_log(state) == 1
+        assert '1 call log entries were not written' in capsys.readouterr().err
+    finally:
+        other.execute('ROLLBACK')
+        other.close()
+
+
+def test_make_state_shortens_the_log_connection_busy_timeout(state):
+    assert state.write_db.execute('PRAGMA busy_timeout').fetchone()[0] == server.LOG_BUSY_MS
+
+
+# ---- review M3-3: every answer, errors too, fits the budget ----------------------------------------
+
+def test_error_answers_fit_the_budget_and_messages_are_short(state, tmp_path):
+    indexed(state, tmp_path)
+    found = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'lexical'}, ('c', '')))
+    hit = found['result']['hits'][0]
+    for unit in ({'kind': 'sheet_cell', 'sheet': 'S' * 60_000, 'cell': 'A1'},
+                 {'kind': 'cell', 'row': 1, 'columns': list(range(1, 20_000))}):
+        raw = server.handle(state, 'get_snippet', {'locator': {**hit['locator'], 'unit': unit}}, ('c', ''))
+        envelope = json.loads(raw)
+        assert len(raw) <= tools.RESPONSE_MAX_CHARS and envelope['ok'] is False
+        assert envelope['error']['code'] == 'not_found' and len(envelope['error']['message']) <= tools.ERROR_MESSAGE_MAX
+    assert len(tools.error('x', 'y' * 1000)['error']['message']) == tools.ERROR_MESSAGE_MAX
+
+
+def test_the_final_length_check_catches_any_oversized_answer(state, monkeypatch):
+    monkeypatch.setitem(server.TOOLS, 'status', lambda state, **args: {
+        'ok': False, 'error': {'code': 'not_found', 'message': 'x' * 50_000, 'retryable': False}})
+    raw = server.handle(state, 'status', {}, ('c', ''))
+    assert json.loads(raw)['error']['code'] == 'response_too_large' and len(raw) < 200
+    assert calls(state)[-1][3:5] == (0, 'response_too_large')
+
+
+# ---- review L1: no silent integer or boolean conversion --------------------------------------------
+
+@pytest.mark.parametrize('tool, arguments', [
+    ('search', {'query': '견적', 'limit': True}),
+    ('search', {'query': '견적', 'limit': 2.0}),
+    ('search', {'query': '견적', 'collapse_by_document': 'yes'}),
+    ('get_snippet', {'chunk_id': True}),
+    ('get_snippet', {'chunk_id': 1, 'context_units': 1.0}),
+    ('list_documents', {'offset': False}),
+    ('recent_changes', {'limit': '5'}),
+])
+def test_integer_and_boolean_arguments_are_strict(state, tool, arguments):
+    built = server.build_server(state.home, state=state)
+    with pytest.raises(ToolError, match='validation error'):  # the SDK's argument error (isError on the wire)
+        anyio.run(built.call_tool, tool, arguments)
+    assert calls(state) == []  # our code never ran
+    fine = anyio.run(built.call_tool, 'list_documents', {'limit': 3, 'offset': 0})
+    assert not fine.is_error

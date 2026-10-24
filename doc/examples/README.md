@@ -14,8 +14,9 @@
    - `<USER>`: 이 PC의 Windows 사용자 이름.
    - `command`: 이 저장소의 `.venv\Scripts\python.exe` 절대 경로. 저장소를 다른 곳에 두었다면 `C:\Users\<USER>\Project\Motive_work` 부분도 맞춘다.
    - `WORKMCP_HOME`: 데이터 홈 절대 경로. 평상시 `C:\Users\<USER>\Motive_work`, 연결 시험 중에는 합성 자료만 든 시험 홈(예: `C:\Users\<USER>\Motive_work_m3test`).
-3. 경로 표기: JSON은 역슬래시를 `\`로 두 번 쓴다. TOML은 작은따옴표 문자열(`'...'`)이라 역슬래시를 한 번만 쓴다.
-4. 확인은 `doc/validation/2026-10-24_M3-연결확인_v1.md`의 절차를 따른다. 터미널에서는 `uv run workmcp doctor`로 데이터 홈과 가상화 여부를 먼저 본다.
+3. `args`의 `-I`(파이썬 격리 모드)는 지우지 않는다: Claude 앱 안에서 뜬 셸·클라이언트는 다른 도구의 `PYTHONPATH`(다른 Python 버전의 패키지)를 물려받을 수 있고, 그대로면 serve가 `pydantic_core` import 오류로 시작하지 못한다(이 PC에서 확인, 검토 v1 M3-4). `-I`는 `PYTHONPATH`·사용자 site·작업 폴더를 무시하고 venv의 설치는 그대로 쓴다.
+4. 경로 표기: JSON은 역슬래시를 `\`로 두 번 쓴다. TOML은 작은따옴표 문자열(`'...'`)이라 역슬래시를 한 번만 쓴다.
+5. 확인은 `doc/validation/2026-10-24_M3-연결확인_v1.md`의 절차를 따른다. 터미널에서는 `uv run workmcp doctor`로 데이터 홈과 가상화 여부를 먼저 본다.
 
 ## `WORKMCP_HOME`을 AppData 밖에 두는 이유
 

@@ -5,8 +5,17 @@ thread and every request in its own task; an async tool runs to the end on the e
 so tool calls never overlap and ``search.Engine`` needs no lock). Every tool returns one string,
 the compact JSON envelope (``structured_output=False``: the SDK sends it as one text content as is).
 ``handle`` is the common path: idle release, the tool function, the size budget, the local call
-log (``tool_calls`` + ``deliveries``, no query or body text) and a last guard that turns any
-exception into ``internal_error`` with the exception class name only (traceback to stderr).
+log (``tool_calls`` + ``deliveries``, no query or body text), a last guard that turns any
+exception into ``internal_error`` with the exception class name only (traceback to stderr) and a
+final length check of the serialized answer (``response_too_large``, review M3-3).
+
+The call log never holds a call up (review M3-1): its write waits at most ``LOG_BUSY_MS`` for the
+store (a running ``scan`` keeps a write transaction open) and a call it could not write stays in a
+queue in this process's memory, written by the next call or the ticker. Entries still queued when
+the server stops are lost; their number goes to stderr.
+
+Integer and boolean arguments are strict (``StrictInt``/``StrictBool``): the SDK refuses ``true`` or
+``2.0`` for an integer with its argument validation error (review L1) instead of converting them.
 
 stdout carries MCP JSON-RPC only: nothing here prints to stdout, logs go to stderr. The server
 runs the stdio transport only and makes no outbound calls; ``anyio`` is used for the idle-release
@@ -28,6 +37,7 @@ from typing import Any
 import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from pydantic import StrictBool, StrictInt
 
 from . import __version__, config, locator, paths, search, snippet, store, tools
 
@@ -37,7 +47,9 @@ INSTRUCTIONS = ('응답의 delivered_sources가 이번 응답으로 PC를 떠난
                 '검색 결과 없음 ≠ 회사에 그 정보가 없음.')
 CLIENT_MAX_CHARS = 64
 UNKNOWN_CLIENT = 'unknown'
-LOG_FAILED_NOTICE = '로컬 전달 기록(deliveries) 실패: {}'
+LOG_DELAYED_NOTICE = '로컬 전달 기록(deliveries)을 지금 쓰지 못해 대기열에 두었습니다({}건) — 다음 호출에서 씁니다'
+LOG_BUSY_MS = 200           # the call log's busy_timeout: a scan's write transaction never holds a call up
+LOG_QUEUE_MAX = 10_000      # calls kept in memory while the store is busy; older ones are dropped (counted)
 MODEL_LOADED_NOTICE = '의미 검색 모델을 이 호출에서 처음 로드했습니다(+{} ms); 다음 질의부터 빠릅니다'
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f]')
 
@@ -53,6 +65,8 @@ class ServerState:
     tick: float = 30.0
     started_at: str = field(default_factory=store.now)
     unloads: int = 0
+    pending: list = field(default_factory=list)   # (tool_calls row, deliveries rows) not written yet
+    log_dropped: int = 0
 
 
 def make_state(home: Path, *, engine: search.Engine | None = None, write_db: sqlite3.Connection | None = None,
@@ -60,6 +74,8 @@ def make_state(home: Path, *, engine: search.Engine | None = None, write_db: sql
     """State from ``<home>/config.toml`` (raises ``config.ConfigError``); ``engine`` is injected by
     tests (``HashEmbedder`` factory), else the manifest model, loaded on first semantic use."""
     settings = settings or config.load(home)
+    if write_db is not None:
+        write_db.execute(f'PRAGMA busy_timeout={LOG_BUSY_MS}')
     return ServerState(home=Path(home), engine=engine or search.Engine(home, settings.search), write_db=write_db,
                        budget=settings.server.response_max_chars - tools.NOTICE_RESERVE,
                        tick=float(settings.server.unload_tick_seconds))
@@ -112,11 +128,34 @@ def _annotate_engine(envelope: dict, engine: search.Engine, loads_before: int) -
         envelope['notice'].append(MODEL_LOADED_NOTICE.format(load_ms))
 
 
+def flush_log(state: ServerState) -> bool:
+    """Write every queued call (``tool_calls`` + its ``deliveries`` rows) in one transaction; True when
+    the queue is empty afterwards. A busy store (``LOG_BUSY_MS``) or any SQLite error keeps the queue."""
+    if not state.pending:
+        return True
+    db = state.write_db
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            for call, rows in state.pending:
+                store.record_call(db, call)
+                store.record_deliveries(db, call['call_id'], rows)
+            db.execute('COMMIT')
+        except BaseException:
+            db.execute('ROLLBACK')
+            raise
+    except sqlite3.Error:
+        return False
+    state.pending.clear()
+    return True
+
+
 def _record(state: ServerState, call_id: str, client: tuple[str, str], tool: str, args: dict, envelope: dict,
-            began: float) -> None:
-    """One ``tool_calls`` row and one ``deliveries`` row per delivered piece, in one transaction."""
+            began: float) -> bool:
+    """Queue one ``tool_calls`` row and one ``deliveries`` row per delivered piece and write the queue;
+    True when written now (also when there is no write connection: nothing is logged, tests only)."""
     if state.write_db is None:
-        return
+        return True
     pieces = tools.pieces_of(envelope)
     at = store.now()
     call = {'at': at, 'client': client[0], 'client_version': client[1], 'tool': tool, 'call_id': call_id,
@@ -126,15 +165,11 @@ def _record(state: ServerState, call_id: str, client: tuple[str, str], tool: str
             'elapsed_ms': round((time.perf_counter() - began) * 1000, 1), 'pid': os.getpid()}
     rows = [{'at': at, 'client': client[0], 'tool': tool, 'locator_json': obj, 'chars': len(text)}
             for obj, text in pieces]
-    db = state.write_db
-    db.execute('BEGIN IMMEDIATE')
-    try:
-        store.record_call(db, call)
-        store.record_deliveries(db, call_id, rows)
-        db.execute('COMMIT')
-    except BaseException:
-        db.execute('ROLLBACK')
-        raise
+    state.pending.append((call, rows))
+    if len(state.pending) > LOG_QUEUE_MAX:
+        state.pending.pop(0)
+        state.log_dropped += 1
+    return flush_log(state)
 
 
 def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -> str:
@@ -164,16 +199,22 @@ def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -
     except Exception as exc:  # noqa: BLE001 - last guard: class name only to the client, traceback to stderr
         LOG.exception('tool %s failed', tool)
         envelope = tools.error('internal_error', type(exc).__name__)
-    for attempt in (1, 2):
-        try:
-            _record(state, call_id, client, tool, args, envelope, began)
-            break
-        except sqlite3.Error as exc:
-            if attempt == 2:
-                print(f'workmcp: call log failed for {tool}: {type(exc).__name__}', file=sys.stderr)
-                if envelope.get('ok'):
-                    envelope['notice'].append(LOG_FAILED_NOTICE.format(type(exc).__name__))
+    limit = state.budget + tools.NOTICE_RESERVE
+    if len(tools.dumps(envelope)) > limit:  # any path, errors too (review M3-3)
+        envelope = tools.error('response_too_large', f'the response does not fit in {limit} characters')
+    if not _record(state, call_id, client, tool, args, envelope, began):
+        print(f'workmcp: call log delayed for {tool} ({len(state.pending)} queued)', file=sys.stderr)
+        if envelope.get('ok'):
+            envelope['notice'].append(LOG_DELAYED_NOTICE.format(len(state.pending)))
     return tools.dumps(envelope)
+
+
+def close_log(state: ServerState) -> int:
+    """Last write of the queue when the server stops; returns (and reports on stderr) what is lost."""
+    lost = state.log_dropped + (0 if state.write_db is None or flush_log(state) else len(state.pending))
+    if lost:
+        print(f'workmcp: {lost} call log entries were not written (store busy)', file=sys.stderr)
+    return lost
 
 
 async def _ticker(state: ServerState) -> None:
@@ -181,6 +222,8 @@ async def _ticker(state: ServerState) -> None:
         await anyio.sleep(state.tick)
         try:
             unload_if_idle(state)
+            if state.pending:
+                flush_log(state)
         except Exception:  # noqa: BLE001 - the ticker must keep running
             LOG.exception('idle release failed')
 
@@ -204,9 +247,9 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
     server = MCPServer('workmcp', version=__version__, instructions=INSTRUCTIONS, lifespan=_lifespan(state))
 
     @server.tool(name='search', structured_output=False)
-    async def search_tool(query: str, mode: str = 'hybrid', limit: int = 10, path_prefix: str | None = None,
+    async def search_tool(query: str, mode: str = 'hybrid', limit: StrictInt = 10, path_prefix: str | None = None,
                           ext: list[str] | None = None, since: str | None = None, until: str | None = None,
-                          collapse_by_document: bool = False, ctx: Context | None = None) -> str:
+                          collapse_by_document: StrictBool = False, ctx: Context | None = None) -> str:
         """Hybrid (lexical + semantic) search over the collected documents. Returns up to `limit` hits, each
         with a snippet of document text (at most 600 characters) and its exact source locator;
         delivered_sources lists the source of every snippet in this response. units[] names the stored units
@@ -218,8 +261,8 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
                                         'collapse_by_document': collapse_by_document}, client_of(ctx))
 
     @server.tool(name='get_snippet', structured_output=False)
-    async def get_snippet_tool(chunk_id: int | None = None, locator: dict[str, Any] | None = None,
-                               context_units: int = 0, max_chars: int = tools.PIECE_MAX_CHARS,
+    async def get_snippet_tool(chunk_id: StrictInt | None = None, locator: dict[str, Any] | None = None,
+                               context_units: StrictInt = 0, max_chars: StrictInt = tools.PIECE_MAX_CHARS,
                                ctx: Context | None = None) -> str:
         """Document text of one search hit (chunk_id) or one locator, as pieces per stored unit with exact
         locators, plus up to 5 whole units of context before and after (context_units). Returns document
@@ -230,8 +273,8 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
 
     @server.tool(name='list_documents', structured_output=False)
     async def list_documents_tool(path_prefix: str | None = None, ext: list[str] | None = None, status: str = 'active',
-                                  changed_since: str | None = None, limit: int = tools.LIST_LIMIT_DEFAULT,
-                                  offset: int = 0, ctx: Context | None = None) -> str:
+                                  changed_since: str | None = None, limit: StrictInt = tools.LIST_LIMIT_DEFAULT,
+                                  offset: StrictInt = 0, ctx: Context | None = None) -> str:
         """Collected documents with their latest version (path, hash, size, parse status, indexed or not).
         Returns no document text. status: active|deleted|skipped|all; limit 1-500, offset for paging."""
         return handle(state, 'list_documents', {'path_prefix': path_prefix, 'ext': ext, 'status': status,
@@ -241,7 +284,7 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
     @server.tool(name='recent_changes', structured_output=False)
     async def recent_changes_tool(since: str | None = None, until: str | None = None, kinds: list[str] | None = None,
                                   path_prefix: str | None = None, ext: list[str] | None = None,
-                                  limit: int = tools.LIST_LIMIT_DEFAULT, offset: int = 0,
+                                  limit: StrictInt = tools.LIST_LIMIT_DEFAULT, offset: StrictInt = 0,
                                   ctx: Context | None = None) -> str:
         """Documents added, changed, restored, deleted or reparsed by scans, newest first (default: the last
         30 days). Returns no document text. kinds: added|changed|restored|deleted|reparsed."""
@@ -275,9 +318,11 @@ def main(argv=None) -> int:
         print(exc, file=sys.stderr)
         return 4
     write_db = store.open_home(home)  # migrates once; kept open for the call log
+    state = make_state(home, write_db=write_db, settings=settings)
     try:
-        build_server(home, state=make_state(home, write_db=write_db, settings=settings)).run(transport='stdio')
+        build_server(home, state=state).run(transport='stdio')
     finally:
+        close_log(state)
         write_db.close()
     return 0
 

@@ -44,8 +44,9 @@ COMMON_IMPORTS = frozenset({'__future__', 'argparse', 'collections.abc', 'datacl
 MODULE_IMPORTS = {
     # M3 (design M3 §6.2, appendix C): the request Context (client name), anyio for the idle-release
     # ticker (sleep, create_task_group), contextlib for the lifespan, time for elapsed, logging to stderr.
+    # pydantic's strict int/bool types keep the SDK from turning true or 2.0 into an integer (review L1).
     'server.py': frozenset({'mcp.server.MCPServer', 'mcp.server.mcpserver.Context', 'anyio', 'contextlib', 'time',
-                            'logging'}),
+                            'logging', 'pydantic.StrictBool', 'pydantic.StrictInt'}),
     'paths.py': frozenset({'unicodedata'}),  # NFC before comparing sync folder names (M0 review v2 N-L8)
     'config.py': frozenset({'tomllib'}),
     'collect.py': frozenset({'fnmatch'}),

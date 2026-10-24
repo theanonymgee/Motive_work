@@ -31,7 +31,7 @@ def main(argv=None) -> int:
     parser.add_argument('--timeout', type=float, default=180)
     args = parser.parse_args(argv)
     entry = json.loads(Path(args.config).read_text(encoding='utf-8'))['mcpServers']['workmcp']
-    env = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'VIRTUAL_ENV')}
+    env = dict(os.environ)  # as a client passes it, PYTHONPATH included: the config's -I must cope (review M3-4)
     env.update(entry.get('env', {}))
     proc = subprocess.Popen([entry['command'], *entry['args']], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, cwd=ROOT, text=True, encoding='utf-8')

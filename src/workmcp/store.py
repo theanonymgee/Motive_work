@@ -477,6 +477,20 @@ def fts_available(db: sqlite3.Connection) -> bool:
     return exists is not None and fts5_available()
 
 
+CHUNK_ID_HIGH = 'chunk_id_high'  # meta: the highest chunk id ever given (review M3-2)
+
+
+def take_chunk_ids(db: sqlite3.Connection, count: int) -> int:
+    """The first of ``count`` new chunk ids, never used before in this store: ``chunks.id`` is a plain
+    rowid (SQLite would give a deleted highest id again), so ids come from a counter in ``meta`` that
+    only grows (``max(counter, MAX(id))`` for a store made before it existed). A ``get_snippet`` call
+    with a ``chunk_id`` from an older search therefore finds that chunk or nothing, never another text
+    (review M3-2). ``chunks_fts`` rows use the same id (external content, ``rowid = chunks.id``)."""
+    high = max(int(meta_get(db, CHUNK_ID_HIGH, '0')), db.execute('SELECT COALESCE(MAX(id), 0) FROM chunks').fetchone()[0])
+    meta_set(db, CHUNK_ID_HIGH, str(high + count))
+    return high + 1
+
+
 def insert_chunks(db: sqlite3.Connection, version_id: int, chunk_version: str, specs=(), *,
                   copy_from: int | None = None) -> int:
     """Store the chunks of one version under ``chunk_version`` and add them to ``chunks_fts``.
@@ -493,24 +507,20 @@ def insert_chunks(db: sqlite3.Connection, version_id: int, chunk_version: str, s
     if copy_from is not None:
         if specs:
             raise ValueError('pass specs or copy_from, not both')
-        stored = db.execute(
-            'INSERT INTO chunks(version_id, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
-            'text, text_sha256) SELECT ?, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
-            'text, text_sha256 FROM chunks WHERE version_id=? AND chunk_version=? ORDER BY ordinal',
-            (version_id, copy_from, chunk_version)).rowcount
+        rows = db.execute('SELECT ordinal, unit_first, unit_last, char_start, char_end, text, text_sha256 FROM chunks '
+                          'WHERE version_id=? AND chunk_version=? ORDER BY ordinal',
+                          (copy_from, chunk_version)).fetchall()
     else:
-        sql = ('INSERT INTO chunks(version_id, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
-               'text, text_sha256) VALUES(?,?,?,?,?,?,?,?,?)')
-        stored, batch = 0, []
-        for spec in specs:
-            batch.append((version_id, chunk_version, spec.ordinal, spec.unit_first, spec.unit_last, spec.char_start,
-                          spec.char_end, spec.text, hashlib.sha256(spec.text.encode('utf-8')).hexdigest()))
-            if len(batch) >= CHUNK_INSERT_BATCH:
-                db.executemany(sql, batch)
-                stored, batch = stored + len(batch), []
-        if batch:
-            db.executemany(sql, batch)
-            stored += len(batch)
+        rows = [(spec.ordinal, spec.unit_first, spec.unit_last, spec.char_start, spec.char_end, spec.text,
+                 hashlib.sha256(spec.text.encode('utf-8')).hexdigest()) for spec in specs]
+    sql = ('INSERT INTO chunks(id, version_id, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
+           'text, text_sha256) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    stored = 0
+    for at in range(0, len(rows), CHUNK_INSERT_BATCH):
+        part = rows[at:at + CHUNK_INSERT_BATCH]
+        first = take_chunk_ids(db, len(part))
+        db.executemany(sql, [(first + n, version_id, chunk_version, *row) for n, row in enumerate(part)])
+        stored += len(part)
     if stored:
         if fts_in_step(db):
             db.execute('INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks '
