@@ -149,8 +149,8 @@ def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -
         _annotate_engine(envelope, state.engine, loads_before)
     except search.SearchError as exc:
         envelope = tools.error(exc.code, exc.message)
-    except locator.LocatorError as exc:
-        envelope = tools.error('locator_invalid', str(exc))
+    except locator.LocatorError as exc:  # a fixed code (shape, hash, range, text mismatch), no text
+        envelope = tools.error('locator_invalid', exc.code)
     except snippet.NotFound as exc:
         envelope = tools.error('not_found', str(exc))
     except FileNotFoundError as exc:
@@ -265,6 +265,8 @@ def main(argv=None) -> int:
         print(exc, file=sys.stderr)
         return 2
     paths.ensure_home(home)
+    print(f'workmcp: {paths.virtualization_line(home, paths.virtualization_probe(home, os.environ))}',
+          file=sys.stderr)
     try:
         settings = config.load(home)
     except config.ConfigError as exc:

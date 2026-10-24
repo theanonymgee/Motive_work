@@ -151,26 +151,93 @@ def drive_warning(home: Path, env: Mapping[str, str]) -> str | None:
 
 
 VIRTUALIZATION_KEYS = ('checked', 'under_appdata', 'redirected_to', 'package')
-APPDATA_ENV = ('LOCALAPPDATA', 'APPDATA')
 
 
-def _appdata_roots(env: Mapping[str, str]) -> list[Path]:
-    roots = [Path(env[name]) for name in APPDATA_ENV if env.get(name) and Path(env[name]).is_absolute()]
+def _appdata_parts(home: Path, env: Mapping[str, str]) -> tuple[str, ...] | None:
+    """``('Local' | 'Roaming' | ..., *rest)``: where ``home`` lies inside ``AppData``; None outside it."""
+    home = Path(home)
+    for name, folder in (('LOCALAPPDATA', 'Local'), ('APPDATA', 'Roaming')):
+        if env.get(name) and Path(env[name]).is_absolute() and _within(home, Path(env[name])):
+            return (folder, *home.parts[len(Path(env[name]).parts):])
     if env.get('USERPROFILE') and Path(env['USERPROFILE']).is_absolute():
-        roots.append(Path(env['USERPROFILE'])/'AppData')
-    return roots
+        appdata = Path(env['USERPROFILE'])/'AppData'
+        if _within(home, appdata):
+            return home.parts[len(appdata.parts):]
+    return None
+
+
+def _packages_dir(env: Mapping[str, str]) -> Path | None:
+    if env.get('LOCALAPPDATA') and Path(env['LOCALAPPDATA']).is_absolute():
+        return Path(env['LOCALAPPDATA'])/'Packages'
+    if env.get('USERPROFILE') and Path(env['USERPROFILE']).is_absolute():
+        return Path(env['USERPROFILE'])/'AppData'/'Local'/'Packages'
+    return None
+
+
+def _write_marker(path: Path) -> None:
+    """Create the probe marker (separate so tests can stand in for the app's redirection)."""
+    with open(path, 'x', encoding='ascii') as handle:
+        handle.write('workmcp virtualization probe\n')
 
 
 def virtualization_probe(home: Path, env: Mapping[str, str]) -> dict:
     """Does a packaged (MSIX) app redirect writes to ``home`` into its own folder (design M3 §10.3)?
 
     ``{'checked', 'under_appdata', 'redirected_to', 'package'}`` (``VIRTUALIZATION_KEYS``). A home
-    outside ``AppData`` is never virtualised: ``checked`` True, nothing redirected. Stage 0 fixes the
-    signature only: a home under ``AppData`` comes back ``checked`` False until the marker probe lands
-    (stage 1: marker in ``home/tmp``, looked up under ``%LOCALAPPDATA%\\Packages\\*\\LocalCache``).
+    outside ``AppData`` is never virtualised: ``checked`` True, nothing redirected. Under ``AppData``
+    a marker file is written to ``home/tmp`` and looked up in every
+    ``%LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\<Local|Roaming>\\<same relative path>\\tmp``; the
+    package folder that has it is where this process's writes really land. The marker is always
+    removed. A home not created yet (no ``tmp``) or a failing probe is ``checked`` False, never an error.
+    Standard library only (no native calls).
     """
-    under = any(_within(Path(home), root) for root in _appdata_roots(env))
-    return {'checked': not under, 'under_appdata': under, 'redirected_to': None, 'package': None}
+    home = Path(home)
+    parts = _appdata_parts(home, env)
+    if parts is None:
+        return {'checked': True, 'under_appdata': False, 'redirected_to': None, 'package': None}
+    result = {'checked': False, 'under_appdata': True, 'redirected_to': None, 'package': None}
+    packages = _packages_dir(env)
+    if packages is None or not (home/'tmp').is_dir():
+        return result
+    name = f'.virt-probe-{os.getpid()}-{os.urandom(4).hex()}'
+    marker = home/'tmp'/name
+    try:
+        _write_marker(marker)
+    except OSError:
+        return result
+    try:
+        if packages.is_dir():
+            with os.scandir(packages) as listing:
+                names = sorted(entry.name for entry in listing if entry.is_dir(follow_symlinks=False))
+        else:
+            names = []  # no packaged apps for this user: nothing can redirect
+        for package in names:
+            redirected = packages/package/'LocalCache'/Path(*parts)
+            if (redirected/'tmp'/name).is_file():
+                result.update(redirected_to=str(redirected), package=package)
+                break
+        result['checked'] = True
+    except OSError:
+        pass  # the folder could not be listed: not checked, never an error (design M3 §15 #12)
+    finally:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    return result
+
+
+def virtualization_line(home: Path, probe: Mapping) -> str:
+    """The ``doctor`` line (and the ``serve`` start line on stderr) for ``virtualization_probe``."""
+    if not probe['under_appdata']:
+        return 'app virtualization: none (home outside AppData)'
+    if not probe['checked']:
+        return 'app virtualization: not checked (home under AppData not created yet, or the probe failed)'
+    if probe['redirected_to'] is None:
+        return 'app virtualization: not redirected'
+    return (f"warning: app virtualization: writes to {home} are redirected into package {probe['package']} "
+            f"({probe['redirected_to']}); clients started outside this app see a different data home - set "
+            f'{HOME_ENV} outside AppData (e.g. %USERPROFILE%\\Motive_work) in every client\'s MCP config')
 
 
 def appdata_warning(home: Path, env: Mapping[str, str]) -> str | None:

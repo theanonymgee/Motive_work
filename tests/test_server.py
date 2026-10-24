@@ -11,7 +11,9 @@ import anyio
 import pytest
 from mcp.server.mcpserver import Context
 
-from workmcp import config, embedder, paths, search, server, store, tools
+from fixtures import LINES_KO
+from test_collect import add_root, scan
+from workmcp import config, embedder, index, locator, paths, search, server, snippet, store, tools
 
 
 class Clock:
@@ -72,9 +74,9 @@ def test_handle_returns_compact_json_envelope_and_logs_the_call(state):
     assert envelope['ok'] and set(envelope['result']) == tools.STATUS_KEYS and envelope['delivered_sources'] == []
     assert text == tools.dumps(envelope) and ': ' not in text[:40]
     assert calls(state) == [('claude-code', '2.1', 'status', 1, None, 0, 0)]
-    stage0 = json.loads(server.handle(state, 'list_documents', {'limit': 3}, ('codex', '')))
-    assert stage0['error']['code'] == tools.NOT_IMPLEMENTED
-    assert calls(state)[-1] == ('codex', '', 'list_documents', 0, 'not_implemented', 0, 0)
+    listed = json.loads(server.handle(state, 'list_documents', {'limit': 3}, ('codex', '')))
+    assert listed['ok'] and listed['result']['documents'] == [] and listed['delivered_sources'] == []
+    assert calls(state)[-1] == ('codex', '', 'list_documents', 1, None, 0, 0)
     status = json.loads(server.handle(state, 'status', {}, ('codex', '')))['result']
     assert status['calls'] == {'total': 2, 'by_client': {'claude-code': 1, 'codex': 1}}
 
@@ -100,6 +102,8 @@ def test_client_name_comes_from_client_info_or_unknown():
     (FileNotFoundError('store not created yet: C:\\x'), 'store_missing', False),
     (sqlite3.OperationalError('database is locked'), 'store_busy', True),
     (sqlite3.OperationalError('no such table: x'), 'internal_error', False),
+    (locator.LocatorError('locator_text_mismatch'), 'locator_invalid', False),
+    (snippet.NotFound('chunk 7 not found'), 'not_found', False),
 ])
 def test_known_errors_become_envelopes(state, monkeypatch, raised, code, retryable):
     def fail(state, **args):
@@ -195,3 +199,47 @@ def test_main_refuses_bad_settings_with_exit_4(workmcp_home, capsys):
     assert server.main() == 4
     captured = capsys.readouterr()
     assert captured.out == '' and 'response_max_chars' in captured.err
+
+
+def test_locator_errors_carry_the_fixed_code_only(state, monkeypatch):
+    def fail(state, **args):
+        raise locator.LocatorError('locator_text_mismatch')
+    monkeypatch.setitem(server.TOOLS, 'get_snippet', fail)
+    envelope = json.loads(server.handle(state, 'get_snippet', {}, ('c', '')))
+    assert envelope['error'] == {'code': 'locator_invalid', 'message': 'locator_text_mismatch', 'retryable': False}
+
+
+def indexed(state, tmp_path):
+    """A few synthetic lines scanned and indexed with the state's ``HashEmbedder``."""
+    folder = tmp_path/'src'
+    folder.mkdir()
+    (folder/'a.txt').write_text('\n'.join(LINES_KO), encoding='utf-8')
+    scan(state.write_db, add_root(state.write_db, folder))
+    index.run_index(state.write_db, state.home, embedder=embedder.HashEmbedder(64))
+
+
+def test_first_semantic_call_reports_model_loaded_now(state, tmp_path):
+    indexed(state, tmp_path)
+    lexical = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'lexical'}, ('c', '')))
+    assert lexical['result']['meta']['engine'] == {'model_loaded_now': False, 'load_ms': 0}
+    assert not state.engine.status()['loaded']   # lexical search never loads the model
+    first = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'semantic'}, ('c', '')))
+    engine = first['result']['meta']['engine']
+    assert engine['model_loaded_now'] is True and isinstance(engine['load_ms'], (int, float))
+    assert server.MODEL_LOADED_NOTICE.format(engine['load_ms']) in first['notice']
+    second = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'hybrid'}, ('c', '')))
+    assert second['result']['meta']['engine'] == {'model_loaded_now': False, 'load_ms': 0}
+    assert not any(line.startswith('의미 검색 모델을') for line in second['notice'])
+    state.clock.now += 61
+    again = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'semantic'}, ('c', '')))
+    assert state.unloads == 1 and again['result']['meta']['engine']['model_loaded_now'] is True
+
+
+def test_serve_start_reports_app_virtualization_on_stderr(workmcp_home, monkeypatch, capsys):
+    monkeypatch.setattr(server.MCPServer, 'run', lambda self, transport: None)
+    assert server.main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    [line] = [text for text in captured.err.splitlines() if 'app virtualization' in text]
+    assert line.startswith('workmcp: ') and line.endswith(
+        paths.virtualization_line(workmcp_home, paths.virtualization_probe(workmcp_home, __import__('os').environ)))

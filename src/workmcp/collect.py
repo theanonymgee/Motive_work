@@ -13,7 +13,8 @@ sha256 and parser version (design §3.3). A move is a delete plus an add (units 
 Files are committed in batches of ``commit_every``; deletions are judged only after every root
 was walked to the end, and never under a folder that could not be listed. Events go to the
 ``on_event`` callback (the CLI logs them): path, short hash, status and a fixed code, never
-document text.
+document text. Each added, changed, restored, reparsed or deleted document also gets a
+``document_events`` row in the same transaction as its change (design M3 §2.5; ``recent_changes``).
 """
 from __future__ import annotations
 
@@ -129,6 +130,11 @@ class _Scan:
         self.seen: set[int] = set()
         self.unreadable: list[str] = []
         self.pending = 0
+        self.scan_id: int | None = None  # the ``scans`` row, set once it exists
+
+    def event(self, doc_id: int, version_id: int | None, kind: str):
+        """A ``document_events`` row in the open batch (design M3 §2.5, appendix B)."""
+        store.add_document_event(self.db, self.scan_id, doc_id, version_id, kind)
 
     # -- plumbing ---------------------------------------------------------------------------
     def emit(self, event, path='', sha=None, status=None, code=None):
@@ -197,8 +203,8 @@ class _Scan:
              -1 if exclude is None else exclude)).fetchone()
         return row[0] if row else None
 
-    def record(self, doc_id, seq, sha, info, data, ext, counts, fill=None) -> tuple[str, str | None]:
-        """New version row (or fill/redo ``fill`` in place) with its units; ``(status, code)``."""
+    def record(self, doc_id, seq, sha, info, data, ext, counts, fill=None) -> tuple[str, str | None, int]:
+        """New version row (or fill/redo ``fill`` in place) with its units; ``(status, code, version_id)``."""
         parser = parsers.parser_for(ext)
         units, source = (), None
         if data is None:
@@ -237,7 +243,7 @@ class _Scan:
                 [(version_id, unit.ordinal, unit.kind, parsers.unit_json(unit.unit), unit.text,
                   hashlib.sha256(unit.text.encode('utf-8')).hexdigest()) for unit in units])
         counts['units'] += fields[5]
-        return fields[3], fields[4]
+        return fields[3], fields[4], version_id
 
     # -- one file ---------------------------------------------------------------------------
     def placeholder(self, root_id, path, ext, counts):
@@ -261,11 +267,13 @@ class _Scan:
             if doc is not None:
                 self.activate(doc_id)
                 self.mark_seen(doc_id)
-            self.db.execute('INSERT INTO versions(document_id, seq, sha256, size, mtime_ns, observed_at, parse_status) '
-                            "VALUES(?, 1, ?, ?, ?, ?, 'locked')",
-                            (doc_id, LOCKED_SHA256, info.st_size, info.st_mtime_ns, store.now()))
+            version_id = self.db.execute(
+                'INSERT INTO versions(document_id, seq, sha256, size, mtime_ns, observed_at, parse_status) '
+                "VALUES(?, 1, ?, ?, ?, ?, 'locked')",
+                (doc_id, LOCKED_SHA256, info.st_size, info.st_mtime_ns, store.now())).lastrowid
             counts['new_versions'] += 1
             counts['added'] += 1
+            self.event(doc_id, version_id, 'added')
             self.emit('added', path, status='locked')
             return
         self.mark_seen(doc.id)  # a known file stays as it was until it can be read
@@ -317,35 +325,35 @@ class _Scan:
             counts['unstable'] += 1
             self.emit('unstable', path, code='changed_while_reading')
             return
-        status = code = None
+        status = code = version_id = None
         if doc is None:
             doc_id = self.insert_document(root_id, path, key, ext)
-            status, code = self.record(doc_id, 1, sha, after, data, ext, counts)
+            status, code, version_id = self.record(doc_id, 1, sha, after, data, ext, counts)
             outcome = 'added'
         elif latest is None:
             doc_id = doc.id
             self.activate(doc_id)
-            status, code = self.record(doc_id, 1, sha, after, data, ext, counts)
+            status, code, version_id = self.record(doc_id, 1, sha, after, data, ext, counts)
             outcome = 'added'
         elif latest.parse_status == 'locked' and latest.sha256 == LOCKED_SHA256:
             doc_id = doc.id
             self.activate(doc_id)
-            status, code = self.record(doc_id, latest.seq, sha, after, data, ext, counts, fill=latest.id)
+            status, code, version_id = self.record(doc_id, latest.seq, sha, after, data, ext, counts, fill=latest.id)
             outcome = 'reparsed'
         elif doc.status in ('deleted', 'skipped'):
             doc_id = doc.id
             self.activate(doc_id)
             self.supersede(latest.id)
-            status, code = self.record(doc_id, latest.seq + 1, sha, after, data, ext, counts)
+            status, code, version_id = self.record(doc_id, latest.seq + 1, sha, after, data, ext, counts)
             outcome = 'restored'
         elif sha != latest.sha256:
             doc_id = doc.id
             self.supersede(latest.id)
-            status, code = self.record(doc_id, latest.seq + 1, sha, after, data, ext, counts)
+            status, code, version_id = self.record(doc_id, latest.seq + 1, sha, after, data, ext, counts)
             outcome = 'changed'
         elif self.needs_retry(latest, current):
             doc_id = doc.id
-            status, code = self.record(doc_id, latest.seq, sha, after, data, ext, counts, fill=latest.id)
+            status, code, version_id = self.record(doc_id, latest.seq, sha, after, data, ext, counts, fill=latest.id)
             outcome = 'reparsed'
         elif after.st_mtime_ns != latest.mtime_ns:
             doc_id = doc.id
@@ -356,6 +364,8 @@ class _Scan:
             outcome = 'unchanged'  # --rehash found the same content
         self.mark_seen(doc_id)
         counts[outcome] += 1
+        if outcome in ('added', 'changed', 'restored', 'reparsed'):
+            self.event(doc_id, version_id, outcome)
         if outcome != 'unchanged':
             self.emit(outcome, path, sha, status, code)
 
@@ -438,6 +448,7 @@ class _Scan:
             if doc_id in self.seen or key in unknown or any(key.startswith(prefix) for prefix in hidden_under):
                 continue
             self.db.execute("UPDATE documents SET status='deleted', deleted_at=? WHERE id=?", (store.now(), doc_id))
+            self.event(doc_id, None, 'deleted')
             counts['deleted'] += 1
             self.emit('deleted', path)
 
@@ -463,6 +474,7 @@ def scan(db, roots, settings, *, partial=False, retry_failed=False, reparse=Fals
     scan_id = db.execute("INSERT INTO scans(started_at, status, partial, roots_json) VALUES(?, 'running', ?, ?)",
                          (started_at, int(bool(partial)),
                           json.dumps([str(spec.path) for _, spec in roots], ensure_ascii=False))).lastrowid
+    job.scan_id = scan_id
     per_root = [(spec, new_counts()) for _, spec in roots]
 
     def counts_json():

@@ -810,3 +810,88 @@ def test_collector_module_has_no_logging_and_reads_with_rb_only():
     source = Path(collect.__file__).read_text(encoding='utf-8')
     assert 'import logging' not in source and source.count("open(path, 'rb')") == 2
     assert sys.modules['workmcp.collect'] is collect
+
+
+# ---- document_events (design M3 §2.5, appendix B) -------------------------------------------------
+
+def events(db, after=0):
+    return db.execute('SELECT e.id, e.scan_id, e.document_id, e.version_id, e.kind FROM document_events e '
+                      'WHERE e.id > ? ORDER BY e.id', (after,)).fetchall()
+
+
+def last_event_id(db):
+    return db.execute('SELECT COALESCE(MAX(id), 0) FROM document_events').fetchone()[0]
+
+
+def test_scan_records_document_events_for_added_changed_deleted_restored_reparsed(db, tmp_path, monkeypatch):
+    src = tmp_path/'src'
+    root, pairs = bundle_root(db, tmp_path)
+    data = {item.rel_path: payload for item, payload in pairs}
+    first = scan(db, root)
+    added = events(db)
+    assert len(added) == first['total']['added'] == len(pairs)
+    assert {row[4] for row in added} == {'added'} and {row[1] for row in added} == {first['scan_id']}
+    latest = dict(db.execute('SELECT document_id, id FROM versions'))  # one version per document so far
+    assert all(row[3] == latest[row[2]] for row in added)
+    assert len({row[2] for row in added}) == len(added)
+    mark = last_event_id(db)
+    scan(db, root)
+    assert events(db, mark) == []  # unchanged files are not events
+
+    rewrite(src/CHANGED, other_docx())
+    (src/DELETED).unlink()
+    second = scan(db, root)
+    changed_doc, deleted_doc = document(db, src/CHANGED)[0], document(db, src/DELETED)[0]
+    rows = events(db, mark)
+    assert sorted(row[2:] for row in rows) == sorted([(changed_doc, versions(db, changed_doc)[1][0], 'changed'),
+                                                      (deleted_doc, None, 'deleted')])
+    assert {row[1] for row in rows} == {second['scan_id']}
+    mark = last_event_id(db)
+
+    rewrite(src/CHANGED, data[CHANGED])
+    (src/DELETED).write_bytes(data[DELETED])
+    scan(db, root)
+    rows = events(db, mark)
+    assert sorted(row[2:] for row in rows) == sorted([(changed_doc, versions(db, changed_doc)[2][0], 'changed'),
+                                                      (deleted_doc, versions(db, deleted_doc)[1][0], 'restored')])
+    mark = last_event_id(db)
+
+    real = collect.read_source
+    new = src/'docs'/'locked_later.txt'
+    new.write_bytes('잠긴 합성 파일'.encode('utf-8'))
+
+    def locked_once(path):
+        if path == str(new.resolve()) or os.path.normcase(path) == os.path.normcase(str(new)):
+            monkeypatch.setattr(collect, 'read_source', real)
+            raise collect.SourceLocked()
+        return real(path)
+
+    monkeypatch.setattr(collect, 'read_source', locked_once)
+    scan(db, root)
+    new_doc = document(db, new)[0]
+    [locked] = versions(db, new_doc)
+    assert [row[2:] for row in events(db, mark)] == [(new_doc, locked[0], 'added')]
+    mark = last_event_id(db)
+    scan(db, root)  # readable now: the locked version is filled in place
+    assert [row[2:] for row in events(db, mark)] == [(new_doc, locked[0], 'reparsed')]
+    mark = last_event_id(db)
+    touched = src/'docs'/'notes_utf8.txt'
+    rewrite(touched, touched.read_bytes())
+    assert scan(db, root)['total']['touched'] == 1 and events(db, mark) == []  # same content: no event
+
+
+def test_document_events_roll_back_with_an_interrupted_batch(db, tmp_path, monkeypatch):
+    root = text_root(db, tmp_path)
+    (tmp_path/'src'/'b.txt').write_bytes('둘째 합성 파일'.encode('utf-8'))
+    real = collect._Scan.judge_deleted
+
+    def fail(self, root_id, counts):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(collect._Scan, 'judge_deleted', fail)
+    with pytest.raises(KeyboardInterrupt):
+        scan(db, root)
+    assert events(db) == [] and db.execute('SELECT COUNT(*) FROM documents').fetchone()[0] == 0
+    monkeypatch.setattr(collect._Scan, 'judge_deleted', real)
+    scan(db, root)
+    assert [row[4] for row in events(db)] == ['added', 'added']

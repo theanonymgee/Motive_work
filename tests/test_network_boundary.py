@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 import _audited_server
-from fixtures import bundle
+from fixtures import SENTINEL, bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT/'src'/'workmcp'
@@ -802,20 +802,57 @@ def tool_call(number, name, arguments):
     return {'jsonrpc': '2.0', 'id': number, 'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
 
 
-MCP_SESSION = [
-    {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-     'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'audit-test', 'version': '0'}}},
-    {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
-    {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
-    tool_call(3, 'status', {}),
-    # Stage 0 (design M3 §14.1): the other four answer not_implemented; stage 1 replaces these calls (§12).
-    tool_call(4, 'search', {'query': 'SENTINEL-합성-질의', 'limit': 5}),
-    tool_call(5, 'get_snippet', {'chunk_id': 1}),
-    tool_call(6, 'list_documents', {'limit': 3}),
-    tool_call(7, 'recent_changes', {}),
-    tool_call(8, 'search', {'query': 'x', 'limit': 'x'}),  # SDK argument validation: isError, not our envelope
-]
-SERVE_IDS = set(range(1, 9))
+CLIENT_NAME = 'audit-test'
+
+
+def initialize(number=1):
+    return {'jsonrpc': '2.0', 'id': number, 'method': 'initialize',
+            'params': {'protocolVersion': '2025-06-18', 'capabilities': {},
+                       'clientInfo': {'name': CLIENT_NAME, 'version': '0'}}}
+
+
+def filled_home(tmp_path) -> tuple[Path, Path, dict]:
+    """The synthetic bundle scanned into ``tmp_path/home`` and indexed (``HashEmbedder``) by this test
+    process, before ``serve`` starts; returns ``(home, source root, first lexical hit for SENTINEL)``."""
+    from test_collect import add_root, scan
+    from workmcp import embedder, index, paths, search, store
+    src = tmp_path/'src'
+    bundle.write_bundle(src)
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, src))
+        index.run_index(db, home, embedder=embedder.HashEmbedder(64))
+    finally:
+        db.close()
+    hits = search.Engine(home).search(SENTINEL, limit=5)['hits']  # no model files: lexical, as serve answers
+    assert hits
+    return home, src, hits[0]
+
+
+def mcp_session(hit: dict) -> list[dict]:
+    """The serve audit session (design M3 §12): every tool, two error envelopes, one SDK validation error."""
+    return [
+        initialize(),
+        {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+        tool_call(3, 'status', {}),
+        tool_call(4, 'search', {'query': SENTINEL, 'limit': 5}),
+        tool_call(5, 'search', {'query': SENTINEL, 'mode': 'semantic', 'limit': 5}),  # no model: lexical + note
+        tool_call(6, 'get_snippet', {'chunk_id': hit['chunk_id']}),
+        tool_call(7, 'get_snippet', {'locator': hit['locator'], 'context_units': 2}),
+        tool_call(8, 'list_documents', {'limit': 3}),
+        tool_call(9, 'recent_changes', {}),
+        tool_call(10, 'search', {'query': ''}),          # our error envelope: empty_query
+        tool_call(11, 'get_snippet', {}),                # our error envelope: argument_invalid
+        tool_call(12, 'search', {'query': 'x', 'limit': 'x'}),  # SDK argument validation: isError, not our envelope
+    ]
+
+
+SERVE_IDS = set(range(1, 13))
+SERVE_CALLED = {3: 'status', 4: 'search', 5: 'search', 6: 'get_snippet', 7: 'get_snippet', 8: 'list_documents',
+                9: 'recent_changes', 10: 'search', 11: 'get_snippet'}  # the calls our code handles (not 12)
+SERVE_ERRORS = {10: 'empty_query', 11: 'argument_invalid'}
 
 
 def serve_session(tmp_path, messages, expected_ids, timeout=60, root=None):
@@ -853,12 +890,22 @@ def serve_session(tmp_path, messages, expected_ids, timeout=60, root=None):
     return lines, stderr, report
 
 
+def body_pieces(envelope: dict) -> list[tuple[dict, str]]:
+    result = envelope.get('result') or {} if envelope.get('ok') else {}
+    found = [(hit['locator'], hit['snippet']) for hit in result.get('hits', ())]
+    for key in ('context_before', 'pieces', 'context_after'):
+        found += [(piece['locator'], piece['text']) for piece in result.get(key, ())]
+    return found
+
+
 def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
-    """Real ``serve`` over stdio: stdout is JSON-RPC only, sockets loopback only, no process, no open under
-    the source root, exit 0; five unstructured tools; every call our code handles is logged once."""
-    src = tmp_path/'src'
-    bundle.write_bundle(src)
-    lines, stderr, report = serve_session(tmp_path, MCP_SESSION, SERVE_IDS, root=src)
+    """Real ``serve`` over stdio on a scanned and indexed synthetic home (design M3 §12): stdout is JSON-RPC
+    only, sockets loopback only, no name resolution, no process, no open under the source root, exit 0;
+    five unstructured tools answer with envelopes whose delivered_sources are exactly their pieces; every
+    call our code handles is logged once under the client's name, one deliveries row per piece."""
+    from workmcp import locator
+    home, src, hit = filled_home(tmp_path)
+    lines, stderr, report = serve_session(tmp_path, mcp_session(hit), SERVE_IDS, root=src)
     stdout = ''.join(lines)
     assert stdout.endswith('\n'), stdout[-200:]  # every message, the last one too, ends with a newline
     records = stdout[:-1].split('\n')  # only that final newline is dropped; blank lines stay and fail below
@@ -869,32 +916,56 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     assert set(replies) == SERVE_IDS, stderr
     assert replies[1]['result']['serverInfo']['name'] == 'workmcp'
     assert 'delivered_sources' in replies[1]['result']['instructions']
-    listed = {tool['name']: tool for tool in replies[2]['result']['tools']}
+    listed = {tool['name']: tool for tool in replies[2]['result']['tools']}   # (d)
     assert set(listed) == SERVE_TOOLS
     assert {name: set(tool['inputSchema'].get('properties', {})) for name, tool in listed.items()} == SERVE_ARGUMENTS
     assert all('outputSchema' not in tool for tool in listed.values())  # structured_output=False
-    for number in range(3, 8):
+    envelopes = {}
+    for number in SERVE_CALLED:                                               # (e)
         result = replies[number]['result']
         assert 'structuredContent' not in result and len(result['content']) == 1 and not result.get('isError')
-    status = json.loads(replies[3]['result']['content'][0]['text'])
-    assert status['ok'] and status['result']['schema_version'] == 2 and status['delivered_sources'] == []
-    assert set(status['result']) == STATUS_RESULT_KEYS
-    for number in range(4, 8):  # stage 0
-        envelope = json.loads(replies[number]['result']['content'][0]['text'])
-        assert envelope['ok'] is False and envelope['error']['code'] == 'not_implemented'
-    assert replies[8]['result']['isError'] is True  # rejected by the SDK before our code runs
+        envelopes[number] = json.loads(result['content'][0]['text'])
+    for number, code in SERVE_ERRORS.items():                                 # (i)
+        assert envelopes[number] == {'ok': False, 'error': {'code': code, 'message': envelopes[number]['error'][
+            'message'], 'retryable': False}}
+    for number in set(SERVE_CALLED) - set(SERVE_ERRORS):
+        assert envelopes[number]['ok'] is True, envelopes[number]
+    status = envelopes[3]['result']
+    assert status['schema_version'] == 2 and set(status) == STATUS_RESULT_KEYS
+    assert status['home'] == str(home) and status['db']['chunks'] > 0
+    assert set(status['home_virtualization']) == {'checked', 'under_appdata', 'redirected_to', 'package'}
+    hits = envelopes[4]['result']['hits']
+    assert hits and hits[0]['chunk_id'] == hit['chunk_id'] and hits[0]['locator'] == hit['locator']
+    assert envelopes[5]['result']['meta']['mode'] == 'lexical'
+    assert envelopes[5]['result']['meta']['semantic_note'].startswith('model_missing')
+    assert envelopes[6]['result']['chunk']['id'] == hit['chunk_id']
+    assert envelopes[7]['result']['pieces'][0] == {'locator': hit['locator'], 'text': hit['snippet'],
+                                                   'truncated': False}
+    pieces = 0
+    for number, envelope in envelopes.items():                                # (f)
+        if not envelope['ok']:
+            assert 'delivered_sources' not in envelope
+            continue
+        found = body_pieces(envelope)
+        assert envelope['delivered_sources'] == [locator.display(obj) for obj, _ in found], number
+        assert bool(found) == (SERVE_CALLED[number] in ('search', 'get_snippet')), number
+        pieces += len(found)
+    assert replies[12]['result']['isError'] is True  # (X-2) rejected by the SDK before our code runs
+    assert 'limit' in replies[12]['result']['content'][0]['text']
     assert report['source_opens'] == 0  # (c) the tools never open the originals
-    log = sqlite3.connect(tmp_path/'home'/'db'/'work.sqlite3')
+    log = sqlite3.connect(tmp_path/'home'/'db'/'work.sqlite3')               # (g)
     try:
         calls = log.execute('SELECT client, client_version, tool, ok, error_code, args_json FROM tool_calls '
                             'ORDER BY id').fetchall()
-        deliveries = log.execute('SELECT COUNT(*) FROM deliveries').fetchone()[0]
+        deliveries = log.execute('SELECT client, COUNT(*) FROM deliveries GROUP BY client').fetchall()
     finally:
         log.close()
-    assert [(c[0], c[1], c[2], c[3]) for c in calls] == [('audit-test', '0', name, ok) for name, ok in (
-        ('status', 1), ('search', 0), ('get_snippet', 0), ('list_documents', 0), ('recent_changes', 0))]
-    assert deliveries == 0  # nothing carried document text
-    assert 'SENTINEL' not in stderr and not any('SENTINEL' in c[5] for c in calls)  # no query text logged
+    assert sorted((c[2], c[3], c[4]) for c in calls) == sorted(
+        (tool, 0 if number in SERVE_ERRORS else 1, SERVE_ERRORS.get(number)) for number, tool in SERVE_CALLED.items())
+    assert {(c[0], c[1]) for c in calls} == {(CLIENT_NAME, '0')}
+    assert deliveries == [(CLIENT_NAME, pieces)] and pieces > 0
+    assert SENTINEL not in stderr and not any(SENTINEL in c[5] for c in calls)  # (h) no query text logged
+    assert 'app virtualization' in stderr  # the start line (design M3 §10.3)
     events = report['events']
     assert [e for e in events if e['violation']] == []  # (b) loopback only, no name resolution
     for e in events:

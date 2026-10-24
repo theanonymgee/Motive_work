@@ -7,20 +7,27 @@ snippets, ``get_snippet`` pieces and context) and nothing else (design M3 §3.1)
 finds those pieces from the response structure. ``list_documents``, ``recent_changes`` and
 ``status`` carry none. Nothing here knows the MCP SDK; ``server.handle`` serializes with ``dumps``.
 
-Stage 0 (design M3 §14.1): ``status`` is complete; ``search``, ``get_snippet``, ``list_documents``
-and ``recent_changes`` have their final signatures and answer ``not_implemented`` until stage 1.
+Argument errors come back as error envelopes (``argument_invalid`` here); ``search.SearchError``,
+``locator.LocatorError``, ``snippet.NotFound`` and a missing store (``FileNotFoundError``) are raised
+and ``server.handle`` turns them into envelopes. ``SHRINK`` holds, per tool, the step that drops one
+whole unit (a hit, a context unit, a row) or halves a ``get_snippet`` piece when a response is over
+the budget (design M3 §4).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import locator, models, paths, snippet, store
+from . import chunks, locator, models, paths, snippet, store
 from . import search as searching  # the module; ``search`` below is the tool
+
+locators = locator  # ``get_snippet`` has an argument named ``locator``
 
 TOOL_NAMES = ('search', 'get_snippet', 'list_documents', 'recent_changes', 'status')
 
@@ -39,7 +46,7 @@ EVENT_KINDS = store.EVENT_KINDS
 # Error codes (design M3 §8.1); only store_busy is retryable.
 ERROR_CODES = (*searching.ERROR_CODES, 'argument_invalid', 'locator_invalid', 'not_found', 'store_missing', 'store_busy',
                'response_too_large', 'internal_error')
-NOT_IMPLEMENTED = 'not_implemented'  # stage 0 only; not one of ERROR_CODES
+NOT_IMPLEMENTED = 'not_implemented'  # stage 0 only, no tool answers it now; not one of ERROR_CODES
 
 # Result shapes (design M3 §2). The search tool's ``result`` is ``searching.RESULT_KEYS`` with
 # ``searching.HIT_KEYS`` hits; its ``meta`` is ``searching.META_KEYS`` plus the keys the tool layer adds.
@@ -97,13 +104,96 @@ def delivered(envelope: Mapping) -> list[str]:
 
 
 def shrink_none(envelope: dict) -> bool:
-    """A shrink step that can drop nothing (``status``; stage 0 for every tool)."""
+    """A shrink step that can drop nothing (``status``)."""
     return False
 
 
+SHRINK_HITS_NOTICE = '응답 크기 상한으로 hit {}개를 뺐습니다 — limit을 줄이거나 필터를 쓰세요'
+SHRINK_CONTEXT_NOTICE = '응답 크기 상한으로 문맥 {}단위를 뺐습니다'
+SHRINK_PIECE_NOTICE = '응답 크기 상한으로 조각을 {}자로 줄였습니다'
+SHRINK_ROWS_NOTICE = '응답 크기 상한으로 limit {}으로 줄였습니다; offset으로 이어서 받으세요'
+TRUNCATED_NOTICE = ('잘린 조각이 있습니다(truncated: true, locator의 chars가 잘린 범위) — 이어서 읽으려면 '
+                    'locator의 chars를 바꿔 get_snippet을 다시 부르세요')
+
+
+def _set_notice(envelope: dict, template: str, value) -> None:
+    """Replace the notice made from ``template`` (with any earlier value) or append it."""
+    head = template.split('{}', 1)[0]
+    line = template.format(value)
+    notice = envelope['notice']
+    for at, text in enumerate(notice):
+        if text.startswith(head):
+            notice[at] = line
+            return
+    notice.append(line)
+
+
+def _notice_count(envelope: dict, template: str) -> int:
+    """The number in the notice made from ``template``, 0 when there is none."""
+    head = template.split('{}', 1)[0]
+    for text in envelope['notice']:
+        if text.startswith(head) and (match := re.match(r'\d+', text[len(head):])):
+            return int(match.group())
+    return 0
+
+
+def shrink_search(envelope: dict) -> bool:
+    """Drop the last hit (its snippet leaves ``delivered_sources`` with it); ``meta.truncated_hits``."""
+    result = envelope['result']
+    if not result['hits']:
+        return False
+    result['hits'].pop()
+    meta = result['meta']
+    meta['truncated_hits'] = meta.get('truncated_hits', 0) + 1
+    _set_notice(envelope, SHRINK_HITS_NOTICE, meta['truncated_hits'])
+    return True
+
+
+def shrink_snippet(envelope: dict) -> bool:
+    """Drop the last unit of ``context_after``, then the first of ``context_before``; then cut the longest
+    piece to half its length (``snippet.trim``: word boundary, ``truncated``, a locator for the cut range)."""
+    result = envelope['result']
+    for key, at in (('context_after', -1), ('context_before', 0)):
+        if result[key]:
+            result[key].pop(at)
+            _set_notice(envelope, SHRINK_CONTEXT_NOTICE, _notice_count(envelope, SHRINK_CONTEXT_NOTICE) + 1)
+            return True
+    pieces = result['pieces']
+    if not pieces:
+        return False
+    longest = max(range(len(pieces)), key=lambda i: (len(pieces[i]['text']), i))
+    size = len(pieces[longest]['text'])
+    if size < 2:
+        return False
+    cut = snippet.trim(pieces[longest], size // 2)
+    if len(cut['text']) >= size:
+        return False
+    pieces[longest] = cut
+    _set_notice(envelope, SHRINK_PIECE_NOTICE, max(len(piece['text']) for piece in pieces))
+    if TRUNCATED_NOTICE not in envelope['notice']:
+        envelope['notice'].append(TRUNCATED_NOTICE)
+    return True
+
+
+def _shrink_rows(key: str) -> Callable[[dict], bool]:
+    def shrink(envelope: dict) -> bool:
+        """Drop the last row; ``limit`` becomes the number of rows returned and ``has_more`` true."""
+        result = envelope['result']
+        if not result[key]:
+            return False
+        result[key].pop()
+        result['limit'] = len(result[key])
+        result['has_more'] = True
+        _set_notice(envelope, SHRINK_ROWS_NOTICE, result['limit'])
+        return True
+    return shrink
+
+
 # Per tool: drop one unit from the end (a hit, a context unit, a row) or cut a piece; False when
-# nothing is left to drop. Stage 1 replaces search, get_snippet, list_documents and recent_changes.
-SHRINK: dict[str, Callable[[dict], bool]] = {name: shrink_none for name in TOOL_NAMES}
+# nothing is left to drop.
+SHRINK: dict[str, Callable[[dict], bool]] = {
+    'search': shrink_search, 'get_snippet': shrink_snippet, 'list_documents': _shrink_rows('documents'),
+    'recent_changes': _shrink_rows('changes'), 'status': shrink_none}
 
 
 def fit(envelope: dict, shrink: Callable[[dict], bool], budget: int = RESPONSE_MAX_CHARS - NOTICE_RESERVE) -> dict:
@@ -163,8 +253,23 @@ def summarize_args(tool: str, args: Mapping) -> dict:
 
 # ---- the five tools -----------------------------------------------------------------------------
 
-def _not_implemented(tool: str) -> dict:
-    return error(NOT_IMPLEMENTED, f'{tool} is not implemented yet (M3 stage 1)')
+def _int_in(value, low: int, high: int | None = None) -> bool:
+    return type(value) is int and value >= low and (high is None or value <= high)
+
+
+def _page_error(limit, offset) -> dict | None:
+    if not _int_in(limit, 1, LIST_LIMIT_MAX):
+        return error('argument_invalid', f'limit must be an integer 1-{LIST_LIMIT_MAX}')
+    if not _int_in(offset, 0):
+        return error('argument_invalid', 'offset must be an integer >= 0')
+    return None
+
+
+SEMANTIC_NOTE_NOTICE = '의미 검색 사용 불가({}) — 어휘 결과만'
+_NOTE_CODE = re.compile(r'[a-z_]+')
+OLD_VERSION_NOTICE = '이 조각은 옛 버전(seq {})의 것입니다; 현재 버전 id {}'
+DELETED_NOTICE = '이 문서는 삭제됨(현재 버전 없음); 조각은 마지막으로 수집한 버전(seq {})의 것입니다'
+NO_EVENTS_NOTICE = '이 저장소의 과거 scan은 이벤트를 남기지 않았습니다(M3 이전); 다음 scan부터 기록됩니다'
 
 
 def search(home: Path, engine, query: str, *, mode: str = 'hybrid', limit: int = searching.LIMIT_DEFAULT,
@@ -173,7 +278,23 @@ def search(home: Path, engine, query: str, *, mode: str = 'hybrid', limit: int =
     """``search`` (design M3 §2.2): ``engine.search(...)`` over ``home``; ``result`` = M2 §5.7 plus
     ``meta.collapsed/truncated_hits/signals/engine``; ``delivered_sources`` one line per hit snippet.
     Raises ``search.SearchError`` for bad input (``server.handle`` turns it into an error envelope)."""
-    return _not_implemented('search')
+    result = engine.search(query, mode=mode, limit=limit, path_prefix=path_prefix, ext=ext, since=since, until=until,
+                           collapse_by_document=collapse_by_document)
+    meta = result['meta']
+    meta.setdefault('collapsed', 0)
+    meta.setdefault('signals', dict(searching.DEFAULT_SIGNALS))
+    meta['truncated_hits'] = 0
+    meta['engine'] = {'model_loaded_now': False, 'load_ms': 0}  # server.handle fills it in (design M3 §6.3)
+    notice = list(result.get('notice') or ())
+    note = meta.get('semantic_note')
+    if note and mode != 'lexical':  # the reason code only, never the message
+        code = _NOTE_CODE.match(note)
+        line = SEMANTIC_NOTE_NOTICE.format(code.group() if code else 'unknown')
+        if line not in notice:
+            notice.append(line)
+    envelope = ok(result, notice=notice)
+    envelope['delivered_sources'] = delivered(envelope)
+    return envelope
 
 
 def get_snippet(home: Path, *, chunk_id: int | None = None, locator: dict | None = None, context_units: int = 0,
@@ -182,14 +303,54 @@ def get_snippet(home: Path, *, chunk_id: int | None = None, locator: dict | None
     ``SNIPPET_RESULT_KEYS`` (``snippet.by_chunk`` / ``snippet.by_locator``); ``delivered_sources`` =
     ``context_before``, ``pieces``, ``context_after``. Errors ``argument_invalid``, ``locator_invalid``,
     ``not_found``, ``store_missing``."""
-    return _not_implemented('get_snippet')
+    if (chunk_id is None) == (locator is None):
+        return error('argument_invalid', 'give exactly one of chunk_id or locator')
+    if chunk_id is not None and not _int_in(chunk_id, 1):
+        return error('argument_invalid', 'chunk_id must be a positive integer')
+    if not _int_in(context_units, 0, CONTEXT_UNITS_MAX):
+        return error('argument_invalid', f'context_units must be an integer 0-{CONTEXT_UNITS_MAX}')
+    if not _int_in(max_chars, PIECE_MIN_CHARS, PIECE_MAX_CHARS):
+        return error('argument_invalid', f'max_chars must be an integer {PIECE_MIN_CHARS}-{PIECE_MAX_CHARS}')
+    if locator is not None:
+        locators.check_shape(locator)  # LocatorError -> locator_invalid before the store is opened
+    db = store.open_read(home)
+    try:
+        if chunk_id is not None:
+            result = snippet.by_chunk(db, chunk_id, context_units=context_units, max_chars=max_chars)
+        else:
+            result = snippet.by_locator(db, locator, context_units=context_units, max_chars=max_chars)
+    finally:
+        db.close()
+    notice = []
+    version = result['version']
+    if not version['latest']:
+        notice.append(DELETED_NOTICE.format(version['seq']) if version['latest_version_id'] is None
+                      else OLD_VERSION_NOTICE.format(version['seq'], version['latest_version_id']))
+    if any(piece['truncated'] for key in ('context_before', 'pieces', 'context_after') for piece in result[key]):
+        notice.append(TRUNCATED_NOTICE)
+    envelope = ok(result, notice=notice)
+    envelope['delivered_sources'] = delivered(envelope)
+    return envelope
 
 
 def list_documents(home: Path, *, path_prefix: str | None = None, ext: list[str] | None = None, status: str = 'active',
                    changed_since: str | None = None, limit: int = LIST_LIMIT_DEFAULT, offset: int = 0) -> dict:
     """``list_documents`` (design M3 §2.4): ``LIST_RESULT_KEYS`` with ``DOCUMENT_KEYS`` rows
     (``store.documents_query``), no text, ``delivered_sources`` empty."""
-    return _not_implemented('list_documents')
+    if status not in DOCUMENT_STATUSES:
+        return error('argument_invalid', f'status must be one of {", ".join(DOCUMENT_STATUSES)}')
+    if failure := _page_error(limit, offset):
+        return failure
+    checked = searching.check_filters(path_prefix, ext, since=changed_since)
+    filters = {'path_prefix': checked['path_prefix'], 'ext': checked['ext'], 'status': status,
+               'changed_since': checked['since']}
+    db = store.open_read(home)
+    try:
+        rows, total = store.documents_query(db, filters, limit, offset, chunk_version=chunks.CHUNK_VERSION)
+    finally:
+        db.close()
+    return ok({'documents': rows, 'total': total, 'limit': limit, 'offset': offset,
+               'has_more': offset + len(rows) < total})
 
 
 def recent_changes(home: Path, *, since: str | None = None, until: str | None = None, kinds: list[str] | None = None,
@@ -197,7 +358,25 @@ def recent_changes(home: Path, *, since: str | None = None, until: str | None = 
                    offset: int = 0) -> dict:
     """``recent_changes`` (design M3 §2.5): ``CHANGES_RESULT_KEYS`` with ``CHANGE_KEYS`` rows
     (``store.document_events_query``), newest first, ``since`` default now - 30 days, no text."""
-    return _not_implemented('recent_changes')
+    if kinds is not None and (not isinstance(kinds, list) or not kinds
+                              or any(not isinstance(kind, str) or kind not in EVENT_KINDS for kind in kinds)):
+        return error('argument_invalid', f'kinds must be a list of {", ".join(EVENT_KINDS)}')
+    if failure := _page_error(limit, offset):
+        return failure
+    if since is None:
+        since = (datetime.now().astimezone() - timedelta(days=RECENT_DEFAULT_DAYS)).isoformat(timespec='seconds')
+    checked = searching.check_filters(path_prefix, ext, since, until)
+    filters = {**checked, 'kinds': sorted(set(kinds)) if kinds else None}
+    db = store.open_read(home)
+    try:
+        rows, total = store.document_events_query(db, filters, limit, offset)
+        unrecorded = db.execute('SELECT NOT EXISTS(SELECT 1 FROM document_events) '
+                                'AND EXISTS(SELECT 1 FROM scans)').fetchone()[0]
+    finally:
+        db.close()
+    return ok({'changes': rows, 'total': total, 'limit': limit, 'offset': offset,
+               'has_more': offset + len(rows) < total, 'since': checked['since'], 'until': checked['until']},
+              notice=[NO_EVENTS_NOTICE] if unrecorded else [])
 
 
 def _index_status(db) -> dict:

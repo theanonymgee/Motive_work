@@ -234,3 +234,106 @@ def test_real_default_home_passes_on_this_pc():
         pytest.skip('LOCALAPPDATA is not set (not a Windows user session)')
     home = validate_home(None, env, REPO_ROOT)
     assert home.name == 'Motive_work'
+
+
+# ---- app virtualization (design M3 §10.3, V-1..V-3) ------------------------------------------------
+
+def fake_profile(tmp_path):
+    """A fake user profile: ``AppData/Local`` with a ``Packages`` folder of three packages."""
+    profile = tmp_path/'profile'
+    local = profile/'AppData'/'Local'
+    for name in ('Fake_pkg', 'Other_pkg', 'Third_pkg'):
+        (local/'Packages'/name/'LocalCache'/'Local').mkdir(parents=True)
+    env = {'LOCALAPPDATA': str(local), 'APPDATA': str(profile/'AppData'/'Roaming'), 'USERPROFILE': str(profile)}
+    return profile, local, env
+
+
+def tree(folder: Path) -> list[str]:
+    return sorted(str(p.relative_to(folder)) for p in folder.rglob('*'))
+
+
+def test_virtualization_probe_outside_appdata_is_not_applicable(tmp_path):
+    profile, _, env = fake_profile(tmp_path)
+    home = ensure_home(profile/'Motive_work')
+    assert paths.virtualization_probe(home, env) == {'checked': True, 'under_appdata': False, 'redirected_to': None,
+                                                     'package': None}
+    assert tree(home/'tmp') == []
+    assert paths.virtualization_line(home, paths.virtualization_probe(home, env)) == \
+        'app virtualization: none (home outside AppData)'
+
+
+def test_virtualization_probe_detects_redirect_into_a_package(tmp_path, monkeypatch):
+    profile, local, env = fake_profile(tmp_path)
+    home = ensure_home(local/'Motive_work')
+    assert paths.virtualization_probe(home, env) == {'checked': True, 'under_appdata': True, 'redirected_to': None,
+                                                     'package': None}
+    real = paths._write_marker
+    package_home = local/'Packages'/'Other_pkg'/'LocalCache'/'Local'/'Motive_work'
+
+    def redirected(path):  # what the packaged app's file system does: the write lands in its folder
+        real(path)
+        copy = package_home/'tmp'/path.name
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        real(copy)
+
+    monkeypatch.setattr(paths, '_write_marker', redirected)
+    probe = paths.virtualization_probe(home, env)
+    assert probe == {'checked': True, 'under_appdata': True, 'redirected_to': str(package_home),
+                     'package': 'Other_pkg'}
+    line = paths.virtualization_line(home, probe)
+    assert line.startswith('warning: app virtualization:') and 'Other_pkg' in line and paths.HOME_ENV in line
+    roaming = ensure_home(profile/'AppData'/'Roaming'/'Motive_work')
+    roaming_copy = local/'Packages'/'Fake_pkg'/'LocalCache'/'Roaming'/'Motive_work'
+
+    def redirected_roaming(path):
+        real(path)
+        (roaming_copy/'tmp').mkdir(parents=True, exist_ok=True)
+        real(roaming_copy/'tmp'/path.name)
+
+    monkeypatch.setattr(paths, '_write_marker', redirected_roaming)
+    assert paths.virtualization_probe(roaming, env)['redirected_to'] == str(roaming_copy)
+
+
+def test_virtualization_probe_cleans_its_marker(tmp_path, monkeypatch):
+    profile, local, env = fake_profile(tmp_path)
+    home = ensure_home(local/'Motive_work')
+    before = tree(profile)
+    assert paths.virtualization_probe(home, env)['checked'] is True
+    assert tree(profile) == before                       # marker removed, nothing made anywhere else
+    real_scandir = os.scandir
+
+    def unlistable(path):
+        if Path(path) == local/'Packages':
+            raise PermissionError('denied')
+        return real_scandir(path)
+
+    monkeypatch.setattr(paths.os, 'scandir', unlistable)
+    failed = paths.virtualization_probe(home, env)
+    monkeypatch.undo()
+    assert failed == {'checked': False, 'under_appdata': True, 'redirected_to': None, 'package': None}
+    assert tree(profile) == before                       # removed on the failure path too
+    missing = local/'Not_yet'
+    probe = paths.virtualization_probe(missing, env)
+    assert (probe['checked'], probe['under_appdata']) == (False, True) and not missing.exists()
+    assert paths.virtualization_line(missing, probe).startswith('app virtualization: not checked')
+    package = local/'Packages'/'Fake_pkg'/'LocalCache'/'Local'/'Motive_work'
+    assert 'Fake_pkg' in paths.appdata_warning(package, env)
+    assert paths.appdata_warning(profile/'Motive_work', env) is None
+
+
+def test_doctor_reports_app_virtualization(workmcp_home, monkeypatch, capsys, tmp_path):
+    profile, local, env = fake_profile(tmp_path)
+    home = ensure_home(profile/'Motive_work')
+    monkeypatch.setenv('WORKMCP_HOME', str(home))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert cli.main(['doctor']) == 0
+    lines = capsys.readouterr().out.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith('data home:'))
+    assert lines[at + 1] == 'app virtualization: none (home outside AppData)'
+    inside = ensure_home(local/'Packages'/'Fake_pkg'/'LocalCache'/'Local'/'Motive_work')
+    monkeypatch.setenv('WORKMCP_HOME', str(inside))
+    assert cli.main(['doctor']) == 0
+    out = capsys.readouterr().out
+    assert 'app virtualization: not redirected' in out
+    assert 'is inside the app package folder' in out and 'Fake_pkg' in out

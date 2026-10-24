@@ -9,6 +9,8 @@
   with ``HashEmbedder`` (test-only, not a model) in every mode; a changed document is re-chunked and
   re-embedded alone (②); hits name only the latest versions and every snippet is cut again from the
   re-parsed current file (④).
+- ``test_cli_scan_index_then_the_server_tools_answer_with_exact_sources`` (M3): ``doctor``'s app
+  virtualization line, then the five tools through ``server.handle`` on the CLI-built home.
 
 Synthetic data only; temporary data home (conftest).
 """
@@ -130,5 +132,47 @@ def test_corpus_hybrid_search_follows_a_change_and_rederives_from_the_files(work
                     assert cache[path][parsers.unit_json(hit['locator']['unit'])][start:end] == hit['snippet']
         report = binding.verify(db)
         assert report['ok'] and report['chunks_checked'] == db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_cli_scan_index_then_the_server_tools_answer_with_exact_sources(workmcp_home, tmp_path, capsys):
+    """M3: after ``scan`` and ``index`` from the CLI, ``doctor`` names the app virtualization state and the
+    server's tools (``server.handle``, the ``serve`` path without stdio) find, quote and list the documents."""
+    import os
+
+    from workmcp import server, tools
+    home = paths.ensure_home(paths.resolve_home())
+    root = tmp_path/'bundle'
+    synthetic_bundle.write_bundle(root)
+    assert run(capsys, 'scan', '--root', str(root))[0] == 0
+    assert run(capsys, 'index')[0] == 0
+    code, out, _ = run(capsys, 'doctor')
+    assert code == 0
+    assert paths.virtualization_line(home, paths.virtualization_probe(home, os.environ)) in out.splitlines()
+    db = store.open_home(home)
+    state = server.make_state(home, write_db=db)
+    try:
+        status = json.loads(server.handle(state, 'status', {}, ('e2e', '1')))['result']
+        assert status['schema_version'] == 2 and status['last_scan'] is not None
+        found = json.loads(server.handle(state, 'search', {'query': SENTINEL, 'limit': 3}, ('e2e', '1')))
+        assert found['ok'] and found['result']['hits']
+        hit = found['result']['hits'][0]
+        quoted = json.loads(server.handle(state, 'get_snippet', {'chunk_id': hit['chunk_id'], 'context_units': 1},
+                                          ('e2e', '1')))
+        assert quoted['ok'] and quoted['delivered_sources'] == tools.delivered(quoted)
+        changes = json.loads(server.handle(state, 'recent_changes', {'kinds': ['added']}, ('e2e', '1')))['result']
+        listed = json.loads(server.handle(state, 'list_documents', {'status': 'all', 'limit': 1}, ('e2e', '1')))
+        assert changes['total'] == listed['result']['total'] > 0
+        reader = store.open_read(home)
+        try:
+            check_hit_sources(reader, found['result']['hits'])
+            for piece in quoted['result']['context_before'] + quoted['result']['pieces'] + \
+                    quoted['result']['context_after']:
+                assert binding.validate_locator(reader, piece['locator'])['text'] == piece['text']
+        finally:
+            reader.close()
+        calls = json.loads(server.handle(state, 'status', {}, ('e2e', '1')))['result']['calls']
+        assert calls == {'total': 5, 'by_client': {'e2e': 5}}  # a call is logged after its answer is made
     finally:
         db.close()
