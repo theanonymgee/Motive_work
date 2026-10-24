@@ -35,7 +35,8 @@ import numpy as np
 from . import chunks, embedder as embedders, index, locator, models, parsers, store
 from .config import SearchSettings
 
-SEARCH_VERSION = 'fts5-trigram-bm25+cos-rrf60-tieavg-v1'
+# v2 (M2 stage 2): in hybrid mode a chunk holding the whole query verbatim ranks before the others
+SEARCH_VERSION = 'fts5-trigram-bm25+cos-rrf60-tieavg-exact-v2'
 RRF_K = 60
 TOKEN = re.compile(r'[\w가-힣]+')
 QUERY_MAX_CHARS = 1000
@@ -58,7 +59,8 @@ RESULT_KEYS = frozenset({'hits', 'meta', 'notice'})
 HIT_KEYS = frozenset({'rank', 'chunk_id', 'version_id', 'doc', 'snippet', 'locator', 'units', 'scores'})
 HIT_OPTIONAL_KEYS = frozenset({'units_truncated'})
 DOC_KEYS = frozenset({'id', 'path', 'ext', 'sha256', 'observed_at'})
-SCORE_KEYS = frozenset({'bm25', 'lexical_rank', 'cosine', 'semantic_rank', 'fusion', 'hit', 'score_is_probability'})
+SCORE_KEYS = frozenset({'bm25', 'lexical_rank', 'cosine', 'semantic_rank', 'fusion', 'exact_phrase', 'hit',
+                        'score_is_probability'})
 HIT_REASONS = ('both', 'lexical', 'semantic')
 META_KEYS = frozenset({'mode', 'search_version', 'lexical', 'semantic', 'semantic_note', 'eligible_chunks',
                        'filters', 'elapsed_ms'})
@@ -71,7 +73,8 @@ NOT_REQUESTED = 'not_requested'  # meta['semantic'] in lexical mode (the model i
 
 LOAD_BLOCK = 4096               # rows per fetchmany while loading the matrix
 SCORE_BLOCK = 65536             # matrix rows converted to float32 at a time (<= 256 MiB at 1024 dims)
-STREAM_BLOCK = 8192             # rows per block on the streaming path (32 MiB of float32 at 1024 dims)
+STREAM_BLOCK = 2048             # rows per block on the streaming path: 8 MiB of float32 at 1024 dims; the
+                                # blob list, its join and the float16/float32 copies make ~5x that at peak
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f​-‏  ﻿\ud800-\udfff]')
 _EXT = re.compile(r'\.[a-z0-9]{1,10}')
 
@@ -263,6 +266,26 @@ def _like_candidates(db, terms: Terms, scope: tuple[str, list], top: int) -> dic
            'ORDER BY n DESC, c.id LIMIT ?')
     rows = db.execute(sql, [*folded, *params, *folded, top])
     return {chunk_id: (None, float(count)) for chunk_id, count in rows}
+
+
+def exact_phrase_ids(db, query: str, candidates) -> set[int]:
+    """Lexical candidates whose text holds the whole query verbatim (whitespace folded to one space,
+    case folded as ``LIKE`` does), for queries of at least ``MIN_MATCH_CHARS`` characters.
+
+    Hybrid ranking puts these first (design M2 stage 2): an exact occurrence of everything the user
+    typed is the strongest evidence there is, and rank fusion alone can let a chunk that only
+    resembles the query in meaning outrank it."""
+    phrase = ' '.join(query.split()).casefold()
+    ids = list(candidates)
+    if len(phrase) < MIN_MATCH_CHARS or not ids:
+        return set()
+    found: set[int] = set()
+    for start in range(0, len(ids), 500):
+        block = ids[start:start + 500]
+        found.update(row[0] for row in db.execute(
+            f'SELECT id FROM chunks WHERE id IN ({",".join("?" * len(block))}) AND instr(lower(text), ?) > 0',
+            [*block, phrase]))
+    return found
 
 
 def average_ranks(scores: Mapping) -> dict:
@@ -543,12 +566,14 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
     lexical_ranks = average_ranks(lexical_key)
     semantic_ranks = average_ranks(cosine)
     fusion = rrf([lexical_ranks, semantic_ranks])
+    exact = exact_phrase_ids(db, text, lexical) if mode == 'hybrid' else set()
     if mode == 'lexical':
         order = sorted(lexical, key=lambda k: (tuple(-x for x in lexical_key[k]), k))
     elif mode == 'semantic':
         order = sorted(cosine, key=lambda k: (-cosine[k], k))
     else:
-        order = sorted(fusion, key=lambda k: (-fusion[k], tuple(-x for x in lexical_key.get(k, (float('-inf'),) * 2)),
+        order = sorted(fusion, key=lambda k: (k not in exact, -fusion[k],
+                                              tuple(-x for x in lexical_key.get(k, (float('-inf'),) * 2)),
                                               -cosine.get(k, float('-inf')), k))
     ranked = []
     for k in order[:limit]:
@@ -556,7 +581,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
         ranked.append((k, {
             'bm25': lexical[k][0] if in_lex else None,
             'lexical_rank': lexical_ranks.get(k), 'cosine': cosine.get(k), 'semantic_rank': semantic_ranks.get(k),
-            'fusion': fusion.get(k, 0.0),
+            'fusion': fusion.get(k, 0.0), 'exact_phrase': k in exact,
             'hit': 'both' if in_lex and in_sem else 'lexical' if in_lex else 'semantic',
             'score_is_probability': False}))
     hits = _hits(db, ranked, terms.snippet_terms)
@@ -714,7 +739,8 @@ def format_hits(result: dict) -> list[str]:
         lines.append(f"semantic: {meta['semantic_note']}")
     for hit in result['hits']:
         scores = hit['scores']
-        lines.append(f"{hit['rank']:>2}. [{scores['hit']}] fusion {_number(scores['fusion'], 4)}  "
+        tag = scores['hit'] + (', exact' if scores.get('exact_phrase') else '')
+        lines.append(f"{hit['rank']:>2}. [{tag}] fusion {_number(scores['fusion'], 4)}  "
                      f"bm25 {_number(scores['bm25'], 2)}  cosine {_number(scores['cosine'], 3)}")
         lines.append(f"    {locator.display(hit['locator'])}")
         more = f" (+{hit['units_truncated']} more)" if hit.get('units_truncated') else ''

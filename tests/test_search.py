@@ -323,8 +323,12 @@ def test_modes_lexical_semantic_hybrid(engine):
     cosines = [h['scores']['cosine'] for h in semantic['hits']]
     assert cosines == sorted(cosines, reverse=True) and min(cosines) > 0
     assert semantic['meta']['lexical']['engine'] == 'none'
-    fusion = [h['scores']['fusion'] for h in hybrid['hits']]
-    assert fusion == sorted(fusion, reverse=True)
+    # chunks holding the whole query come first (search v2), each group in fusion order
+    flags = [h['scores']['exact_phrase'] for h in hybrid['hits']]
+    assert flags == sorted(flags, reverse=True)
+    for group in (True, False):
+        fusion = [h['scores']['fusion'] for h in hybrid['hits'] if h['scores']['exact_phrase'] is group]
+        assert fusion == sorted(fusion, reverse=True)
     reasons = {h['scores']['hit'] for h in hybrid['hits']}
     assert 'both' in reasons
     for hit in hybrid['hits']:
@@ -621,3 +625,35 @@ def test_format_hits(engine):
     assert empty[0].startswith('0 hits') and empty[-1] == f'notice: {search.NO_RESULTS_NOTICE}'
     noted = search.format_hits(search.Engine(engine.home).search('사양서'))
     assert any(line.startswith('semantic: model_missing') for line in noted)
+
+
+def test_hybrid_puts_chunks_holding_the_whole_query_first(tmp_path):
+    """Stage 2: in hybrid mode a chunk that holds the whole query verbatim ranks before chunks that only
+    share words or meaning with it; lexical and semantic orders are unchanged (search v2)."""
+    def write(root):
+        root.mkdir(parents=True)
+        (root/'exact.txt').write_text('첫 줄은 관계없는 합성 문장이다.\n합성 납품분 검수 결과 보고는 금요일이다.\n',
+                                      encoding='utf-8')
+        (root/'near.txt').write_text('합성 납품분 검수 결과 검수 결과 납품분 보고 보고 결과 검수 납품분 합성 보고.\n',
+                                     encoding='utf-8')
+        (root/'other.txt').write_text('관계없는 합성 회의 기록이다.\n', encoding='utf-8')
+
+    home, root = build_home(tmp_path/'home', write)
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    query = '납품분 검수 결과 보고는'
+    result = engine.search(query, mode='hybrid')
+    check_contract(result)
+    first = result['hits'][0]
+    assert Path(first['doc']['path']).name == 'exact.txt' and first['scores']['exact_phrase'] is True
+    assert all(hit['scores']['exact_phrase'] is False for hit in result['hits'][1:])
+    for mode in ('lexical', 'semantic'):
+        assert all(hit['scores']['exact_phrase'] is False for hit in engine.search(query, mode=mode)['hits'])
+    db = ro(home)
+    try:
+        ids = [row[0] for row in db.execute('SELECT id FROM chunks')]
+        assert len(search.exact_phrase_ids(db, '  검수 결과   보고는 ', ids)) == 1   # whitespace folded
+        assert search.exact_phrase_ids(db, '납품', ids) == set()                  # shorter than a trigram
+        assert search.exact_phrase_ids(db, '납품분 검수', []) == set()
+    finally:
+        db.close()
+    assert '[both, exact]' in search.format_hits(result)[1] or '[lexical, exact]' in search.format_hits(result)[1]

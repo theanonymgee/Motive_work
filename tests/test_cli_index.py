@@ -153,3 +153,34 @@ def test_doctor_and_status_report_the_index_after_a_run(home, scanned, capsys):
     assert index_status['last_run']['chunks'] == result['result']['db']['chunks'] > 0
     assert index_status['model'] == {'name': None, 'model_key': None, 'vectors': 0}
     assert index_status['fts']['consistent'] is store.fts5_available()
+
+
+def test_index_loads_the_model_only_when_there_is_new_text(home, scanned, capsys, monkeypatch):
+    """The model key comes from the manifest; the model loads at the first embed (design M2 §6.3 P6),
+    and a model that cannot load leaves chunks and FTS with the fixed reason code (§3.4)."""
+    from workmcp import embedder
+    loads = []
+
+    class Blocked:
+        def __init__(self, *args, **kwargs):
+            loads.append(args)
+            raise ImportError('DLL load failed (synthetic)')
+
+    monkeypatch.setattr(models, 'quick_status', lambda name, home: {'name': name, 'available': True, 'message': 'ok'})
+    monkeypatch.setattr(embedder, 'OnnxEmbedder', Blocked)
+    code, out, err = run(capsys, 'index')
+    assert code == 0, err
+    assert len(loads) == 1 and 'vectors: skipped (runtime_import_failed:ImportError)' in out
+    assert 'embedded 0' in out
+    # every text has a vector for the model key: the next run neither loads nor hashes the model
+    from workmcp import index
+    key = index.model_key(models.identity('bge-m3'))
+    db = store.open_home(home)
+    try:
+        db.executemany("INSERT INTO chunk_vectors VALUES(?, ?, 1024, x'00', 'x')",
+                       [(key, sha) for (sha,) in db.execute('SELECT DISTINCT text_sha256 FROM chunks').fetchall()])
+    finally:
+        db.close()
+    code, out, _ = run(capsys, 'index')
+    assert code == 0 and len(loads) == 1 and 'embedded 0' in out and 'remaining 0' in out
+    assert 'load 0.0s' in out

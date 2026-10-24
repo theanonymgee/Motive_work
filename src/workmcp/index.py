@@ -84,6 +84,16 @@ def from_blob(blob: bytes, dims: int) -> np.ndarray | None:
     return vector
 
 
+class EmbedderUnavailable(Exception):
+    """Raised by a lazily loaded embedder whose model cannot load; ``note`` is the fixed reason code
+    (``runtime_import_failed:<Class>``, ``model_unverified(...)``). ``run_index`` then finishes with
+    chunks and FTS only and reports the note, as for a missing model (design M2 §3.4)."""
+
+    def __init__(self, note: str):
+        super().__init__(note)
+        self.note = note
+
+
 def _busy(error: sqlite3.OperationalError) -> bool:
     message = str(error).lower()
     return 'locked' in message or 'busy' in message
@@ -320,10 +330,15 @@ def run_index(db: sqlite3.Connection, home: Path, *, embedder=None, settings: In
         if embedder is not None:
             todo = _texts_to_embed(db, key, doc_sql, doc_args)
             run = todo if limit is None else todo[:max(0, int(limit))]
-            result['embedded'], result['truncated'] = _embed(db, embedder, key, run, settings, emit)
+            try:
+                result['embedded'], result['truncated'] = _embed(db, embedder, key, run, settings, emit)
+            except EmbedderUnavailable as exc:
+                result.update(vectors_note=exc.note, model=None, model_key=None)
+                emit({'event': 'vectors_skipped', 'path': '', 'sha12': '', 'chunks': 0, 'note': exc.note})
             result['remaining'] = len(todo) - result['embedded']
-            result['vectors_for_model'] = db.execute('SELECT COUNT(*) FROM chunk_vectors WHERE model_key = ?',
-                                                     (key,)).fetchone()[0]
+            if result['model_key'] is not None:
+                result['vectors_for_model'] = db.execute('SELECT COUNT(*) FROM chunk_vectors WHERE model_key = ?',
+                                                         (key,)).fetchone()[0]
         embed_elapsed = time.monotonic() - embed_begin
 
         db.execute('BEGIN IMMEDIATE')

@@ -317,22 +317,51 @@ def _model_name_error(name: str, allow_none: bool) -> str | None:
     return f'unknown model {name!r}; known: {", ".join(known)}'
 
 
+class _LazyModel:
+    """The manifest model for ``index``, loaded at its first ``embed``: the identity (and so the
+    model key) comes from the manifest, so a run with no new text never loads or hashes the model
+    (design M2 §6.3 P6). A load failure becomes ``index.EmbedderUnavailable`` with the fixed reason
+    code, and the run finishes with chunks and FTS only (design M2 §3.4)."""
+
+    def __init__(self, name: str, home, settings):
+        self.name, self.home, self.settings = name, home, settings
+        self.identity = models.identity(name)
+        self.load_seconds = 0.0
+        self._loaded = None
+
+    def _model(self):
+        if self._loaded is None:
+            from . import embedder, index
+            began = datetime.now()
+            try:
+                self._loaded = embedder.OnnxEmbedder(self.name, self.home, batch_size=self.settings.embed_batch,
+                                                     threads=self.settings.threads or None)
+            except ImportError as exc:
+                raise index.EmbedderUnavailable(f'runtime_import_failed:{type(exc).__name__}') from None
+            except models.ModelFileError:
+                bad = {key: value for key, value in models.verify(self.name, self.home).items() if value != 'ok'}
+                raise index.EmbedderUnavailable(
+                    'model_unverified(' + ', '.join(f'{key}: {value}' for key, value in bad.items()) + ')') from None
+            finally:
+                self.load_seconds = (datetime.now() - began).total_seconds()
+        return self._loaded
+
+    def embed(self, texts, *, query: bool):
+        return self._model().embed(texts, query=query)
+
+    def token_counts(self, texts, *, query: bool = False):
+        return self._model().token_counts(texts, query=query)
+
+
 def _index_embedder(name: str, home, settings):
-    """``(embedder or None, vectors note or None)`` for ``index`` (design M2 §3.4): no model, or a
-    model that cannot load, means chunks and FTS only with the reason; never an error exit."""
+    """``(embedder or None, vectors note or None)`` for ``index`` (design M2 §3.4): no model means
+    chunks and FTS only with the reason; never an error exit. The model loads lazily (``_LazyModel``)."""
     if name == 'none':
         return None, None
     status = models.quick_status(name, home)
     if not status['available']:
         return None, f"model_missing: {status['message']}"
-    from . import embedder
-    try:
-        return embedder.OnnxEmbedder(name, home, batch_size=settings.embed_batch, threads=settings.threads or None), None
-    except ImportError as exc:
-        return None, f'runtime_import_failed:{type(exc).__name__}'
-    except models.ModelFileError:
-        bad = {key: value for key, value in models.verify(name, home).items() if value != 'ok'}
-        return None, 'model_unverified(' + ', '.join(f'{key}: {value}' for key, value in bad.items()) + ')'
+    return _LazyModel(name, home, settings), None
 
 
 def index_summary_lines(result: dict, log_file) -> list[str]:
@@ -395,17 +424,16 @@ def index_command(args) -> int:
             try:
                 from . import index
                 try:
-                    loading = datetime.now()
                     embedder, note = _index_embedder(name, home, cfg.index)
-                    load_seconds = (datetime.now() - loading).total_seconds()
                     if note:
                         logger.info(f'vectors_skipped |  |  |  | {note}')
                     result = index.run_index(db, home, embedder=embedder, settings=cfg.index,
                                              on_event=lambda event: _log_index_event(logger, event), limit=args.limit,
                                              doc_ids=args.doc or None, rebuild_fts=args.rebuild_fts, gc=args.gc,
                                              keep_history=args.keep_history, vectors_note=note)
-                    result['elapsed']['load'] = load_seconds
-                    result['elapsed']['total'] += load_seconds
+                    if embedder is not None:  # the model loaded inside the embed step: report it apart
+                        result['elapsed']['load'] = embedder.load_seconds
+                        result['elapsed']['embed'] = max(0.0, result['elapsed']['embed'] - embedder.load_seconds)
                 except Exception as exc:  # class name only: a message could carry a file name or value
                     logger.info(f'aborted |  |  |  | {type(exc).__name__}')
                     print(f'index aborted ({type(exc).__name__}); see {log_file}', file=sys.stderr)
@@ -446,9 +474,6 @@ def search_command(args) -> int:
     except search.SearchError as exc:
         print(exc, file=sys.stderr)
         return 4
-    except NotImplementedError:
-        print('workmcp search: not implemented yet (M2 stage 1)', file=sys.stderr)
-        return 1
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=1))
     else:
@@ -475,11 +500,7 @@ def fetch_model_command(args) -> int:
         print(f'--from must be an existing absolute folder: {args.source}', file=sys.stderr)
         return 4
     paths.ensure_home(home)
-    try:
-        return models.cli_fetch_model(args, home)
-    except NotImplementedError:
-        print('workmcp fetch-model: not implemented yet (M2 stage 1)', file=sys.stderr)
-        return 1
+    return models.cli_fetch_model(args, home)
 
 
 def verify_model_command(args) -> int:
