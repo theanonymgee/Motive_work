@@ -77,11 +77,32 @@ SOURCE_FILTERS = ('evidence', 'my_note', 'all')
 def visible_sql(valid_at: str | None, recorded_at: str | None, include_closed: bool) -> tuple[str, list]:
     """``(sql, params)``: a boolean expression on alias ``a`` (assertions), no leading ``AND``, for the two
     time axes (design M4 §5.1). ``recorded_at`` None means now; ``valid_at`` None filters no validity
-    period; ``include_closed`` keeps rows closed before ``recorded_at`` (recorded by then)."""
-    raise NotImplementedError('knowledge_query.visible_sql: M4 stage 1')
+    period; ``include_closed`` keeps rows closed before ``recorded_at`` (recorded by then).
+
+    Recorded axis at R: ``julianday(recorded_from) <= julianday(R) AND (recorded_to IS NULL OR julianday(R)
+    < julianday(recorded_to))`` (a row closed at R is no longer seen); now is the open rows exactly
+    (``recorded_to IS NULL``). Valid axis at T: ``(valid_from IS NULL OR valid_from <= T) AND (valid_to IS
+    NULL OR T < valid_to)`` (``[valid_from, valid_to)``, open ends unbounded). ``argument_invalid`` for a
+    bad date or time."""
+    parts, params = [], []
+    recorded_at = recorded_instant(recorded_at)
+    if recorded_at is None:
+        if not include_closed:
+            parts.append('a.recorded_to IS NULL')
+    else:
+        parts.append('julianday(a.recorded_from) <= julianday(?)')
+        params.append(recorded_at)
+        if not include_closed:
+            parts.append('(a.recorded_to IS NULL OR julianday(?) < julianday(a.recorded_to))')
+            params.append(recorded_at)
+    if valid_at is not None:
+        knowledge.check_date(valid_at, 'as_of_valid')
+        parts += ['(a.valid_from IS NULL OR a.valid_from <= ?)', '(a.valid_to IS NULL OR ? < a.valid_to)']
+        params += [valid_at, valid_at]
+    return ' AND '.join(parts) or '1', params
 
 
-def recorded_instant(value) -> str | None:
+def recorded_instant(value, name: str = 'as_of_recorded') -> str | None:
     """``value`` (an ISO 8601 date or time) as an aware ISO time to the second, the local time zone when it
     has none (``search._instant``'s rule); None stays None (now). ``KnowledgeError('argument_invalid')``."""
     if value is None:
@@ -91,7 +112,7 @@ def recorded_instant(value) -> str | None:
             raise ValueError
         moment = datetime.fromisoformat(value.strip())
     except ValueError:
-        raise knowledge.KnowledgeError('argument_invalid', 'as_of_recorded must be an ISO 8601 date or time') from None
+        raise knowledge.KnowledgeError('argument_invalid', f'{name} must be an ISO 8601 date or time') from None
     if moment.tzinfo is None:
         moment = moment.astimezone()
     return moment.isoformat(timespec='seconds')
@@ -251,16 +272,102 @@ def entity_row(db, entity_id: int) -> dict:
             'counts': dict(zip(('facts_open', 'decisions_open', 'tasks_open', 'conflicts'), counts))}
 
 
+# ---- notices (lines the tools move into the envelope) ---------------------------------------------------
+SOURCE_NOTICE = ('출처 {}건의 원문이 인용 뒤 바뀌었거나(changed) 삭제(deleted)·건너뜀(skipped) 상태입니다(source_state) '
+                 '— changed는 requote 제안의 locator로 supersede하면 새 근거가 됩니다')
+SOURCE_LIST_NOTICE = '출처가 바뀌었거나 사라진 항목 {}건(source_state) — get_history로 근거를 확인하세요'
+CONFLICT_NOTICE = '충돌로 표시된 사실 {}건(같은 주어·속성, 겹치는 기간, 다른 값) — retract 또는 supersede로 해소하세요'
+FIND_EMPTY_NOTICE = '이름·별칭이 맞는 엔티티가 없습니다 — 없는 것이 아니라 기록되지 않은 것일 수 있습니다(record_entity)'
+LIST_EMPTY_NOTICE = '조건에 맞는 기록이 없습니다 — 기록되지 않았다는 뜻이지 그런 사실이 없다는 뜻은 아닙니다'
+HISTORY_TRUNCATED_NOTICE = f'이력이 {HISTORY_MAX}행을 넘어 최신 {HISTORY_MAX}행만 보입니다(truncated)'
+FIND_QUERY_MAX = 200
+
+
+def _notices(rows, *, quotes: bool) -> list[str]:
+    """Source and conflict lines for the assertions a tool returns (``quotes``: counted per evidence item,
+    else per row)."""
+    notice = []
+    if quotes:
+        stale = sum(item['source_state'] != 'current' for row in rows for item in row['evidence'] or ())
+        if stale:
+            notice.append(SOURCE_NOTICE.format(stale))
+    else:
+        stale = sum(row['source_state'] not in (None, 'current') for row in rows)
+        if stale:
+            notice.append(SOURCE_LIST_NOTICE.format(stale))
+    if conflicted := sum(bool(row['conflicts']) for row in rows):
+        notice.append(CONFLICT_NOTICE.format(conflicted))
+    return notice
+
+
+def _as_of(valid_at: str | None, recorded_at: str | None) -> dict:
+    """``AS_OF_KEYS``: the validity date (None: every period) and the recorded time used (now when none)."""
+    return {'valid': valid_at, 'recorded': recorded_at or store.now()}
+
+
+def _source_filter(source_kind: str) -> tuple[str, list]:
+    if source_kind not in SOURCE_FILTERS:
+        raise knowledge.KnowledgeError('argument_invalid', f"source_kind must be one of {'|'.join(SOURCE_FILTERS)}")
+    return ('1', []) if source_kind == 'all' else ('a.source_kind = ?', [source_kind])
+
+
+def _check_kind(kind, *, allow_none: bool) -> None:
+    if not (kind is None and allow_none) and kind not in store.ENTITY_KINDS:
+        raise knowledge.KnowledgeError('argument_invalid', f"kind must be one of {'|'.join(store.ENTITY_KINDS)}")
+
+
 def entity_by_name(db, kind: str, name: str) -> int:
     """The id of entity ``(kind, name)`` (exact; ``name`` NFC+strip). Raises ``KnowledgeError
     ('entity_not_found')``, saying to use find_entity when ``name`` is only an alias."""
-    raise NotImplementedError('knowledge_query.entity_by_name: M4 stage 1')
+    _check_kind(kind, allow_none=False)
+    name = knowledge.norm_text(name, 'name', knowledge.NAME_MAX)
+    row = db.execute('SELECT id FROM entities WHERE kind = ? AND name = ?', (kind, name)).fetchone()
+    if row is not None:
+        return row[0]
+    folded = name.casefold()
+    alias = any(folded in (item.casefold() for item in json.loads(aliases))
+                for (aliases,) in db.execute('SELECT aliases_json FROM entities').fetchall())
+    hint = ('the name is an alias of an entity: use find_entity' if alias
+            else 'find_entity searches names and aliases')
+    raise knowledge.KnowledgeError('entity_not_found', f'no {kind} entity with that exact name ({hint})')
 
 
 def find_entities(db, query: str, kind: str | None, limit: int) -> dict:
     """``find_entity`` (design M4 §6.3): name or alias contains ``query`` (case-insensitive); exact name, then
-    exact alias, then partial, then by name. Returns ``FIND_RESULT_KEYS`` + ``notice``; no document text."""
-    raise NotImplementedError('knowledge_query.find_entities: M4 stage 1')
+    exact alias, then partial, then by name. Returns ``FIND_RESULT_KEYS`` + ``notice``; no document text.
+
+    Case is folded in Python (``str.casefold``), so it holds for every script, not only ASCII as SQLite's
+    ``lower`` would."""
+    folded = knowledge.norm_text(query, 'query', FIND_QUERY_MAX).casefold()
+    _check_kind(kind, allow_none=True)
+    sql, params = 'SELECT id, name, aliases_json FROM entities', []
+    if kind is not None:
+        sql, params = sql + ' WHERE kind = ?', [kind]
+    ranked = []
+    for entity_id, name, aliases_json in db.execute(sql, params).fetchall():
+        own, aliases = name.casefold(), [item.casefold() for item in json.loads(aliases_json)]
+        if own == folded:
+            rank = 0
+        elif folded in aliases:
+            rank = 1
+        elif folded in own or any(folded in item for item in aliases):
+            rank = 2
+        else:
+            continue
+        ranked.append((rank, own, name, entity_id))
+    ranked.sort()
+    return {'entities': [entity_row(db, entity_id) for *_, entity_id in ranked[:limit]], 'total': len(ranked),
+            'limit': limit, 'has_more': len(ranked) > limit, 'notice': [] if ranked else [FIND_EMPTY_NOTICE]}
+
+
+# Orders inside get_entity's lists: facts by predicate then period; decisions newest first; tasks by due.
+_FACT_ORDER = 'a.predicate, a.valid_from IS NOT NULL, a.valid_from, a.id'
+_RECENT_ORDER = 'julianday(a.recorded_from) DESC, a.id DESC'
+_TASK_ORDER = "json_extract(a.data_json, '$.due') IS NULL, json_extract(a.data_json, '$.due'), " + _RECENT_ORDER
+_ENTITY_LISTS = {'facts': ("a.kind = 'fact' AND a.entity_id = ?", _FACT_ORDER),
+                 'related': ("a.kind = 'fact' AND a.object_entity_id = ?", _FACT_ORDER),
+                 'decisions': ("a.kind = 'decision' AND a.entity_id = ?", _RECENT_ORDER),
+                 'tasks': ("a.kind = 'todo' AND a.entity_id = ?", _TASK_ORDER)}
 
 
 def entity_detail(db, entity_id: int, *, as_of_valid: str | None, as_of_recorded: str | None,
@@ -268,20 +375,152 @@ def entity_detail(db, entity_id: int, *, as_of_valid: str | None, as_of_recorded
     """``get_entity`` (design M4 §6.3): the entity, its facts, facts naming it as object (``related``),
     decisions and tasks about it (each at most ``limit``, ``has_more`` per list), ``predicates_in_use``,
     ``as_of``. Assertions carry evidence with quotes and ``requote``. Returns ``ENTITY_RESULT_KEYS`` +
-    ``notice``. Raises ``KnowledgeError('entity_not_found')``."""
-    raise NotImplementedError('knowledge_query.entity_detail: M4 stage 1')
+    ``notice``. Raises ``KnowledgeError('entity_not_found')``.
+
+    Every list and ``predicates_in_use`` use the same time axes and ``source_kind`` filter; facts come by
+    predicate then validity start (none first), decisions newest recorded first, tasks by ``due`` (none
+    last)."""
+    entity = entity_row(db, entity_id)
+    recorded_at = recorded_instant(as_of_recorded)
+    visible, visible_params = visible_sql(as_of_valid, recorded_at, include_closed)
+    source, source_params = _source_filter(source_kind)
+    where, params = f'({visible}) AND {source}', [*visible_params, *source_params]
+    result: dict = {'entity': entity}
+    has_more = {}
+    for key, (condition, order) in _ENTITY_LISTS.items():
+        found = [row[0] for row in db.execute(
+            f'SELECT a.id FROM assertions a WHERE {condition} AND {where} ORDER BY {order} LIMIT ?',
+            (entity_id, *params, limit + 1)).fetchall()]
+        has_more[key] = len(found) > limit
+        result[key] = [_row(db, found_id, with_evidence=True, with_requote=True, recorded_at=recorded_at)
+                       for found_id in found[:limit]]
+    result['predicates_in_use'] = [row[0] for row in db.execute(
+        f"SELECT DISTINCT a.predicate FROM assertions a WHERE a.kind = 'fact' AND a.entity_id = ? AND {where} "
+        'ORDER BY a.predicate', (entity_id, *params)).fetchall()]
+    result['has_more'] = has_more
+    result['as_of'] = _as_of(as_of_valid, recorded_at)
+    result['notice'] = _notices([row for key in ENTITY_LISTS for row in result[key]], quotes=True)
+    return result
+
+
+def _status_sql(status: str, recorded_at: str | None) -> tuple[str, list, bool]:
+    """``(sql, params, include_closed)`` of a ``list_knowledge`` status at ``recorded_at`` (None: now):
+    open = active or conflict then; conflict = an open conflict link then; closed = closed by then."""
+    if status not in LIST_STATUSES:
+        raise knowledge.KnowledgeError('argument_invalid', f"status must be one of {'|'.join(LIST_STATUSES)}")
+    if status == 'open':
+        return '1', [], False
+    if status == 'all':
+        return '1', [], True
+    if status == 'conflict':
+        if recorded_at is None:
+            return "a.status = 'conflict'", [], False
+        return ("EXISTS(SELECT 1 FROM links l WHERE l.relation = 'conflicts' AND (l.from_id = a.id OR l.to_id = a.id) "
+                'AND julianday(l.recorded_at) <= julianday(?) '
+                'AND (l.resolved_at IS NULL OR julianday(?) < julianday(l.resolved_at)))',
+                [recorded_at, recorded_at], False)
+    if recorded_at is None:
+        return 'a.recorded_to IS NOT NULL', [], True
+    return 'a.recorded_to IS NOT NULL AND julianday(a.recorded_to) <= julianday(?)', [recorded_at], True
 
 
 def list_assertions(db, filters: Mapping, limit: int, offset: int) -> dict:
     """``list_knowledge`` (design M4 §6.3): assertions matching ``filters`` (``FILTER_KEYS``), newest recorded
     first (tasks by ``due``, none last), ``evidence`` None and ``evidence_count``, ``source_state`` the worst.
-    Returns ``LIST_RESULT_KEYS`` + ``notice``; no document text."""
-    raise NotImplementedError('knowledge_query.list_assertions: M4 stage 1')
+    Returns ``LIST_RESULT_KEYS`` + ``notice``; no document text.
+
+    A missing filter takes the tool default (kind all, status open, source_kind all, none for the rest).
+    ``state`` and ``due_before`` (``due < due_before``) select tasks only; ``recorded_since`` keeps rows
+    recorded at or after it. An unknown filter key is ``argument_invalid``."""
+    if unknown := set(filters) - set(FILTER_KEYS):
+        raise knowledge.KnowledgeError('argument_invalid', f'unknown filter {sorted(unknown)[0]}')
+    kind = filters.get('kind') or 'all'
+    if kind not in LIST_KINDS:
+        raise knowledge.KnowledgeError('argument_invalid', f"kind must be one of {'|'.join(LIST_KINDS)}")
+    recorded_at = recorded_instant(filters.get('as_of_recorded'))
+    as_of_valid = filters.get('as_of_valid')
+    status_sql, status_params, include_closed = _status_sql(filters.get('status') or 'open', recorded_at)
+    visible, visible_params = visible_sql(as_of_valid, recorded_at, include_closed)
+    source, source_params = _source_filter(filters.get('source_kind') or 'all')
+    clauses, params = [f'({visible})', status_sql, source], [*visible_params, *status_params, *source_params]
+    if kind != 'all':
+        clauses.append('a.kind = ?')
+        params.append(kind)
+    if filters.get('entity_id') is not None:
+        clauses.append('a.entity_id = ?')
+        params.append(filters['entity_id'])
+    if filters.get('predicate') is not None:
+        clauses.append('a.predicate = ?')
+        params.append(knowledge.norm_text(filters['predicate'], 'predicate', knowledge.PREDICATE_MAX))
+    if filters.get('state') is not None:
+        if filters['state'] not in store.TASK_STATES:
+            raise knowledge.KnowledgeError('argument_invalid', f"state must be one of {'|'.join(store.TASK_STATES)}")
+        clauses.append("a.kind = 'todo' AND json_extract(a.data_json, '$.state') = ?")
+        params.append(filters['state'])
+    if filters.get('due_before') is not None:
+        clauses.append("a.kind = 'todo' AND json_extract(a.data_json, '$.due') < ?")
+        params.append(knowledge.check_date(filters['due_before'], 'due_before'))
+    if filters.get('recorded_since') is not None:
+        clauses.append('julianday(a.recorded_from) >= julianday(?)')
+        params.append(recorded_instant(filters['recorded_since'], 'recorded_since'))
+    where = ' AND '.join(clauses)
+    total = db.execute(f'SELECT COUNT(*) FROM assertions a WHERE {where}', params).fetchone()[0]
+    order = _TASK_ORDER if kind == 'todo' else _RECENT_ORDER
+    found = [row[0] for row in db.execute(f'SELECT a.id FROM assertions a WHERE {where} ORDER BY {order} '
+                                          'LIMIT ? OFFSET ?', (*params, limit, offset)).fetchall()]
+    items = [_row(db, found_id, with_evidence=False, with_requote=False, recorded_at=recorded_at) for found_id in found]
+    notice = _notices(items, quotes=False) if items else ([] if total else [LIST_EMPTY_NOTICE])
+    return {'items': items, 'total': total, 'limit': limit, 'offset': offset, 'has_more': offset + len(items) < total,
+            'as_of': _as_of(as_of_valid, recorded_at), 'notice': notice}
+
+
+_EVENT_COLUMNS = ('id', 'at', 'kind', 'reason', 'related_id', 'recorded_by')
+_LINK_COLUMNS = ('id', 'from_id', 'to_id', 'relation', 'recorded_at', 'recorded_by', 'resolved_at', 'resolved_by_id')
+
+
+def _events(db, assertion_id: int) -> list[dict]:
+    return [dict(zip(_EVENT_COLUMNS, row)) for row in db.execute(
+        f"SELECT {', '.join(_EVENT_COLUMNS)} FROM assertion_events WHERE assertion_id = ? ORDER BY id",
+        (assertion_id,)).fetchall()]
+
+
+def _links(db, assertion_id: int) -> list[dict]:
+    return [dict(zip(_LINK_COLUMNS, row)) for row in db.execute(
+        f"SELECT {', '.join(_LINK_COLUMNS)} FROM links WHERE from_id = ? OR to_id = ? ORDER BY id",
+        (assertion_id, assertion_id)).fetchall()]
+
+
+def chain_ids(db, assertion_id: int) -> list[int]:
+    """The supersede chain through ``assertion_id``, root to latest: back along ``supersedes_id``, forward
+    to the row that supersedes each one (one at most: a closed row cannot be superseded again)."""
+    back, current = [], assertion_id
+    while current is not None and current not in back:
+        back.append(current)
+        current = db.execute('SELECT supersedes_id FROM assertions WHERE id = ?', (current,)).fetchone()[0]
+    chain, current = back[::-1], assertion_id
+    while True:
+        later = db.execute('SELECT MIN(id) FROM assertions WHERE supersedes_id = ?', (current,)).fetchone()[0]
+        if later is None or later in chain:
+            return chain
+        chain.append(later)
+        current = later
 
 
 def history(db, assertion_id: int) -> dict:
     """``get_history`` (design M4 §5.2): the supersede chain root to latest (at most ``HISTORY_MAX``, latest
     kept, ``truncated``), each row ``ASSERTION_KEYS`` + ``events`` (``EVENT_KEYS``) + ``links``
     (``LINK_KEYS``), evidence with quotes and ``requote``. Returns ``HISTORY_RESULT_KEYS`` + ``notice``.
-    Raises ``KnowledgeError('assertion_not_found')``."""
-    raise NotImplementedError('knowledge_query.history: M4 stage 1')
+    Raises ``KnowledgeError('assertion_not_found')``.
+
+    No time axis: every row with its stored status (``status_as_of`` now). ``links`` holds the row's
+    supersede and conflict links in either direction, resolved ones too."""
+    if db.execute('SELECT 1 FROM assertions WHERE id = ?', (assertion_id,)).fetchone() is None:
+        raise knowledge.KnowledgeError('assertion_not_found', f'no assertion {assertion_id}')
+    chain = chain_ids(db, assertion_id)
+    truncated = len(chain) > HISTORY_MAX
+    rows = [{**_row(db, row_id, with_evidence=True, with_requote=True, recorded_at=None),
+             'events': _events(db, row_id), 'links': _links(db, row_id)} for row_id in chain[-HISTORY_MAX:]]
+    notice = _notices(rows, quotes=True)
+    if truncated:
+        notice.insert(0, HISTORY_TRUNCATED_NOTICE)
+    return {'chain': rows, 'truncated': truncated, 'notice': notice}

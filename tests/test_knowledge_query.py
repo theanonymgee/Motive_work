@@ -115,12 +115,14 @@ def add_version(db, doc, lines):
     return version
 
 
-def add_evidence(db, assertion, version, line, quote):
+def add_evidence(db, assertion, version, ordinal, quote):
+    """An evidence row as ``knowledge.bind_sources`` stores it: unit ``ordinal`` of ``version``."""
     doc, sha, path = db.execute('SELECT d.id, v.sha256, d.path FROM versions v JOIN documents d ON '
                                 'd.id = v.document_id WHERE v.id=?', (version,)).fetchone()
-    text = db.execute('SELECT text FROM units WHERE version_id=? AND ordinal=?', (version, line)).fetchone()[0]
+    unit_json, text = db.execute('SELECT locator_json, text FROM units WHERE version_id=? AND ordinal=?',
+                                 (version, ordinal)).fetchone()
     start = text.index(quote)
-    obj = locator.make(doc, path, sha, {'kind': 'line', 'line': line}, text, [start, start + len(quote)])
+    obj = locator.make(doc, path, sha, json.loads(unit_json), text, [start, start + len(quote)])
     db.execute('INSERT INTO evidence(assertion_id, version_id, chunk_id, locator_json, quote, quote_sha256) '
                'VALUES (?, ?, NULL, ?, ?, ?)', (assertion, version, json.dumps(obj, ensure_ascii=False), quote,
                                                  locator.text_sha256(quote)))
@@ -299,3 +301,511 @@ def test_representation_never_puts_text_into_errors(db):
         with pytest.raises(knowledge.KnowledgeError) as caught:
             call()
         assert SENTINEL not in str(caught.value)
+
+
+# ---- visible_sql: the two time axes as SQL (design M4 §5.1) -----------------------------------------------
+
+def visible(db, valid_at=None, recorded_at=None, include_closed=False, where='1'):
+    sql, params = kq.visible_sql(valid_at, recorded_at, include_closed)
+    return [row[0] for row in db.execute(f'SELECT a.id FROM assertions a WHERE ({sql}) AND {where} ORDER BY a.id',
+                                         params)]
+
+
+def test_visible_sql_is_a_bare_expression_with_its_parameters():
+    assert kq.visible_sql(None, None, False) == ('a.recorded_to IS NULL', [])
+    assert kq.visible_sql(None, None, True) == ('1', [])
+    sql, params = kq.visible_sql('2026-10-01', '2026-10-02T09:00:00+09:00', False)
+    assert not sql.lstrip().upper().startswith('AND') and sql.count('?') == len(params) == 4
+    assert params == ['2026-10-02T09:00:00+09:00'] * 2 + ['2026-10-01'] * 2
+    for bad in (('2026-10-1', None, False), ('2026-10-01', 'nope', False)):
+        with pytest.raises(knowledge.KnowledgeError) as caught:
+            kq.visible_sql(*bad)
+        assert caught.value.code == 'argument_invalid'
+
+
+def retract_scenario(db):
+    """B recorded at T2 and retracted at T4; A recorded at T1 and still open."""
+    entity = add_entity(db, name='합성 철회 과제')
+    a = add(db, entity=entity, predicate='금액', value='합성 1', at=T1)
+    b = add(db, entity=entity, predicate='단계', value='합성 2', at=T2)
+    close(db, b, 'withdrawn', T4)
+    return a, b
+
+
+RECORDED_CASES = [  # (as_of_recorded, include_closed, expected names) for retract_scenario
+    ('2026-09-30T09:00:00+09:00', False, []),                 # before anything was recorded
+    ('2026-10-01T08:59:59+09:00', False, []),                 # a second before A
+    (T1, False, ['a']),                                       # recorded_from is inclusive
+    ('2026-10-02T08:59:59+09:00', False, ['a']),              # before B
+    (T2, False, ['a', 'b']),
+    (T3, False, ['a', 'b']),                                  # between record and retract
+    ('2026-10-04T08:59:59+09:00', False, ['a', 'b']),         # a second before the retraction
+    (T4, False, ['a']),                                       # recorded_to is exclusive: retracted at T4
+    (T5, False, ['a']),                                       # after the retraction
+    (None, False, ['a']),                                     # now
+    (T1, True, ['a']),                                        # include_closed: recorded by then
+    (T3, True, ['a', 'b']),
+    (T5, True, ['a', 'b']),
+    (None, True, ['a', 'b']),
+    ('2026-10-04T00:00:00Z', False, ['a']),                   # another offset: 09:00+09:00 == 00:00Z
+    ('2026-10-03T23:59:59Z', False, ['a', 'b']),
+]
+
+
+def recorded_mismatches(db) -> list:
+    a, b = retract_scenario(db)
+    names = {a: 'a', b: 'b'}
+    return [(at, closed, got) for at, closed, expected in RECORDED_CASES
+            if (got := [names[i] for i in visible(db, recorded_at=at, include_closed=closed) if i in names]) != expected]
+
+
+def test_as_of_recorded_replays_what_was_known_before_between_and_after_a_retraction(db):
+    assert recorded_mismatches(db) == []
+
+
+def cut_chain(db):
+    """A (valid from 09-01) recorded at T1, superseded at T3 with old_valid_to 10-20: the cut row C (old value,
+    09-01..10-20) and the new row N (from 10-20), both open; N supersedes C, C supersedes A (design §4.3)."""
+    entity = add_entity(db, name='합성 대체 과제')
+    a = add(db, entity=entity, predicate='금액', value='옛 값', at=T1, valid=('2026-09-01', None))
+    c = add(db, entity=entity, predicate='금액', value='옛 값', at=T3, valid=('2026-09-01', '2026-10-20'),
+            supersedes=a)
+    close(db, a, 'superseded', T3)
+    n = add(db, entity=entity, predicate='금액', value='새 값', at=T3, valid=('2026-10-20', None), supersedes=c)
+    link(db, c, a, 'supersedes', T3)
+    link(db, n, c, 'supersedes', T3)
+    for row, related in ((c, a), (n, c)):
+        event(db, row, 'recorded', T3, related=related)
+    return entity, a, c, n
+
+
+VALID_CASES = [  # (as_of_valid, as_of_recorded, expected names) for cut_chain
+    (None, None, ['c', 'n']),                    # every period, now
+    ('2026-08-31', None, []),                    # before valid_from
+    ('2026-09-01', None, ['c']),                 # valid_from is inclusive
+    ('2026-10-10', None, ['c']),
+    ('2026-10-19', None, ['c']),
+    ('2026-10-20', None, ['n']),                 # valid_to is exclusive; N starts there
+    ('2099-01-01', None, ['n']),                 # open end
+    ('2026-10-25', T2, ['a']),                   # what we knew at T2 (before the supersede)
+    ('2026-08-31', T2, []),
+    ('2026-10-10', T3, ['c']),                   # at the supersede: A closed, C and N recorded
+    ('2026-10-25', T3, ['n']),
+    (None, '2026-10-03T08:59:59+09:00', ['a']),  # a second before the supersede
+    (None, T3, ['c', 'n']),
+]
+
+
+def valid_mismatches(db) -> list:
+    _, a, c, n = cut_chain(db)
+    names = {a: 'a', c: 'c', n: 'n'}
+    return [(on, at, got) for on, at, expected in VALID_CASES
+            if (got := [names[i] for i in visible(db, valid_at=on, recorded_at=at) if i in names]) != expected]
+
+
+def test_as_of_valid_selects_the_period_of_a_cut_chain_and_combines_with_as_of_recorded(db):
+    assert valid_mismatches(db) == []
+
+
+def test_rows_without_a_period_are_valid_at_every_date(db):
+    entity = add_entity(db)
+    always = add(db, entity=entity, predicate='정의', value='합성 정의')
+    until = add(db, entity=entity, predicate='단계', value='합성 단계', valid=(None, '2026-10-01'))
+    since = add(db, entity=entity, predicate='담당', value='합성 담당', valid=('2026-10-01', None))
+    assert visible(db, valid_at='1900-01-01') == [always, until]
+    assert visible(db, valid_at='2026-09-30') == [always, until]
+    assert visible(db, valid_at='2026-10-01') == [always, since]
+    assert visible(db, valid_at='9999-12-31') == [always, since]
+
+
+def test_mutation_checks(db, monkeypatch):
+    """The boundary tests catch a missing ``recorded_to`` condition, an inclusive ``recorded_to``, an
+    inclusive ``valid_to`` and a missing ``valid_from`` condition (design M4 §12, M3 §9.2)."""
+    real = kq.visible_sql
+    mutants = {
+        'no recorded_to': lambda sql: sql.replace('(a.recorded_to IS NULL OR julianday(?) < julianday(a.recorded_to))',
+                                                  '(1 OR ? IS NULL)').replace('a.recorded_to IS NULL', '1'),
+        'recorded_to inclusive': lambda sql: sql.replace('julianday(?) < julianday(a.recorded_to)',
+                                                         'julianday(?) <= julianday(a.recorded_to)'),
+        'valid_to inclusive': lambda sql: sql.replace('? < a.valid_to', '? <= a.valid_to'),
+        'no valid_from': lambda sql: sql.replace('a.valid_from <= ?', '(1 OR ? IS NULL)'),
+    }
+    for name, mutate in mutants.items():
+        monkeypatch.setattr(kq, 'visible_sql', lambda *args, mutate=mutate: (mutate(real(*args)[0]), real(*args)[1]))
+        db.execute('BEGIN')
+        caught = recorded_mismatches(db) + valid_mismatches(db)
+        db.execute('ROLLBACK')
+        assert caught, name
+    monkeypatch.setattr(kq, 'visible_sql', real)
+    assert recorded_mismatches(db) == [] and valid_mismatches(db) == []
+
+
+# ---- find_entity / entity_by_name ----------------------------------------------------------------------
+
+def test_find_entities_ranks_exact_name_then_exact_alias_then_partial_then_name(db):
+    partial = add_entity(db, 'project', '합성 과제 P31 확장')
+    alias = add_entity(db, 'project', '합성 과제 31', aliases=['P31', '삼일'])
+    exact = add_entity(db, 'project', 'p31')
+    person = add_entity(db, 'person', '합성 사람', aliases=['담당 p31 대리'])
+    add_entity(db, 'customer', '무관한 고객')
+    found = kq.find_entities(db, 'P31', None, 20)
+    assert set(found) == kq.FIND_RESULT_KEYS | {'notice'} and found['notice'] == []
+    assert ids(found['entities']) == [exact, alias, partial, person] and found['total'] == 4
+    assert all(set(item) == kq.ENTITY_KEYS for item in found['entities'])
+    assert ids(kq.find_entities(db, 'p31', 'project', 20)['entities']) == [exact, alias, partial]
+    assert ids(kq.find_entities(db, '삼일', None, 20)['entities']) == [alias]
+    page = kq.find_entities(db, 'p31', None, 2)
+    assert (ids(page['entities']), page['total'], page['limit'], page['has_more']) == ([exact, alias], 4, 2, True)
+    nfd = kq.find_entities(db, '합성', None, 20)   # '합성' decomposed
+    assert set(ids(nfd['entities'])) == {partial, alias, person}
+    empty = kq.find_entities(db, '없는 이름', None, 20)
+    assert (empty['entities'], empty['total'], empty['has_more'], empty['notice']) == ([], 0, False,
+                                                                                         [kq.FIND_EMPTY_NOTICE])
+    for bad in (('', None), ('   ', None), ('x' * 201, None), (3, None), ('p31', 'team')):
+        with pytest.raises(knowledge.KnowledgeError) as caught:
+            kq.find_entities(db, bad[0], bad[1], 20)
+        assert caught.value.code == 'argument_invalid'
+
+
+def test_entity_by_name_is_exact_and_points_aliases_to_find_entity(db):
+    entity = add_entity(db, 'project', '합성 과제', aliases=['과제A'])
+    assert kq.entity_by_name(db, 'project', '  합성 과제 ') == entity
+    assert kq.entity_by_name(db, 'project', '합성 과제') == entity   # NFD
+    for kind, name, hint in (('project', '과제a', 'alias'), ('person', '합성 과제', 'find_entity searches'),
+                             ('project', SENTINEL, 'find_entity searches')):
+        with pytest.raises(knowledge.KnowledgeError) as caught:
+            kq.entity_by_name(db, kind, name)
+        assert caught.value.code == 'entity_not_found' and hint in caught.value.message
+        assert SENTINEL not in caught.value.message and '과제' not in caught.value.message
+    with pytest.raises(knowledge.KnowledgeError) as caught:
+        kq.entity_by_name(db, 'team', '합성 과제')
+    assert caught.value.code == 'argument_invalid'
+
+
+# ---- get_entity ------------------------------------------------------------------------------------------
+
+def test_entity_detail_lists_facts_related_decisions_tasks_with_quotes(db):
+    customer = add_entity(db, 'customer', '합성 고객')
+    person = add_entity(db, 'person', '합성 사람')
+    _, version = add_document(db)
+    budget = add(db, entity=customer, predicate='예산', value='3억', unit='원', valid=('2026-09-01', None),
+                 source_kind='evidence', at=T1)
+    add_evidence(db, budget, version, 2, '합성 인용')
+    owner = add(db, entity=customer, predicate='담당자', obj=person, at=T2)
+    early = add(db, entity=customer, predicate='예산', value='2억', unit='원', valid=(None, '2026-09-01'), at=T2)
+    decision_1 = add(db, 'decision', entity=customer, statement='합성 결정 1', at=T1)
+    decision_2 = add(db, 'decision', entity=customer, statement='합성 결정 2', at=T2)
+    later = add(db, 'todo', entity=customer, statement='합성 할 일 늦음', at=T1,
+                data={'state': 'open', 'due': '2026-12-01', 'owner_entity_id': person, 'done_at': None})
+    undated = add(db, 'todo', entity=customer, statement='합성 할 일 기한 없음', at=T2)
+    sooner = add(db, 'todo', entity=customer, statement='합성 할 일 이름', at=T3,
+                 data={'state': 'open', 'due': '2026-11-01', 'owner_entity_id': None, 'done_at': None})
+    add(db, entity=person, predicate='소속', value='합성 부서')   # another entity's fact
+    detail = kq.entity_detail(db, customer, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                              source_kind='all', limit=50)
+    assert set(detail) == kq.ENTITY_RESULT_KEYS | {'notice'} and detail['notice'] == []
+    assert detail['entity'] == kq.entity_row(db, customer)
+    assert ids(detail['facts']) == [owner, early, budget]       # by predicate, then period start (none first)
+    assert ids(detail['decisions']) == [decision_2, decision_1]
+    assert ids(detail['tasks']) == [sooner, later, undated]     # by due, none last
+    assert ids(kq.entity_detail(db, person, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                                source_kind='all', limit=50)['related']) == [owner]
+    assert detail['related'] == [] and detail['predicates_in_use'] == ['담당자', '예산']
+    assert detail['has_more'] == dict.fromkeys(kq.ENTITY_LISTS, False)
+    assert set(detail['as_of']) == kq.AS_OF_KEYS and detail['as_of']['valid'] is None
+    quoted = next(row for row in detail['facts'] if row['id'] == budget)
+    assert [item['quote'] for item in quoted['evidence']] == ['합성 인용']
+    assert all(row['evidence'] == [] for row in detail['facts'] if row['id'] != budget)
+    narrow = kq.entity_detail(db, customer, as_of_valid='2026-08-15', as_of_recorded=None, include_closed=False,
+                              source_kind='evidence', limit=1)
+    assert ids(narrow['facts']) == [] and narrow['predicates_in_use'] == [] and narrow['as_of']['valid'] == '2026-08-15'
+    small = kq.entity_detail(db, customer, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                             source_kind='my_note', limit=1)
+    assert ids(small['facts']) == [owner] and small['has_more'] == {'facts': True, 'related': False,
+                                                                     'decisions': True, 'tasks': True}
+
+
+def test_entity_detail_include_closed_and_past_recorded_time(db):
+    entity, a, c, n = cut_chain(db)
+    gone = add(db, entity=entity, predicate='단계', value='합성 단계', at=T2)
+    close(db, gone, 'withdrawn', T4)
+    def facts(**kwargs):
+        args = {'as_of_valid': None, 'as_of_recorded': None, 'include_closed': False, 'source_kind': 'all',
+                'limit': 50, **kwargs}
+        return [(row['id'], row['status_as_of']) for row in kq.entity_detail(db, entity, **args)['facts']]
+    assert facts() == [(c, 'open'), (n, 'open')]
+    assert facts(include_closed=True) == [(a, 'superseded'), (c, 'open'), (n, 'open'), (gone, 'withdrawn')]
+    assert facts(as_of_recorded=T2) == [(a, 'open'), (gone, 'open')]
+    assert facts(as_of_recorded=T3, include_closed=True) == [(a, 'superseded'), (c, 'open'), (n, 'open'),
+                                                             (gone, 'open')]
+    detail = kq.entity_detail(db, entity, as_of_valid=None, as_of_recorded=T2, include_closed=False,
+                              source_kind='all', limit=50)
+    assert detail['as_of'] == {'valid': None, 'recorded': T2}
+    with pytest.raises(knowledge.KnowledgeError) as caught:
+        kq.entity_detail(db, 999, as_of_valid=None, as_of_recorded=None, include_closed=False, source_kind='all',
+                         limit=50)
+    assert caught.value.code == 'entity_not_found'
+    with pytest.raises(knowledge.KnowledgeError):
+        kq.entity_detail(db, entity, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                         source_kind='모두', limit=50)
+
+
+def test_entity_detail_marks_conflicts_and_changed_sources_in_notice(db):
+    entity = add_entity(db)
+    doc, version = add_document(db)
+    a = add(db, entity=entity, predicate='금액', value='합성 1', source_kind='evidence')
+    add_evidence(db, a, version, 2, '합성 인용')
+    b = add(db, entity=entity, predicate='금액', value='합성 2')
+    mark_conflict(db, b, a, T1)
+    add_version(db, doc, ('바뀐 첫 줄', '둘째 줄 합성 인용 문장'))
+    detail = kq.entity_detail(db, entity, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                              source_kind='all', limit=50)
+    assert detail['notice'] == [kq.SOURCE_NOTICE.format(1), kq.CONFLICT_NOTICE.format(2)]
+    evidence = next(row for row in detail['facts'] if row['id'] == a)['evidence'][0]
+    assert evidence['source_state'] == 'changed' and evidence['requote']['found'] is True
+
+
+# ---- list_knowledge ----------------------------------------------------------------------------------------
+
+def knowledge_rows(db):
+    e1, e2 = add_entity(db, name='합성 과제 1'), add_entity(db, name='합성 과제 2')
+    _, version = add_document(db)
+    rows = {'f1': add(db, entity=e1, predicate='금액', value='합성 1', at=T1, source_kind='evidence'),
+            'f2': add(db, entity=e1, predicate='금액', value='합성 2', at=T2),
+            'f3': add(db, entity=e2, predicate='단계', value='합성 단계', at=T2, valid=('2026-11-01', None)),
+            'd1': add(db, 'decision', entity=e1, statement='합성 결정', at=T3),
+            't1': add(db, 'todo', entity=e1, statement='합성 할 일 1', at=T3,
+                      data={'state': 'open', 'due': '2026-11-15', 'owner_entity_id': None, 'done_at': None}),
+            't2': add(db, 'todo', statement='합성 할 일 2', at=T4,
+                      data={'state': 'done', 'due': '2026-11-01', 'owner_entity_id': None, 'done_at': '2026-10-04'}),
+            't3': add(db, 'todo', statement='합성 할 일 3', at=T4)}
+    add_evidence(db, rows['f1'], version, 2, '합성 인용')
+    link_id = mark_conflict(db, rows['f2'], rows['f1'], T2)
+    close(db, rows['f2'], 'withdrawn', T4)
+    resolve(db, link_id, T4, rows['f2'], clear=[rows['f1']])
+    rows['e1'], rows['e2'] = e1, e2
+    return rows
+
+
+def listed(db, limit=50, offset=0, **filters):
+    return kq.list_assertions(db, filters, limit, offset)
+
+
+def names_of(rows, result):
+    back = {value: key for key, value in rows.items() if key[0] in 'fdt'}
+    return [back[item['id']] for item in result['items']]
+
+
+@pytest.mark.parametrize('filters, expected', [
+    ({}, ['t3', 't2', 't1', 'd1', 'f3', 'f1']),                       # open now, newest recorded first
+    ({'kind': 'fact'}, ['f3', 'f1']),
+    ({'kind': 'todo'}, ['t2', 't1', 't3']),                           # tasks by due, none last
+    ({'kind': 'todo', 'state': 'open'}, ['t1', 't3']),
+    ({'state': 'done'}, ['t2']),
+    ({'due_before': '2026-11-15'}, ['t2']),                           # due < due_before
+    ({'entity_id': 'e1'}, ['t1', 'd1', 'f1']),
+    ({'predicate': ' 금액 '}, ['f1']),
+    ({'status': 'closed'}, ['f2']),
+    ({'status': 'all', 'kind': 'fact'}, ['f3', 'f2', 'f1']),
+    ({'status': 'conflict'}, []),                                     # resolved at T4
+    ({'status': 'conflict', 'as_of_recorded': T3}, ['f2', 'f1']),     # open conflict link then
+    ({'status': 'closed', 'as_of_recorded': T3}, []),
+    ({'status': 'closed', 'as_of_recorded': T4}, ['f2']),
+    ({'as_of_recorded': T2}, ['f3', 'f2', 'f1']),
+    ({'as_of_valid': '2026-10-15', 'kind': 'fact'}, ['f1']),
+    ({'source_kind': 'evidence'}, ['f1']),
+    ({'source_kind': 'my_note', 'kind': 'fact'}, ['f3']),
+    ({'recorded_since': T3}, ['t3', 't2', 't1', 'd1']),
+    ({'recorded_since': '2026-10-04'}, ['t3', 't2']),                 # a date: midnight local time
+])
+def test_list_assertions_filters(db, filters, expected):
+    rows = knowledge_rows(db)
+    if 'entity_id' in filters:
+        filters = {**filters, 'entity_id': rows[filters['entity_id']]}
+    result = listed(db, **filters)
+    assert names_of(rows, result) == expected and result['total'] == len(expected)
+
+
+def test_list_assertions_rows_pages_and_carries_no_quotes(db):
+    rows = knowledge_rows(db)
+    first = listed(db, limit=2)
+    assert set(first) == kq.LIST_RESULT_KEYS | {'notice'}
+    assert (names_of(rows, first), first['total'], first['limit'], first['offset'], first['has_more']) == (
+        ['t3', 't2'], 6, 2, 0, True)
+    last = listed(db, limit=2, offset=4)
+    assert (names_of(rows, last), last['has_more']) == (['f3', 'f1'], False)
+    beyond = listed(db, limit=2, offset=10)
+    assert (beyond['items'], beyond['total'], beyond['has_more'], beyond['notice']) == ([], 6, False, [])
+    f1 = next(item for item in listed(db, kind='fact')['items'] if item['id'] == rows['f1'])
+    assert set(f1) == kq.ASSERTION_KEYS and (f1['evidence'], f1['evidence_count'], f1['source_state']) == (
+        None, 1, 'current')
+    assert '합성 인용' not in json.dumps(listed(db, status='all'), ensure_ascii=False)
+    assert listed(db, kind='decision', entity_id=rows['e2'])['notice'] == [kq.LIST_EMPTY_NOTICE]
+    then = listed(db, status='all', as_of_recorded=T3, kind='fact')
+    assert [(item['id'], item['status_as_of'], item['status']) for item in then['items']] == [
+        (rows['f3'], 'open', 'active'), (rows['f2'], 'open', 'withdrawn'), (rows['f1'], 'open', 'active')]
+    assert then['notice'] == [kq.CONFLICT_NOTICE.format(2)] and then['as_of'] == {'valid': None, 'recorded': T3}
+
+
+@pytest.mark.parametrize('filters', [
+    {'kind': 'term'}, {'status': 'withdrawn'}, {'source_kind': 'none'}, {'state': 'late'}, {'due_before': '2026-1-1'},
+    {'as_of_valid': '2026/10/01'}, {'as_of_recorded': '어제'}, {'recorded_since': 'x'}, {'predicate': ''},
+    {'colour': 'red'},
+])
+def test_list_assertions_refuses_bad_filters(db, filters):
+    with pytest.raises(knowledge.KnowledgeError) as caught:
+        listed(db, **filters)
+    assert caught.value.code == 'argument_invalid'
+
+
+# ---- get_history -------------------------------------------------------------------------------------------
+
+def test_history_chain_root_to_latest_with_events_links_and_evidence(db):
+    entity, a, c, n = cut_chain(db)
+    _, version = add_document(db)
+    other = add(db, entity=entity, predicate='금액', value='합성 다른 값', at=T4, source_kind='evidence')
+    add_evidence(db, other, version, 2, '합성 인용')
+    conflict = mark_conflict(db, other, n, T4)
+    close(db, other, 'withdrawn', T5, reason='합성 오기')
+    resolve(db, conflict, T5, other, clear=[n])
+    for start in (a, c, n):
+        result = kq.history(db, start)
+        assert set(result) == kq.HISTORY_RESULT_KEYS | {'notice'} and result['truncated'] is False
+        assert ids(result['chain']) == [a, c, n]
+    chain = kq.history(db, n)['chain']
+    assert all(set(row) == kq.ASSERTION_KEYS | kq.HISTORY_ROW_EXTRA_KEYS for row in chain)
+    assert [row['status'] for row in chain] == ['superseded', 'active', 'active']
+    assert [row['superseded_by_id'] for row in chain] == [c, n, None]
+    assert [[e['kind'] for e in row['events']] for row in chain] == [
+        ['superseded'], ['recorded'], ['recorded', 'conflict_marked', 'conflict_cleared']]
+    assert all(set(e) == kq.EVENT_KEYS for row in chain for e in row['events'])
+    assert chain[0]['events'][0]['reason'] == '합성 사유'
+    assert [(l['relation'], l['from_id'], l['to_id'], l['resolved_at']) for l in chain[2]['links']] == [
+        ('supersedes', n, c, None), ('conflicts', other, n, T5)]
+    assert all(set(l) == kq.LINK_KEYS for row in chain for l in row['links'])
+    single = kq.history(db, other)
+    assert ids(single['chain']) == [other] and single['chain'][0]['status_as_of'] == 'withdrawn'
+    assert single['chain'][0]['evidence'][0]['quote'] == '합성 인용' and single['notice'] == []
+    with pytest.raises(knowledge.KnowledgeError) as caught:
+        kq.history(db, 999)
+    assert caught.value.code == 'assertion_not_found'
+
+
+def test_history_keeps_the_latest_fifty_rows(db):
+    entity = add_entity(db)
+    row = add(db, entity=entity, predicate='금액', value='합성 0', at=T1)
+    rows = [row]
+    for step in range(1, kq.HISTORY_MAX + 2):
+        row = supersede(db, row, {'entity': entity, 'predicate': '금액', 'value': f'합성 {step}'},
+                        f'2026-10-01T{9 + step // 60:02d}:{step % 60:02d}:00+09:00')
+        rows.append(row)
+    result = kq.history(db, rows[3])
+    assert result['truncated'] is True and ids(result['chain']) == rows[-kq.HISTORY_MAX:]
+    assert result['notice'][0] == kq.HISTORY_TRUNCATED_NOTICE
+
+
+# ---- source state through real scans (design M4 §3.4, §12) -------------------------------------------------
+
+from test_collect import add_root, rewrite, scan  # noqa: E402 - helpers of the collector tests
+from workmcp import binding, collect  # noqa: E402
+
+LINES = ('합성 회의록 첫 줄입니다.', '담당자 갑이 가상 거래처 A에 견적을 보냈다.', '다음 회의는 금요일이다.')
+QUOTE = '가상 거래처 A'
+
+
+@pytest.fixture
+def scanned(db, tmp_path):
+    """One synthetic text file scanned, a fact citing its second line."""
+    root = add_root(db, tmp_path/'src')
+    path = tmp_path/'src'/'a.txt'
+    path.write_bytes('\n'.join(LINES).encode('utf-8'))
+    scan(db, root)
+    version = db.execute('SELECT id FROM versions WHERE superseded_at IS NULL').fetchone()[0]
+    fact = add(db, entity=add_entity(db), predicate='거래처', value='가상 거래처 A', source_kind='evidence')
+    add_evidence(db, fact, version, 2, QUOTE)
+    return root, path, fact
+
+
+def detail_evidence(db, fact):
+    entity = db.execute('SELECT entity_id FROM assertions WHERE id=?', (fact,)).fetchone()[0]
+    detail = kq.entity_detail(db, entity, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                              source_kind='all', limit=50)
+    history = kq.history(db, fact)['chain'][0]['evidence'][0]
+    from_detail = detail['facts'][0]['evidence'][0]
+    assert from_detail == history
+    return from_detail
+
+
+def test_source_state_follows_scan_changed_with_requote(db, scanned):
+    root, path, fact = scanned
+    assert detail_evidence(db, fact)['source_state'] == 'current'
+    rewrite(path, '\n'.join(('바뀐 첫 줄입니다.', *LINES[1:])).encode('utf-8'))
+    scan(db, root)
+    evidence = detail_evidence(db, fact)
+    assert evidence['source_state'] == 'changed' and evidence['requote']['found'] is True
+    suggested = evidence['requote']['locator']
+    assert suggested['sha256'] != evidence['locator']['sha256'] and suggested['chars'] == evidence['locator']['chars']
+    assert binding.validate_locator(db, suggested)['text'] == QUOTE     # a real locator of the latest version
+    assert kq.assertion_row(db, fact, with_evidence=True)['evidence'][0]['requote'] is None
+    assert kq.list_assertions(db, {}, 50, 0)['items'][0]['source_state'] == 'changed'
+
+
+def test_requote_is_not_found_when_the_quote_left_or_repeats_in_the_unit(db, scanned):
+    root, path, fact = scanned
+    rewrite(path, '\n'.join((LINES[0], '담당자 갑이 견적을 보냈다.', LINES[2])).encode('utf-8'))
+    scan(db, root)
+    assert detail_evidence(db, fact)['requote'] == {'found': False}
+    rewrite(path, '\n'.join((LINES[0], f'{QUOTE}와 {QUOTE}', LINES[2])).encode('utf-8'))
+    scan(db, root)
+    assert detail_evidence(db, fact)['requote'] == {'found': False}
+    rewrite(path, '\n'.join((LINES[0], LINES[2], LINES[1])).encode('utf-8'))   # moved to another line
+    scan(db, root)
+    assert detail_evidence(db, fact)['requote'] == {'found': False}            # same unit only (design §3.4)
+
+
+def test_source_state_follows_scan_deleted_restored_and_skipped(db, scanned, monkeypatch):
+    root, path, fact = scanned
+    data = path.read_bytes()
+    path.unlink()
+    scan(db, root)
+    evidence = detail_evidence(db, fact)
+    assert (evidence['source_state'], evidence['requote']) == ('deleted', None)
+    path.write_bytes(data)
+    scan(db, root)                                                     # restored: a new version, same text
+    evidence = detail_evidence(db, fact)
+    assert evidence['source_state'] == 'changed' and evidence['requote']['found'] is True
+    assert binding.validate_locator(db, evidence['requote']['locator'])['text'] == QUOTE
+    path.unlink()
+    scan(db, root)
+    path.write_bytes(data)
+    real = collect.file_attributes
+    monkeypatch.setattr(collect, 'file_attributes',
+                        lambda info: real(info) | collect.FILE_ATTRIBUTE_REPARSE_POINT
+                        | paths.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+    scan(db, root)                                                     # back as an online-only placeholder
+    assert db.execute('SELECT status FROM documents').fetchone()[0] == 'skipped'
+    evidence = detail_evidence(db, fact)
+    assert (evidence['source_state'], evidence['requote']) == ('skipped', None)
+    assert kq.assertion_row(db, fact, with_evidence=False)['source_state'] == 'skipped'
+
+
+def test_reading_never_writes_or_opens_files(db, scanned, monkeypatch):
+    """The read path changes no row and opens no file (design M4 §8.1)."""
+    import builtins
+    _, _, fact = scanned
+    before = {table: db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+              for table in ('assertions', 'evidence', 'links', 'entities', 'assertion_events')}
+    changes = db.total_changes
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('a file was opened')
+    monkeypatch.setattr(builtins, 'open', refuse)
+    entity = db.execute('SELECT entity_id FROM assertions WHERE id=?', (fact,)).fetchone()[0]
+    kq.entity_detail(db, entity, as_of_valid=None, as_of_recorded=None, include_closed=True, source_kind='all',
+                     limit=50)
+    kq.list_assertions(db, {'status': 'all'}, 50, 0)
+    kq.history(db, fact)
+    kq.find_entities(db, '합성', None, 20)
+    monkeypatch.undo()
+    assert db.total_changes == changes
+    assert before == {table: db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in before}
