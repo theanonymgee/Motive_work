@@ -20,7 +20,6 @@ Other queries iterate their cursor or read in ``fetchmany`` blocks.
 from __future__ import annotations
 
 import gc
-import json
 import os
 import re
 import sqlite3
@@ -32,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import chunks, embedder as embedders, index, locator, models, parsers, store
+from . import chunks, embedder as embedders, index, locator, models, parsers, snippet, store
 from .config import SearchSettings
 
 # v2 (M2 stage 2): in hybrid mode a chunk holding the whole query verbatim ranks before the others
@@ -52,6 +51,8 @@ ERROR_CODES = ('empty_query', 'query_too_long', 'limit_out_of_range', 'filter_in
 NO_RESULTS_NOTICE = '검색 결과 없음 ≠ 회사에 그 정보가 없음'
 OBSERVED_NOTICE = 'since/until은 파일이 관측된 시각(versions.observed_at)이며 문서 안의 날짜가 아님'
 SHORT_QUERY_NOTICE = '질의가 짧아 어휘 검색을 할 수 없음 — 3자 이상 낱말을 포함해 주세요'
+# N1 (design M3 §9.1): chunks changed without FTS5 since the last rebuild, so chunks_fts may name other texts
+FTS_DIRTY_NOTICE = '전문 색인이 어긋나 있어 느린 어휘 검색을 씁니다 — `workmcp index --rebuild-fts`'
 NO_VECTORS_NOTE = 'no_vectors: no stored vectors for this model (run workmcp index with the model)'
 
 # The result shape (design M2 §5.7, the M3 ``search`` tool contract).
@@ -68,13 +69,24 @@ LEXICAL_META_KEYS = frozenset({'engine', 'terms', 'candidates'})          # engi
 SEMANTIC_META_KEYS = frozenset({'model', 'model_key', 'real_model', 'vectors', 'candidates', 'streamed'})
 FILTER_KEYS = frozenset({'path_prefix', 'ext', 'since', 'until'})
 ELAPSED_KEYS = frozenset({'lexical', 'embed_query', 'semantic', 'total'})
-# Facts for an "absent information" judgement (design M3 §9.3). Stage 0 fills the defaults below;
-# stage 1 (B) computes them and the ``low`` rule.
+# Facts for an "absent information" judgement (design M3 §9.3), in every result: the lexical candidate
+# count and how many hold the whole query (None in semantic mode: no lexical search ran), the cosine of
+# the 1st and 10th semantic candidate and their difference (None without a model or with fewer
+# candidates), and ``low`` computed by ``low_signal`` with ``LOW_SIGNAL``.
 SIGNAL_KEYS = frozenset({'lexical_candidates', 'exact_phrase_hits', 'cosine_top1', 'cosine_top10', 'cosine_gap',
                          'low'})
 DEFAULT_SIGNALS = {'lexical_candidates': None, 'exact_phrase_hits': None, 'cosine_top1': None, 'cosine_top10': None,
                    'cosine_gap': None, 'low': False}
+# Rules (design M3 §9.3): R1 cosine_top1 < the cosine_top1 threshold, R2 cosine_gap < the gap threshold,
+# R3 no lexical candidate and no exact phrase, R4 = R3 and R1. A rule whose facts are missing (None) is
+# False. R3 needs no threshold; the measured thresholds are in doc/validation/2026-10-24_M3-신호측정_v1.md
+# and replace this default only by decision (design M3 §14.3).
+LOW_SIGNAL_RULES = ('R1', 'R2', 'R3', 'R4')
+LOW_SIGNAL = {'rule': 'R3', 'cosine_top1': None, 'gap': None}
+LOW_SIGNAL_NOTICE = '질의와 가까운 내용이 적습니다(어휘 후보 {lexical}, 코사인 1위 {top1}) — 없는 정보일 수 있음'
 UNAVAILABLE = 'unavailable'     # meta['semantic'] when there is no usable model
+ENGINE_STATUS_KEYS = frozenset({'loaded', 'rows', 'generation', 'data_generation', 'matrix_bytes', 'load_failure',
+                                'idle_seconds', 'loads', 'last_load_ms'})
 NOT_REQUESTED = 'not_requested'  # meta['semantic'] in lexical mode (the model is not even looked at)
 
 LOAD_BLOCK = 4096               # rows per fetchmany while loading the matrix
@@ -235,15 +247,50 @@ def lexical_terms(query: str) -> Terms:
 
 
 def fts_usable(db: sqlite3.Connection) -> bool:
-    """``chunks_fts`` exists and this SQLite can read it (FTS5 with trigram), tested on ``db`` itself:
-    no extra connection, so the search phase opens nothing but its read-only store."""
+    """``chunks_fts`` exists, this SQLite can read it (FTS5 with trigram) and it is in step with the
+    chunks (no ``meta.fts_dirty``, the judgement of ``store.fts_in_step``; N1, design M3 §9.1: a dirty
+    index may hold old texts under reused chunk ids). Tested on ``db`` itself: no extra connection, so
+    the search phase opens nothing but its read-only store."""
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'").fetchone() is None:
         return False
     try:
         db.execute('SELECT rowid FROM chunks_fts LIMIT 0').fetchone()
     except sqlite3.Error:
         return False
-    return True
+    return not fts_dirty(db)
+
+
+def fts_dirty(db: sqlite3.Connection) -> bool:
+    """``meta.fts_dirty`` is set: chunks changed without FTS5 since the last rebuild."""
+    return store.meta_get(db, 'fts_dirty') is not None
+
+
+def low_signal(signals: Mapping, rule: Mapping | None = None) -> bool:
+    """``rule['rule']`` (``LOW_SIGNAL_RULES``; None: ``LOW_SIGNAL``) on the facts of ``signals``; False
+    when a fact it needs is None (that mode did not produce it) or its threshold is not set."""
+    rule = LOW_SIGNAL if rule is None else rule
+    name = rule['rule']
+    if name not in LOW_SIGNAL_RULES:
+        raise ValueError('unknown low-signal rule')
+    lexical, exact = signals.get('lexical_candidates'), signals.get('exact_phrase_hits')
+    top1, gap = signals.get('cosine_top1'), signals.get('cosine_gap')
+    r1 = top1 is not None and rule.get('cosine_top1') is not None and top1 < rule['cosine_top1']
+    r2 = gap is not None and rule.get('gap') is not None and gap < rule['gap']
+    r3 = lexical == 0 and exact == 0
+    return {'R1': r1, 'R2': r2, 'R3': r3, 'R4': r3 and r1}[name]
+
+
+def signals_of(lexical: int | None, exact: int | None, cosines: Sequence[float],
+               rule: Mapping | None = None) -> dict:
+    """``SIGNAL_KEYS`` from the lexical candidate and exact-phrase counts (None: no lexical search) and
+    the semantic candidates' cosines best first (empty without a model); ``low`` by ``rule``."""
+    top1 = round(float(cosines[0]), 4) if len(cosines) else None
+    top10 = round(float(cosines[9]), 4) if len(cosines) >= 10 else None
+    gap = round(top1 - top10, 4) if top1 is not None and top10 is not None else None
+    out = {'lexical_candidates': lexical, 'exact_phrase_hits': exact, 'cosine_top1': top1, 'cosine_top10': top10,
+           'cosine_gap': gap}
+    out['low'] = low_signal(out, rule)
+    return out
 
 
 def _contains_sum(column: str, count: int) -> str:
@@ -472,13 +519,18 @@ def embed_query(embedder, text: str, dims: int) -> np.ndarray:
 # ---- hits ---------------------------------------------------------------------------------------
 
 def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Sequence[str],
-          expected: Mapping[int, str] | None = None) -> list[dict]:
+          expected: Mapping[int, str] | None = None, *, limit: int | None = None, collapse: bool = False,
+          counts: dict | None = None) -> list[dict]:
     """Hit dicts (``HIT_KEYS``) for ``ranked`` ``(chunk_id, scores)``: snippet and locator inside one
-    unit, ``units[]`` with the chunk's range in each unit (at most ``UNITS_CAP``).
+    unit, ``units[]`` with the chunk's range in each unit (at most ``UNITS_CAP``; ``snippet.cover``
+    computes the ranges, the same function ``get_snippet`` uses).
 
     A chunk is returned only if it is still eligible now (latest active version, current chunk rules)
     and, when ``expected`` names a text hash for it, still holds that text (review M2-1: a candidate
-    from an older mapping, or a chunk id reused since, never becomes a hit)."""
+    from an older mapping, or a chunk id reused since, never becomes a hit).
+
+    ``collapse`` (design M3 §2.2): only the first hit of each document; the hits skipped for that are
+    counted in ``counts['collapsed']``. Stops at ``limit`` hits (None: all of ``ranked``)."""
     if not ranked:
         return []
     ids = [chunk_id for chunk_id, _ in ranked]
@@ -489,24 +541,27 @@ def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Seq
                       'AND c.chunk_version = ?', [*ids, chunks.CHUNK_VERSION]).fetchall()
     by_id = {row[0]: row for row in rows}
     expected = expected or {}
-    out = []
+    out: list[dict] = []
+    seen_docs: set[int] = set()
+    skipped = 0
     for chunk_id, scores in ranked:
+        if limit is not None and len(out) >= limit:
+            break
         if chunk_id not in by_id:
             continue  # no longer eligible (scan or index since the candidates were taken)
         (_, version_id, first, last, char_start, char_end, sha256, observed_at, doc_id, path, ext,
          text_sha256) = by_id[chunk_id]
         if expected.get(chunk_id, text_sha256) != text_sha256:
             continue  # the id now holds another text than the one scored
+        if collapse and doc_id in seen_docs:
+            skipped += 1
+            continue
         units = db.execute('SELECT ordinal, locator_json, text FROM units WHERE version_id = ? '
                            'AND ordinal BETWEEN ? AND ? ORDER BY ordinal', (version_id, first, last)).fetchall()
-        covered, offset = [], 0
-        for ordinal, locator_json, text in units:
-            start, end = max(char_start - offset, 0), min(char_end - offset, len(text))
-            if start < end:
-                covered.append((ordinal, json.loads(locator_json), text, (start, end)))
-            offset += len(text) + 1
+        covered = snippet.cover(units, char_start, char_end)
         if not covered:
             continue
+        seen_docs.add(doc_id)
         ordinal, start, end = chunks.snippet_in_unit(covered, list(terms))
         unit, text = next((u, t) for o, u, t, _ in covered if o == ordinal)
         hit = {'rank': len(out) + 1, 'chunk_id': chunk_id, 'version_id': version_id,
@@ -518,6 +573,8 @@ def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Seq
         if len(covered) > UNITS_CAP:
             hit['units_truncated'] = len(covered) - UNITS_CAP
         out.append(hit)
+    if counts is not None:
+        counts['collapsed'] = skipped
     return out
 
 
@@ -533,8 +590,11 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
            until: str | None = None, semantic_note: str | None = None, collapse_by_document: bool = False) -> dict:
     """One search on a read-only connection; returns ``{'hits', 'meta', 'notice'}`` (``RESULT_KEYS``).
 
-    ``collapse_by_document`` (design M3 §2.2): keep the first hit per document, ``meta.collapsed`` the
-    number skipped. Stage 0 accepts it and reports ``collapsed`` 0 (stage 1, B, implements it).
+    ``collapse_by_document`` (design M3 §2.2): walk the whole fused order and keep the first hit of
+    each document until ``limit`` hits; ranks are renumbered from 1, scores are unchanged,
+    ``meta.collapsed`` counts the hits skipped. ``meta.signals`` (design M3 §9.3): ``signals_of``; a
+    ``low`` result with hits adds ``LOW_SIGNAL_NOTICE``. ``chunks_fts`` out of step (``fts_dirty``,
+    N1) means the ``LIKE`` path and ``FTS_DIRTY_NOTICE``.
 
     ``embedder``/``vectors`` None means lexical only (``semantic_note`` says why); with an embedder
     and no ``vectors`` the cache is loaded here. Raises ``SearchError`` for bad input. Pure apart
@@ -558,6 +618,9 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
     if mode != 'semantic':
         started = time.perf_counter()
         fts = fts_usable(db)
+        dirty = not fts and fts_dirty(db)
+        if dirty:
+            notice.append(FTS_DIRTY_NOTICE)
         if fts and terms.match:
             engine = 'fts5'
             lexical = _fts_candidates(db, terms, scope, settings.lexical_candidates)
@@ -566,7 +629,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
             if eligible <= settings.like_max_chunks:
                 engine = 'like'
                 lexical = _like_candidates(db, terms, scope, settings.lexical_candidates)
-            else:
+            elif not dirty:
                 notice.append(SHORT_QUERY_NOTICE)
         elif not terms.tokens and not terms.match:
             notice.append(SHORT_QUERY_NOTICE)
@@ -574,6 +637,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
 
     # Semantic candidates.
     cosine: dict[int, float] = {}
+    best_cosines: list[float] = []      # the first 10 semantic candidates' cosines, best first (signals)
     expected: dict[int, str] = {}
     semantic_meta = NOT_REQUESTED if requested == 'lexical' else UNAVAILABLE
     if mode != 'lexical':
@@ -596,6 +660,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
             ids, scores = vectors.candidates(query_vector, settings.semantic_candidates, allowed)
             expected = vectors.expected_texts(ids)
         cosine = {int(i): float(s) for i, s in zip(ids, scores)}
+        best_cosines = [float(s) for s in scores[:10]]
         elapsed['semantic'] = _ms(time.perf_counter() - started)
         semantic_meta = {'model': identity.get('name'), 'model_key': key,
                          'real_model': bool(identity.get('real_model', True)), 'vectors': vectors.total,
@@ -611,7 +676,8 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
     lexical_ranks = average_ranks(lexical_key)
     semantic_ranks = average_ranks(cosine)
     fusion = rrf([lexical_ranks, semantic_ranks])
-    exact = exact_phrase_ids(db, text, lexical) if mode == 'hybrid' else set()
+    holding = exact_phrase_ids(db, text, lexical) if mode != 'semantic' else set()
+    exact = holding if mode == 'hybrid' else set()     # ordering and scores: hybrid only (M2 contract)
     if mode == 'lexical':
         order = sorted(lexical, key=lambda k: (tuple(-x for x in lexical_key[k]), k))
     elif mode == 'semantic':
@@ -621,7 +687,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
                                               tuple(-x for x in lexical_key.get(k, (float('-inf'),) * 2)),
                                               -cosine.get(k, float('-inf')), k))
     ranked = []
-    for k in order[:limit]:
+    for k in (order if collapse_by_document else order[:limit]):
         in_lex, in_sem = k in lexical_ranks, k in semantic_ranks
         ranked.append((k, {
             'bm25': lexical[k][0] if in_lex else None,
@@ -629,9 +695,18 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
             'fusion': fusion.get(k, 0.0), 'exact_phrase': k in exact,
             'hit': 'both' if in_lex and in_sem else 'lexical' if in_lex else 'semantic',
             'score_is_probability': False}))
-    hits = _hits(db, ranked, terms.snippet_terms, expected)
+    counts = {'collapsed': 0}
+    hits = _hits(db, ranked, terms.snippet_terms, expected, limit=limit, collapse=collapse_by_document,
+                 counts=counts)
+    lexical_ran = mode != 'semantic'
+    signals = signals_of(len(lexical) if lexical_ran else None, len(holding) if lexical_ran else None,
+                         best_cosines)
     if not hits:
         notice.append(NO_RESULTS_NOTICE)
+    elif signals['low']:
+        notice.append(LOW_SIGNAL_NOTICE.format(
+            lexical='-' if signals['lexical_candidates'] is None else signals['lexical_candidates'],
+            top1=_number(signals['cosine_top1'], 2)))
     if filters['since'] or filters['until']:
         notice.append(OBSERVED_NOTICE)
     elapsed['total'] = _ms(time.perf_counter() - began)
@@ -640,7 +715,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
                         'terms': {'match': list(terms.match) if engine == 'fts5' else [], 'short': list(terms.short)},
                         'candidates': len(lexical)},
             'semantic': semantic_meta, 'semantic_note': semantic_note, 'eligible_chunks': eligible,
-            'filters': filters, 'elapsed_ms': elapsed, 'collapsed': 0, 'signals': dict(DEFAULT_SIGNALS)}
+            'filters': filters, 'elapsed_ms': elapsed, 'collapsed': counts['collapsed'], 'signals': signals}
     return {'hits': hits, 'meta': meta, 'notice': notice}
 
 
@@ -677,6 +752,7 @@ class Engine:
         self.load_failure: str | None = None
         self.last_used: float | None = None
         self.loads = 0                  # model loads attempted in this process
+        self.last_load_ms: float | None = None   # duration of the last load attempt (design M3 §6.3)
 
     def search(self, query: str, *, mode: str = 'hybrid', limit: int = LIMIT_DEFAULT,
                path_prefix: str | None = None, ext: Sequence[str] | None = None, since: str | None = None,
@@ -707,6 +783,7 @@ class Engine:
         if self.load_failure is not None:
             return None
         self.loads += 1
+        started = time.perf_counter()
         try:
             if self.embedder_factory is not None:
                 self._embedder = self.embedder_factory()
@@ -721,6 +798,8 @@ class Engine:
             self.load_failure = load_failure_code(exc)
             self._embedder = None
             return None
+        finally:
+            self.last_load_ms = _ms(time.perf_counter() - started)
         self.last_used = self.clock()
         return self._embedder
 
@@ -763,11 +842,16 @@ class Engine:
         self.load_failure = None
 
     def status(self) -> dict:
-        """``{'loaded', 'rows', 'generation', 'matrix_bytes', 'load_failure'}`` (no text)."""
+        """``ENGINE_STATUS_KEYS`` (no text): model loaded, matrix rows and bytes, the index and data
+        generations the cache belongs to, seconds since the model was last used (None: never), load
+        attempts and the last one's duration in ms, the recorded load failure."""
         cache = self._vectors
         return {'loaded': self._embedder is not None, 'rows': cache.rows if cache else 0,
                 'generation': cache.generation if cache else None,
-                'matrix_bytes': int(cache.matrix.nbytes) if cache else 0, 'load_failure': self.load_failure}
+                'data_generation': cache.data_generation if cache else None,
+                'matrix_bytes': int(cache.matrix.nbytes) if cache else 0, 'load_failure': self.load_failure,
+                'idle_seconds': None if self.last_used is None else round(self.clock() - self.last_used, 1),
+                'loads': self.loads, 'last_load_ms': self.last_load_ms}
 
 
 # ---- console output -----------------------------------------------------------------------------

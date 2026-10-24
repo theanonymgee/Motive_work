@@ -518,8 +518,10 @@ def test_index_by_a_python_without_fts5_is_detected_and_rebuilt(text_home, monke
     assert status['dirty'] and not status['consistent']
     assert any('--rebuild-fts' in line for line in tools.status(home)['notice'])
     assert cli.main(['doctor']) == 0 and 'run workmcp index --rebuild-fts' in capsys.readouterr()[0]
-    hits = search.Engine(home).search('고유어휘조합', mode='lexical')['hits']
-    assert hits == []                           # the index does not hold the new chunk yet
+    # the FTS index does not hold the new chunk yet: search takes the LIKE path (M3 N1) and says so
+    dirty = search.Engine(home).search('고유어휘조합', mode='lexical')
+    assert dirty['meta']['lexical']['engine'] == 'like' and search.FTS_DIRTY_NOTICE in dirty['notice']
+    assert dirty['hits'] and Path(dirty['hits'][0]['doc']['path']).name == 'a.txt'
     result = index.run_index(db, home)
     assert result['fts_rebuilt'] and store.fts_status(db)['consistent']
     hits = search.Engine(home).search('고유어휘조합', mode='lexical')['hits']

@@ -3,6 +3,7 @@ module: its name does not match ``test_*.py``, so the default pytest run never c
 
     uv run python tests/probes/measure_search.py [--embedder real|hash] [--model-home HOME] [--work DIR]
                                                   [--seed 7] [--threads N] [--out FILE]
+    uv run python tests/probes/measure_search.py --signals [--seeds 7 11 23] [--embedder real|hash] ...
     uv run pytest tests/probes/measure_search.py -m probe     # hash run (always) + real run (if a model)
 
 One fresh process per run. Steps: a temporary data home (``--work``, default under %TEMP%, outside
@@ -19,6 +20,15 @@ read in place, not copied. ``--embedder hash`` uses ``HashEmbedder(1024)``: a fu
 quality numbers are not a model's (the report says so). Without a real model ``--embedder real``
 exits 3 (pytest: skip). The result JSON goes to ``<work>/measure/``; the console gets the tables.
 Offline: nothing here reaches the network.
+
+``--signals`` (design M3 §9.3, absent-information signals): for each seed (default 7, 11, 23) a fresh
+home -> ``corpus.write`` -> scan -> index with one shared embedder, then every Q1-Q7 query, the Q9
+queries and ``corpus.absent_queries()`` (60) in hybrid mode (``meta.signals``) and lexical mode
+(``bm25_top1``). "Answered" samples are the Q1-Q7 queries whose gold document is in the hybrid top
+10; "absent" are Q9 and the 60 absent queries. The rules R1 ``cosine_top1 < t``, R2 ``cosine_gap <
+d``, R3 no lexical candidate and no exact phrase, R4 = R3 and R1 are swept over thresholds; for each
+the best recall on absent with a false-alarm rate on answered <= 10 % is reported, pooled, per seed,
+and fitted on the first seed only then applied to the other seeds.
 """
 import argparse
 import json
@@ -172,6 +182,186 @@ def measure(args) -> dict:
     return result
 
 
+# ---- absent-information signals (design M3 §9.3) -----------------------------------------------------
+
+FALSE_ALARM_MAX = 0.10
+SIGNAL_FACTS = ('cosine_top1', 'cosine_top10', 'cosine_gap', 'lexical_candidates', 'exact_phrase_hits', 'bm25_top1')
+RULES = ('R1', 'R2', 'R3', 'R4')
+
+
+def _factory(args):
+    """One shared embedder for every seed's index and engine (the model loads once)."""
+    from workmcp import models
+    from workmcp.config import SearchSettings
+    from workmcp.embedder import HashEmbedder, OnnxEmbedder
+    if args.embedder == 'real':
+        from _real_model import real_model_home
+        model_home = Path(args.model_home) if args.model_home else real_model_home()
+        if model_home is None or not models.available(models.DEFAULT_MODEL, model_home):
+            raise LookupError('no real model')
+        shared = OnnxEmbedder(models.DEFAULT_MODEL, model_home,
+                              threads=args.threads or SearchSettings().effective_threads())
+    else:
+        shared = HashEmbedder(1024)
+    return lambda: shared
+
+
+def signal_rows(seed: int, factory, work: Path) -> tuple[list[dict], dict]:
+    """One seed: build, scan, index, then the facts of every query (synthetic query text only)."""
+    from fixtures import corpus as corpus_module
+    from test_collect import add_root, scan
+    from workmcp import index, paths, search, store
+
+    home = paths.ensure_home(work/f'seed-{seed}'/'home')
+    root = work/f'seed-{seed}'/'corpus'
+    corpus = corpus_module.build(seed)
+    corpus_module.write(corpus, root)
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))
+        started = time.perf_counter()
+        indexed = index.run_index(db, home, embedder=factory())
+        info = {'seed': seed, 'index_seconds': round(time.perf_counter() - started, 1),
+                'chunks': indexed['chunks_total'], 'embedded': indexed['embedded']}
+    finally:
+        db.close()
+    engine = search.Engine(home, embedder_factory=factory)
+    queries = [(q.id, q.category, q.text, q) for q in corpus.queries if q.category != 'Q8_two_chars']
+    queries += [(f'Q9x-{n:03d}', 'Q9x_absent', text, None) for n, text in enumerate(corpus_module.absent_queries(), 1)]
+    rows = []
+    for qid, category, text, query in queries:
+        hybrid = engine.search(text, mode='hybrid')
+        lexical = engine.search(text, mode='lexical')
+        facts = {key: hybrid['meta']['signals'][key] for key in SIGNAL_FACTS if key != 'bm25_top1'}
+        top_bm25 = [h['scores']['bm25'] for h in lexical['hits'][:1] if h['scores']['bm25'] is not None]
+        facts['bm25_top1'] = round(top_bm25[0], 3) if top_bm25 else None
+        absent = category.startswith('Q9')
+        found = None if absent else bool(corpus_module.score_query(query, hybrid['hits'], root)['doc@10'])
+        rows.append({'seed': seed, 'id': qid, 'category': category, 'text': text, 'absent': absent,
+                     'gold_in_top10': found, 'hits': len(hybrid['hits']), 'low_default': hybrid['meta']['signals']['low'],
+                     **facts})
+    info['queries'] = len(rows)
+    return rows, info
+
+
+def _rule(name: str, row: dict, threshold) -> bool:
+    lexical_none = row['lexical_candidates'] == 0 and row['exact_phrase_hits'] == 0
+    if name == 'R1':
+        return row['cosine_top1'] is not None and threshold is not None and row['cosine_top1'] < threshold
+    if name == 'R2':
+        return row['cosine_gap'] is not None and threshold is not None and row['cosine_gap'] < threshold
+    if name == 'R3':
+        return lexical_none
+    return lexical_none and row['cosine_top1'] is not None and threshold is not None and row['cosine_top1'] < threshold
+
+
+def _answered(rows):
+    return [r for r in rows if not r['absent'] and r['gold_in_top10']]
+
+
+def rates(name: str, rows: list[dict], threshold) -> dict:
+    answered, absent = _answered(rows), [r for r in rows if r['absent']]
+    hit = sum(_rule(name, r, threshold) for r in absent)
+    alarm = sum(_rule(name, r, threshold) for r in answered)
+    return {'recall': round(hit / len(absent), 3) if absent else None,
+            'false_alarm': round(alarm / len(answered), 3) if answered else None,
+            'absent_n': len(absent), 'answered_n': len(answered)}
+
+
+def best_threshold(name: str, rows: list[dict]) -> dict:
+    """The threshold with the highest recall at false alarm <= FALSE_ALARM_MAX (ties: lower false alarm,
+    then the lower threshold); R3 has none."""
+    if name == 'R3':
+        return {'rule': name, 'threshold': None, **rates(name, rows, None)}
+    best = None
+    for threshold in (round(0.001 * k, 3) for k in range(0, 1001)):
+        found = rates(name, rows, threshold)
+        if found['false_alarm'] is None or found['false_alarm'] > FALSE_ALARM_MAX:
+            continue
+        key = (found['recall'], -found['false_alarm'], -threshold)
+        if best is None or key > best[0]:
+            best = (key, {'rule': name, 'threshold': threshold, **found})
+    return best[1] if best else {'rule': name, 'threshold': None, 'recall': 0.0, 'false_alarm': None}
+
+
+def distribution(rows: list[dict], fact: str) -> dict:
+    out = {}
+    for label, chosen in (('answered', _answered(rows)),
+                          ('missed', [r for r in rows if not r['absent'] and r['gold_in_top10'] is False]),
+                          ('absent', [r for r in rows if r['absent']])):
+        values = [r[fact] for r in chosen if r[fact] is not None]
+        out[label] = {'n': len(values), 'min': percentile4(values, 0.0), 'p5': percentile4(values, 0.05),
+                      'p50': percentile4(values, 0.5), 'p95': percentile4(values, 0.95), 'max': percentile4(values, 1.0)}
+    return out
+
+
+def percentile4(values, q):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    k = (len(ordered) - 1) * q
+    low = int(k)
+    high = min(low + 1, len(ordered) - 1)
+    return round(ordered[low] + (ordered[high] - ordered[low]) * (k - low), 4)
+
+
+def measure_signals(args) -> dict:
+    factory = _factory(args)
+    work = Path(args.work or tempfile.mkdtemp(prefix='workmcp-signals-'))
+    rows, seeds = [], []
+    for seed in args.seeds:
+        part, info = signal_rows(seed, factory, work)
+        rows += part
+        seeds.append(info)
+    pooled = {name: best_threshold(name, rows) for name in RULES}
+    per_seed = {name: {seed: rates(name, [r for r in rows if r['seed'] == seed], pooled[name]['threshold'])
+                       for seed in args.seeds} for name in RULES}
+    first = args.seeds[0]
+    fitted = {name: best_threshold(name, [r for r in rows if r['seed'] == first]) for name in RULES}
+    holdout = {name: rates(name, [r for r in rows if r['seed'] != first], fitted[name]['threshold'])
+               for name in RULES}
+    missed = [r for r in rows if not r['absent'] and r['gold_in_top10'] is False]
+    by_category = {}
+    for category in sorted({r['category'] for r in rows}):
+        chosen = [r for r in rows if r['category'] == category]
+        by_category[category] = {name: sum(_rule(name, r, pooled[name]['threshold']) for r in chosen) for name in RULES}
+        by_category[category]['n'] = len(chosen)
+    return {'embedder': args.embedder, 'seeds': seeds, 'work': str(work), 'false_alarm_max': FALSE_ALARM_MAX,
+            'counts': {'answered': len(_answered(rows)), 'missed': len(missed),
+                       'absent': sum(1 for r in rows if r['absent'])},
+            'distribution': {fact: distribution(rows, fact) for fact in SIGNAL_FACTS},
+            'pooled': pooled, 'per_seed': per_seed, 'fitted_on_first_seed': fitted, 'holdout': holdout,
+            'missed_flagged': {name: sum(_rule(name, r, pooled[name]['threshold']) for r in missed) for name in RULES},
+            'flagged_by_category': by_category, 'rows': rows}
+
+
+def signal_tables(result: dict) -> str:
+    counts = result['counts']
+    lines = [f"signals: embedder {result['embedder']}, seeds {[s['seed'] for s in result['seeds']]}, "
+             f"answered {counts['answered']}, missed {counts['missed']}, absent {counts['absent']}",
+             f"index: {json.dumps(result['seeds'])}",
+             '', '| fact | sample | n | min | p5 | p50 | p95 | max |', '|---|---|---|---|---|---|---|---|']
+    for fact, parts in result['distribution'].items():
+        for label, row in parts.items():
+            lines.append(f"| {fact} | {label} | {row['n']} | {row['min']} | {row['p5']} | {row['p50']} | "
+                         f"{row['p95']} | {row['max']} |")
+    lines += ['', '| rule | threshold | recall (absent) | false alarm (answered) | missed flagged | '
+              'fit on first seed: threshold / holdout recall / holdout false alarm |', '|---|---|---|---|---|---|']
+    for name, row in result['pooled'].items():
+        fit, hold = result['fitted_on_first_seed'][name], result['holdout'][name]
+        lines.append(f"| {name} | {row['threshold']} | {row['recall']} | {row['false_alarm']} | "
+                     f"{result['missed_flagged'][name]}/{counts['missed']} | "
+                     f"{fit['threshold']} / {hold['recall']} / {hold['false_alarm']} |")
+    lines += ['', '| rule | seed | recall | false alarm |', '|---|---|---|---|']
+    for name, seeds in result['per_seed'].items():
+        for seed, row in seeds.items():
+            lines.append(f"| {name} | {seed} | {row['recall']} | {row['false_alarm']} |")
+    lines += ['', '| category | n | ' + ' | '.join(RULES) + ' |', '|---|---|' + '---|' * len(RULES)]
+    for category, row in result['flagged_by_category'].items():
+        lines.append(f"| {category} | {row['n']} | " + ' | '.join(str(row[name]) for name in RULES) + ' |')
+    return '\n'.join(lines)
+
+
 def tables(result: dict) -> str:
     lines = [f"embedder {result['embedder']}  seed {result['seed']}" + (f"  ({result['note']})" if result['note'] else '')]
     idx = result['index']
@@ -205,18 +395,22 @@ def main(argv=None) -> int:
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--threads', type=int, default=0)
     parser.add_argument('--out')
+    parser.add_argument('--signals', action='store_true', help='absent-information signals (design M3 §9.3)')
+    parser.add_argument('--seeds', type=int, nargs='+', default=[7, 11, 23])
     args = parser.parse_args(argv)
     try:
-        result = measure(args)
+        result = measure_signals(args) if args.signals else measure(args)
     except LookupError as exc:
         print(f'skipped: {exc}', file=sys.stderr)
         return 3
-    out = Path(args.out) if args.out else (Path(result['home'])/'measure'/
-                                           f"search-{args.embedder}-{time.strftime('%Y%m%d-%H%M%S')}.json")
+    name = 'signals' if args.signals else 'search'
+    folder = Path(result['work']) if args.signals else Path(result['home'])
+    out = Path(args.out) if args.out else (folder/'measure'/
+                                           f"{name}-{args.embedder}-{time.strftime('%Y%m%d-%H%M%S')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding='utf-8')
     sys.stdout.reconfigure(encoding='utf-8')
-    print(tables(result))
+    print(signal_tables(result) if args.signals else tables(result))
     print(f'result: {out}')
     return 0
 
@@ -236,6 +430,18 @@ def test_probe_search(tmp_path, embedder):
     assert result['index_second']['chunked'] == 0 and result['index_second']['embedded'] == 0
     assert result['matrix']['commit_increase_mib'] <= result['memory']['s1_bound_mib']
     assert result['metrics']['lexical']['Q1_phrase']['doc@10'] >= 0.8
+
+
+@pytest.mark.probe
+def test_probe_signals_hash(tmp_path):
+    """``--signals`` end to end with HashEmbedder and one seed: every rule is reported."""
+    run = subprocess.run([sys.executable, str(HERE), '--signals', '--embedder', 'hash', '--seeds', '7',
+                          '--work', str(tmp_path/'work'), '--out', str(tmp_path/'signals.json')],
+                         capture_output=True, text=True, encoding='utf-8', timeout=1800)
+    assert run.returncode == 0, run.stderr[-2000:]
+    result = json.loads((tmp_path/'signals.json').read_text(encoding='utf-8'))
+    assert set(result['pooled']) == set(RULES) and result['counts']['absent'] == 65
+    assert all(set(row) >= set(SIGNAL_FACTS) for row in result['rows'])
 
 
 if __name__ == '__main__':

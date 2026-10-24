@@ -81,6 +81,24 @@ def check_contract(result: dict) -> None:
     assert meta['semantic'] in (search.UNAVAILABLE, search.NOT_REQUESTED) or set(meta['semantic']) == search.SEMANTIC_META_KEYS
     assert set(meta['filters']) == search.FILTER_KEYS and set(meta['elapsed_ms']) == search.ELAPSED_KEYS
     assert isinstance(meta['eligible_chunks'], int) and isinstance(result['notice'], list)
+    assert isinstance(meta['collapsed'], int) and meta['collapsed'] >= 0
+    signals = meta['signals']
+    assert set(signals) == search.SIGNAL_KEYS and isinstance(signals['low'], bool)
+    lexical_ran = meta['mode'] != 'semantic'
+    for key in ('lexical_candidates', 'exact_phrase_hits'):
+        assert (signals[key] is not None) == lexical_ran
+    assert signals['lexical_candidates'] in (None, meta['lexical']['candidates'])
+    assert signals['exact_phrase_hits'] is None or signals['exact_phrase_hits'] <= signals['lexical_candidates']
+    if isinstance(meta['semantic'], dict) and meta['semantic']['candidates']:
+        cosines = [h['scores']['cosine'] for h in result['hits'] if h['scores']['cosine'] is not None]
+        assert signals['cosine_top1'] is not None
+        assert not cosines or signals['cosine_top1'] >= max(cosines) - 1e-4
+        assert (signals['cosine_top10'] is not None) == (meta['semantic']['candidates'] >= 10)
+    else:
+        assert signals['cosine_top1'] is None and signals['cosine_top10'] is None
+    if signals['cosine_gap'] is not None:
+        assert signals['cosine_gap'] == pytest.approx(signals['cosine_top1'] - signals['cosine_top10'], abs=2e-4)
+    assert signals['low'] == search.low_signal(signals)
     for rank, hit in enumerate(result['hits'], 1):
         assert search.HIT_KEYS <= set(hit) <= search.HIT_KEYS | search.HIT_OPTIONAL_KEYS
         assert hit['rank'] == rank and isinstance(hit['chunk_id'], int) and isinstance(hit['version_id'], int)
@@ -564,7 +582,11 @@ def test_engine_unloads_after_idle(indexed):
     assert engine.maybe_unload() is False
     assert engine.maybe_unload(now[0] + 1) is True
     status = engine.status()
-    assert status == {'loaded': False, 'rows': 0, 'generation': None, 'matrix_bytes': 0, 'load_failure': None}
+    assert set(status) == search.ENGINE_STATUS_KEYS
+    assert status == {'loaded': False, 'rows': 0, 'generation': None, 'data_generation': None, 'matrix_bytes': 0,
+                      'load_failure': None, 'idle_seconds': 599.0, 'loads': 1,
+                      'last_load_ms': status['last_load_ms']}
+    assert status['last_load_ms'] >= 0
     assert engine.search('사양서')['meta']['semantic']['vectors'] > 0   # loads again on demand
     assert engine.loads == 2
 
@@ -766,3 +788,251 @@ def test_hits_drop_a_candidate_whose_chunk_text_changed(tmp_path):
         assert search._hits(db, [(chunk_id, scores)], [], {chunk_id: 'f' * 64}) == []
     finally:
         db.close()
+
+
+# ---- M3 §9.1 N1: an FTS index out of step means the LIKE path ---------------------------------------
+
+DIRTY_NEW = f'{SENTINEL} 합성 변경문서 감마델타엡실론 확정사항입니다.\n'
+DIRTY_QUERY = '감마델타엡실론 확정사항입니다'          # every token >= 3 characters: no LIKE fallback by (c)
+
+
+def old_fts_usable(db):
+    """The M2 judgement (table there and readable, ``fts_dirty`` not looked at)."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'").fetchone() is None:
+        return False
+    try:
+        db.execute('SELECT rowid FROM chunks_fts LIMIT 0').fetchone()
+    except sqlite3.Error:
+        return False
+    return True
+
+
+def test_fts_dirty_switches_lexical_to_like_with_notice(tmp_path, monkeypatch):
+    home, root = stale_home(tmp_path)
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    assert engine.search('베타 견적서 원래', mode='lexical')['meta']['lexical']['engine'] == 'fts5'
+    with monkeypatch.context() as patch:              # chunks change in a Python without FTS5
+        patch.setattr(store, 'fts5_available', lambda: False)
+        rewrite(root/'b.txt', DIRTY_NEW.encode('utf-8'))
+        db = store.open_home(home)
+        try:
+            scan(db, add_root(db, root))
+            index.run_index(db, home, embedder=HashEmbedder(DIMS))
+            assert store.meta_get(db, 'fts_dirty') == '1'
+        finally:
+            db.close()
+    assert store.fts5_available()                     # FTS5 is back; chunks_fts is still out of step
+    latest = eligible_versions(home)
+    for mode in ('lexical', 'hybrid'):
+        result = engine.search(DIRTY_QUERY, mode=mode)
+        check_contract(result)
+        assert result['meta']['lexical']['engine'] == 'like', mode
+        assert search.FTS_DIRTY_NOTICE in result['notice'] and search.SHORT_QUERY_NOTICE not in result['notice']
+        top = result['hits'][0]
+        assert Path(top['doc']['path']).name == 'b.txt' and top['version_id'] == latest['b.txt']
+        assert '감마델타엡실론' in top['snippet']
+    # over the LIKE cap: no lexical search, the same notice
+    capped = search.Engine(home, replace(SearchSettings(), like_max_chunks=1)).search(DIRTY_QUERY, mode='lexical')
+    assert capped['meta']['lexical']['engine'] == 'none' and capped['hits'] == []
+    assert search.FTS_DIRTY_NOTICE in capped['notice'] and search.SHORT_QUERY_NOTICE not in capped['notice']
+    # mutation check: with the M2 judgement the stale FTS index is used and misses the current text
+    with monkeypatch.context() as patch:
+        patch.setattr(search, 'fts_usable', old_fts_usable)
+        stale = engine.search(DIRTY_QUERY, mode='lexical')
+        assert stale['meta']['lexical']['engine'] == 'fts5' and stale['hits'] == []
+        assert search.FTS_DIRTY_NOTICE not in stale['notice']
+    # the next index with FTS5 rebuilds it: back to FTS5, the new text found
+    db = store.open_home(home)
+    try:
+        index.run_index(db, home, embedder=HashEmbedder(DIMS))
+        assert store.meta_get(db, 'fts_dirty') is None
+    finally:
+        db.close()
+    rebuilt = engine.search(DIRTY_QUERY, mode='lexical')
+    assert rebuilt['meta']['lexical']['engine'] == 'fts5' and rebuilt['hits'][0]['version_id'] == latest['b.txt']
+    assert search.FTS_DIRTY_NOTICE not in rebuilt['notice']
+
+
+# ---- M3 §9.2 N2: an index run that stopped must re-map the semantic candidates ---------------------
+
+N2_TEXTS = {'near.txt': '합성 근접 문서 오메가 항목 정밀 측정 결과 보고서',
+            'mid1.txt': '합성 근접 문서 오메가 항목 측정 일정 보고',
+            'mid2.txt': '합성 근접 문서 오메가 측정 장비 목록'}
+N2_QUERY = N2_TEXTS['near.txt']
+
+
+class StopsAtFirstBatch:
+    """Embeds nothing: the index run stops in its vector phase, after the chunk phase committed."""
+    identity = HashEmbedder(DIMS).identity
+
+    def embed(self, texts, *, query):
+        raise KeyboardInterrupt
+
+
+def test_stopped_index_run_remaps_semantic_candidates(tmp_path, monkeypatch):
+    def write(root):
+        root.mkdir(parents=True)
+        for name, text in N2_TEXTS.items():
+            (root/name).write_text(f'{SENTINEL} {text}\n', encoding='utf-8')
+
+    home, root = build_home(tmp_path/'home', write)
+    settings = replace(SearchSettings(), semantic_candidates=2)
+    engines = [search.Engine(home, settings, embedder_factory=hash_factory()) for _ in range(2)]
+    for engine in engines:                            # warm: matrix and chunk mapping cached
+        before = engine.search(N2_QUERY, mode='semantic', limit=2)['hits']
+        assert [Path(h['doc']['path']).name for h in before][0] == 'near.txt' and len(before) == 2
+    (root/'near.txt').unlink()                        # the best candidate's document goes away
+    (root/'new.txt').write_text(f'{SENTINEL} 합성 새 문서 아직 벡터 없음\n', encoding='utf-8')
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))
+        generation, data_generation = store.meta_get(db, 'index_generation'), store.meta_get(db, 'data_generation')
+        with pytest.raises(KeyboardInterrupt):
+            index.run_index(db, home, embedder=StopsAtFirstBatch())
+        assert store.meta_get(db, 'index_generation') == generation       # the matrix stays valid
+        assert store.meta_get(db, 'data_generation') != data_generation
+    finally:
+        db.close()
+    # the mapping is rebuilt: the two remaining documents fill the two candidates
+    hits = engines[0].search(N2_QUERY, mode='semantic', limit=2)['hits']
+    assert sorted(Path(h['doc']['path']).name for h in hits) == ['mid1.txt', 'mid2.txt']
+    assert engines[0].status()['data_generation'] == eligible_data_generation(home)
+    # mutation check: without the re-map the dropped chunk takes a candidate slot and one hit is lost
+    with monkeypatch.context() as patch:
+        patch.setattr(search.VectorCache, 'remap', lambda self, db: None)
+        assert len(engines[1].search(N2_QUERY, mode='semantic', limit=2)['hits']) == 1
+
+
+def eligible_data_generation(home):
+    db = ro(home)
+    try:
+        return store.meta_get(db, 'data_generation', '0')
+    finally:
+        db.close()
+
+
+# ---- M3 §2.2: one hit per document ------------------------------------------------------------------
+
+def test_collapse_by_document_keeps_first_hit_per_document(engine, indexed):
+    query = '합성 프로젝트 사양서 개정판 담당'
+    total_skipped = 0
+    for mode in search.MODES:
+        full = engine.search(query, mode=mode, limit=50)
+        assert full['meta']['collapsed'] == 0
+        collapsed = engine.search(query, mode=mode, limit=10, collapse_by_document=True)
+        check_contract(collapsed)
+        hits = collapsed['hits']
+        docs = [h['doc']['id'] for h in hits]
+        assert len(docs) == len(set(docs)) == 10, mode
+        assert [h['rank'] for h in hits] == list(range(1, 11))
+        # the same hits as walking the full order and keeping each document's first one
+        first_per_doc, skipped = [], 0
+        for hit in full['hits']:
+            if hit['doc']['id'] in {h['doc']['id'] for h in first_per_doc}:
+                skipped += 1
+                continue
+            if len(first_per_doc) == 10:
+                break
+            first_per_doc.append(hit)
+        assert [h['chunk_id'] for h in hits] == [h['chunk_id'] for h in first_per_doc], mode
+        assert collapsed['meta']['collapsed'] == skipped, mode
+        total_skipped += skipped
+        for hit, same in zip(hits, first_per_doc):
+            assert hit['scores'] == same['scores'] and hit['snippet'] == same['snippet']
+    assert total_skipped > 0
+    # the limit is reached before the candidates end: only the skips before the stop are counted
+    wide = engine.search(query, mode='lexical', limit=50, collapse_by_document=True)
+    assert len({h['doc']['id'] for h in wide['hits']}) == len(wide['hits']) == 50
+    assert 0 < wide['meta']['collapsed'] < wide['meta']['lexical']['candidates'] - len(wide['hits'])
+
+
+# ---- M3 §9.3: the facts of an absent-information judgement ----------------------------------------
+
+def test_signals_block_is_present_and_low_rule_is_computed(engine, corpus):
+    present = engine.search('PRJ-012 사양서 개정판')
+    signals = present['meta']['signals']
+    assert signals['lexical_candidates'] > 0 and signals['exact_phrase_hits'] >= 1
+    assert signals['cosine_top1'] is not None and signals['cosine_top10'] is not None and signals['low'] is False
+    semantic = engine.search('PRJ-012 사양서 개정판', mode='semantic')['meta']['signals']
+    assert semantic['lexical_candidates'] is None and semantic['exact_phrase_hits'] is None
+    assert semantic['cosine_top1'] == signals['cosine_top1']
+    lexical = engine.search('PRJ-012 사양서 개정판', mode='lexical')['meta']['signals']
+    assert lexical['cosine_top1'] is None and lexical['exact_phrase_hits'] == signals['exact_phrase_hits']
+    # the lexical scores do not change: exact_phrase stays a hybrid-only score (M2 contract)
+    assert not any(h['scores']['exact_phrase'] for h in engine.search('PRJ-012 사양서 개정판', mode='lexical')['hits'])
+    # a model-less engine: no cosine facts
+    assert search.Engine(engine.home).search('사양서')['meta']['signals']['cosine_top1'] is None
+
+
+def test_low_signal_rules():
+    facts = {'lexical_candidates': 0, 'exact_phrase_hits': 0, 'cosine_top1': 0.40, 'cosine_top10': 0.35,
+             'cosine_gap': 0.05}
+    rule = {'cosine_top1': 0.5, 'gap': 0.08}
+    assert [search.low_signal(facts, {**rule, 'rule': r}) for r in search.LOW_SIGNAL_RULES] == [True] * 4
+    assert search.low_signal({**facts, 'lexical_candidates': 3}, {**rule, 'rule': 'R3'}) is False
+    assert search.low_signal({**facts, 'lexical_candidates': 3}, {**rule, 'rule': 'R4'}) is False
+    assert search.low_signal({**facts, 'cosine_top1': 0.6}, {**rule, 'rule': 'R4'}) is False
+    assert search.low_signal({**facts, 'cosine_gap': 0.2}, {**rule, 'rule': 'R2'}) is False
+    # a fact that mode did not produce, or a threshold not set, never makes a rule true
+    assert search.low_signal({**facts, 'cosine_top1': None}, {**rule, 'rule': 'R1'}) is False
+    assert search.low_signal(facts, {'rule': 'R1', 'cosine_top1': None, 'gap': None}) is False
+    assert search.low_signal({**facts, 'lexical_candidates': None, 'exact_phrase_hits': None},
+                             {**rule, 'rule': 'R3'}) is False
+    with pytest.raises(ValueError):
+        search.low_signal(facts, {'rule': 'R9'})
+    assert search.signals_of(None, None, []) == {**search.DEFAULT_SIGNALS}
+    built = search.signals_of(0, 0, [0.5 - n / 100 for n in range(12)], {**rule, 'rule': 'R2'})
+    assert (built['cosine_top1'], built['cosine_top10'], built['cosine_gap'], built['low']) == (0.5, 0.41, 0.09, False)
+    assert search.signals_of(2, 1, [0.3] * 9)['cosine_top10'] is None
+
+
+def test_low_signal_fires_on_absent_query_fixture(engine, corpus, monkeypatch):
+    """HashEmbedder checks the rule computation only; the thresholds come from the real-model
+    measurement (doc/validation/2026-10-24_M3-신호측정_v1.md)."""
+    absent = corpus_module.absent_queries()
+    assert len(absent) == len(set(absent)) == 60
+    fired = 0
+    for text in absent:
+        result = engine.search(text)
+        signals = result['meta']['signals']
+        assert signals['low'] == search.low_signal(signals)
+        if signals['low']:
+            fired += 1
+            assert result['hits'] and any(line.startswith('질의와 가까운 내용이 적습니다') for line in result['notice'])
+    assert fired > 0                                   # the default rule (R3) fires on some absent queries
+    phrase = engine.search('PRJ-012 사양서 개정판')
+    assert phrase['meta']['signals']['low'] is False and phrase['notice'] == []
+    # another rule from the constant: every hybrid result is judged by it
+    monkeypatch.setattr(search, 'LOW_SIGNAL', {'rule': 'R1', 'cosine_top1': 1.01, 'gap': None})
+    assert engine.search('PRJ-012 사양서 개정판')['meta']['signals']['low'] is True
+
+
+def test_absent_queries_are_not_in_the_corpus(corpus):
+    texts = [text.casefold() for path in corpus.unit_texts for text in corpus.unit_texts[path]]
+    for query in corpus_module.absent_queries():
+        assert not any(query.casefold() in text for text in texts), query
+    for seed in (11, 23):
+        other = corpus_module.build(seed)
+        texts = [t.casefold() for path in other.unit_texts for t in other.unit_texts[path]]
+        assert not any(q.casefold() in t for q in corpus_module.absent_queries() for t in texts)
+
+
+# ---- M3 §2.6, §6.3: engine status --------------------------------------------------------------------
+
+def test_engine_status_reports_generations_idle_and_load_time(indexed):
+    now = [50.0]
+    engine = search.Engine(indexed[0], embedder_factory=hash_factory(), clock=lambda: now[0])
+    cold = engine.status()
+    assert set(cold) == search.ENGINE_STATUS_KEYS
+    assert (cold['loaded'], cold['idle_seconds'], cold['loads'], cold['last_load_ms']) == (False, None, 0, None)
+    engine.search('사양서')
+    now[0] += 12.5
+    warm = engine.status()
+    db = ro(indexed[0])
+    try:
+        assert warm['generation'] == store.meta_get(db, 'index_generation', '0')
+        assert warm['data_generation'] == store.meta_get(db, 'data_generation', '0')
+    finally:
+        db.close()
+    assert warm['loaded'] and warm['idle_seconds'] == 12.5 and warm['loads'] == 1 and warm['last_load_ms'] >= 0
+    json.dumps(warm)

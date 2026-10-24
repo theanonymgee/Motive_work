@@ -468,6 +468,39 @@ def queries(corpus: Corpus) -> list[Query]:
     return list(corpus.queries)
 
 
+# Absent-information queries for the signal measurement (design M3 §9.3): 20 office-style topics that
+# no topic card has, 3 fillers each = 60 queries. Their words may meet the corpus vocabulary (as a real
+# question about missing material would), but no query phrase occurs in any corpus unit
+# (``tests/test_search.py`` checks it). Every value is made up.
+ABSENT_TEMPLATES = (
+    ('{x} 사무실 이전 계획', ('부산', '대전', '광주')),
+    ('{x} 특허 출원 진행 상황', ('배터리 냉각', '음성 인식', '무선 충전')),
+    ('신입 사원 {x} 교육 자료', ('정보보안', '회계 기초', '산업안전')),
+    ('{x} 현지 법인 설립 서류', ('싱가포르', '베트남', '멕시코')),
+    ('사내 {x} 동호회 회비 사용', ('등산', '축구', '독서')),
+    ('{x} 서버 장애 원인 분석', ('메일', '인사관리', '전자결재')),
+    ('{x} 주차권 발급 기준', ('방문객', '임원', '협력사 직원')),
+    ('연말 {x} 행사 장소 섭외', ('송년회', '시상식', '봉사활동')),
+    ('{x} 인증 갱신 심사 결과', ('ISO 14001', 'ISMS', 'CE 마킹')),
+    ('탄소 배출권 {x} 거래 내역', ('1분기', '반기', '연간')),
+    ('{x} 매장 임대료 인상 협상', ('강남', '판교', '해운대')),
+    ('해외 출장 {x} 정산 규정', ('항공권', '숙박비', '일비')),
+    ('{x} 공장 폐수 처리 기준', ('청주', '구미', '여수')),
+    ('Employee {x} reimbursement policy', ('gym', 'commute', 'childcare')),
+    ('{x} 광고 캠페인 성과 보고', ('동영상', '지하철', '라디오')),
+    ('퇴직 연금 {x} 운용 수익률', ('확정급여형', '확정기여형', '개인형')),
+    ('{x} 소송 합의금 지급', ('상표권', '근로자', '하도급')),
+    ('사옥 {x} 공사 업체 선정', ('리모델링', '옥상 방수', '엘리베이터 교체')),
+    ('{x} 데이터센터 전력 사용량', ('수도권', '제주', '세종')),
+    ('Annual {x} audit findings', ('tax', 'fire safety', 'IT security')),
+)
+
+
+def absent_queries() -> list[str]:
+    """60 queries about topics the corpus does not have (template order, then filler order)."""
+    return [template.format(x=value) for template, values in ABSENT_TEMPLATES for value in values]
+
+
 # ---- metrics (design M2 §8.3) ----------------------------------------------------------------------
 
 def hit_rel_path(hit: dict, root: Path) -> str | None:
