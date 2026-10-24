@@ -18,7 +18,11 @@ the server stops are lost; their number goes to stderr.
 Knowledge writes use a second write connection (``know_db``, busy timeout ``KNOWLEDGE_BUSY_MS``): a
 write must not be lost, so it waits up to 5 s for the store and otherwise answers ``store_busy`` with
 nothing written (design M4 §8.2). ``handle`` gives the writers ``recorded_by = "<client>/<tool>"`` and
-the call id through ``ServerState.client`` and ``ServerState.call_id`` (set before each call).
+the call id through ``ServerState.client`` and ``ServerState.call_id`` (set before each call), rolls
+back a transaction a writer left open (``internal_error``: a call commits everything or nothing), and
+answers a committed write that does not fit the budget with ``response_too_large`` naming the stored
+ids, so the client does not repeat it. Two serve processes on one store serialize their writes on
+SQLite's write lock (``BEGIN IMMEDIATE`` holds it from the first read to the commit).
 
 Integer and boolean arguments are strict (``StrictInt``/``StrictBool``): the SDK refuses ``true`` or
 ``2.0`` for an integer with its argument validation error (review L1) instead of converting them.
@@ -58,7 +62,9 @@ LOG_DELAYED_NOTICE = ('로컬 전달 기록(deliveries)을 대기열에 두었�
 LOG_BUSY_MS = 200           # the call log's busy_timeout: a scan's write transaction never holds a call up
 LOG_QUEUE_MAX = 10_000      # calls kept in memory while the store is busy; older ones are dropped (counted)
 KNOWLEDGE_BUSY_MS = 5000    # the knowledge write connection's busy_timeout (design M4 §8.2)
-MODEL_LOADED_NOTICE = '의미 검색 모델을 이 호출에서 처음 로드했습니다(+{} ms); 다음 질의부터 빠릅니다'
+STORED_TOO_LARGE = ('stored (id {}) but the answer does not fit in {} characters; do not repeat the call, '
+                    'read it back with get_entity or get_history')
+MODEL_LOADED_NOTICE ='의미 검색 모델을 이 호출에서 처음 로드했습니다(+{} ms); 다음 질의부터 빠릅니다'
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f]')
 
 
@@ -114,8 +120,13 @@ def client_of(ctx) -> tuple[str, str]:
 
 def _writer(tool: str, function):
     """A knowledge writer on the knowledge write connection with ``recorded_by = "<client>/<tool>"`` and the
-    call id ``handle`` set (design M4 §7.2)."""
-    return lambda st, **args: function(st.know_db, recorded_by=f'{st.client}/{tool}', call_id=st.call_id, **args)
+    call id ``handle`` set (design M4 §7.2). Without that connection (a state made for read-only tests)
+    the writer answers ``store_missing`` and writes nothing."""
+    def call(st: ServerState, **args) -> dict:
+        if st.know_db is None:
+            return tools.error('store_missing', 'this server has no knowledge write connection')
+        return function(st.know_db, recorded_by=f'{st.client}/{tool}', call_id=st.call_id, **args)
+    return call
 
 
 # Each takes the state (positionally) and the tool arguments and returns an envelope. The first parameter
@@ -205,19 +216,49 @@ def _record(state: ServerState, call_id: str, client: tuple[str, str], tool: str
     return flush_log(state)
 
 
+def _written_ids(envelope: dict) -> list[int]:
+    """The ids a successful knowledge write answer names (entity, assertion, cut and new rows), for the
+    message of a write whose answer is too large: the write is stored, the client must not repeat it."""
+    result = envelope.get('result') if envelope.get('ok') else None
+    if not isinstance(result, dict):
+        return []
+    return [row['id'] for key in ('entity', 'assertion', 'cut', 'new')
+            if isinstance(row := result.get(key), dict) and type(row.get('id')) is int]
+
+
+def _settle_knowledge(state: ServerState, tool: str) -> bool:
+    """True when a knowledge writer left its transaction open (a bug): roll it back, so a call either
+    committed everything or wrote nothing (design M4 §8.2); the class of failure goes to stderr."""
+    db = state.know_db
+    if db is None or not db.in_transaction:
+        return False
+    db.execute('ROLLBACK')
+    LOG.error('tool %s left a knowledge transaction open; rolled back', tool)
+    return True
+
+
 def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -> str:
-    """Run one tool call and return the serialized envelope (never raises for an ordinary error)."""
+    """Run one tool call and return the serialized envelope (never raises for an ordinary error).
+
+    A knowledge write is committed or not at all: a transaction a writer left open is rolled back and the
+    answer becomes ``internal_error``. A committed write whose answer does not fit the budget answers
+    ``response_too_large`` naming the stored ids (not retryable: repeating it would record it twice)."""
     began = time.perf_counter()
     call_id = os.urandom(8).hex()
     state.client, state.call_id = client[0], call_id  # the knowledge writers' recorded_by and call id
+    stored: list[int] = []
     try:
         unload_if_idle(state)
         loads_before = state.engine.loads
         envelope = TOOLS[tool](state, **args)
+        if tool in tools.WRITE_TOOL_NAMES:
+            stored = _written_ids(envelope)
         envelope = tools.fit(envelope, tools.SHRINK[tool], state.budget)
         _annotate_engine(envelope, state.engine, loads_before)
     except knowledge.KnowledgeError as exc:  # argument names, numbers and labels only, never text
         envelope = tools.error(exc.code, exc.message, retryable=exc.retryable)
+    except store.Busy:  # a writer that did not turn the lock wait into its KnowledgeError: nothing written
+        envelope = tools.error('store_busy', 'the store is busy; try again', retryable=True)
     except search.SearchError as exc:
         envelope = tools.error(exc.code, exc.message)
     except locator.LocatorError as exc:  # a fixed code (shape, hash, range, text mismatch), no text
@@ -235,9 +276,13 @@ def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -
     except Exception as exc:  # noqa: BLE001 - last guard: class name only to the client, traceback to stderr
         LOG.exception('tool %s failed', tool)
         envelope = tools.error('internal_error', type(exc).__name__)
+    if _settle_knowledge(state, tool) and envelope.get('ok'):  # an answer for a write that was not committed
+        envelope, stored = tools.error('internal_error', 'TransactionLeftOpen'), []
     limit = state.budget + tools.NOTICE_RESERVE
     if len(tools.dumps(envelope)) > limit:  # any path, errors too (review M3-3)
         envelope = tools.error('response_too_large', f'the response does not fit in {limit} characters')
+    if stored and not envelope.get('ok') and envelope['error']['code'] == 'response_too_large':
+        envelope = tools.error('response_too_large', STORED_TOO_LARGE.format(', '.join(map(str, stored)), limit))
     if not _record(state, call_id, client, tool, args, envelope, began):
         print(f'workmcp: call log delayed for {tool} ({len(state.pending)} queued)', file=sys.stderr)
         if envelope.get('ok'):

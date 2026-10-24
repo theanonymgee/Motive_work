@@ -876,10 +876,101 @@ SERVE_IDS = set(range(1, 13))
 SERVE_CALLED = {3: 'status', 4: 'search', 5: 'search', 6: 'get_snippet', 7: 'get_snippet', 8: 'list_documents',
                 9: 'recent_changes', 10: 'search', 11: 'get_snippet'}  # the calls our code handles (not 12)
 SERVE_ERRORS = {10: 'empty_query', 11: 'argument_invalid'}
+SERVE_DELIVERING = {4, 5, 6, 7}                       # the calls whose answers carry document text
+
+# The knowledge part of the session (design M4 §10): write -> read -> supersede -> retract, then three
+# refused writes. Steps are callables of the replies so far (ids come from earlier answers). Every text
+# argument a client writes carries SENTINEL, which must never reach stderr or tool_calls.args_json.
+KNOWLEDGE_CALLED = {13: 'record_entity', 14: 'record_fact', 15: 'record_fact', 16: 'record_fact',
+                    17: 'record_decision', 18: 'record_task', 19: 'find_entity', 20: 'get_entity',
+                    21: 'list_knowledge', 22: 'supersede', 23: 'retract', 24: 'get_history',
+                    25: 'record_fact', 26: 'record_fact', 27: 'record_fact'}
+KNOWLEDGE_ERRORS = {25: 'evidence_quote_not_found', 26: 'evidence_required', 27: 'chunk_not_found'}
+KNOWLEDGE_DELIVERING = {14, 15, 17, 20, 22, 24}       # stored quotes come back: writes with sources, details
+ENTITY_NAME = f'합성 과제 {SENTINEL}'
+PREDICATE = '담당'
 
 
-def serve_session(tmp_path, messages, expected_ids, timeout=60, root=None):
-    """Run the wrapper in ``serve [ROOT]`` mode; keep stdin open until every expected reply arrived, then close it."""
+def answer(replies: dict, number: int) -> dict:
+    return json.loads(replies[number]['result']['content'][0]['text'])
+
+
+def knowledge_session(hit: dict) -> list:
+    """Steps 13-27 after ``mcp_session``; ``hit['snippet']`` is quoted (it is the text under ``hit['locator']``
+    and occurs once in the hit's chunk, which ``unique_in_chunk`` checks before the session)."""
+    quote = hit['snippet']
+
+    def entity(replies):
+        return answer(replies, 13)['result']['entity']['id']
+
+    def fact(replies, **extra):
+        return {'entity_id': entity(replies), 'predicate': PREDICATE, 'value': f'{SENTINEL} 값', **extra}
+
+    def assertion(replies, number, key='assertion'):
+        return answer(replies, number)['result'][key]['id']
+
+    by_chunk = [{'chunk_id': hit['chunk_id'], 'quote': quote}]
+    by_locator = [{'locator': hit['locator'], 'quote': quote}]
+    return [
+        tool_call(13, 'record_entity', {'kind': 'project', 'name': ENTITY_NAME, 'aliases': ['과제P']}),
+        lambda r: tool_call(14, 'record_fact', fact(r, sources=by_chunk)),
+        lambda r: tool_call(15, 'record_fact', fact(r, sources=by_locator)),                 # same value: duplicate
+        lambda r: tool_call(16, 'record_fact', fact(r, value='합성 다른 값', my_note=True)),    # another value: conflict
+        lambda r: tool_call(17, 'record_decision', {'statement': f'합성 결정 {SENTINEL}', 'entity_id': entity(r),
+                                                    'options': ['가안', '나안'], 'chosen': '가안',
+                                                    'sources': by_locator}),
+        lambda r: tool_call(18, 'record_task', {'statement': f'합성 할 일 {SENTINEL}', 'entity_id': entity(r),
+                                                'due': '2026-11-01', 'my_note': True}),
+        tool_call(19, 'find_entity', {'query': '합성 과제'}),
+        lambda r: tool_call(20, 'get_entity', {'entity_id': entity(r)}),
+        tool_call(21, 'list_knowledge', {'kind': 'fact'}),
+        lambda r: tool_call(22, 'supersede', {'assertion_id': assertion(r, 14),
+                                              'statement': f'합성 교정 문장 {SENTINEL}',     # same value
+                                              'reason': f'합성 교정 {SENTINEL}', 'sources': by_locator}),
+        lambda r: tool_call(23, 'retract', {'assertion_id': assertion(r, 16), 'reason': f'합성 철회 {SENTINEL}'}),
+        lambda r: tool_call(24, 'get_history', {'assertion_id': assertion(r, 22, 'new')}),
+        lambda r: tool_call(25, 'record_fact', fact(r, sources=[{'chunk_id': hit['chunk_id'],
+                                                                 'quote': f'없는 문장 {SENTINEL}'}])),
+        lambda r: tool_call(26, 'record_fact', fact(r)),                                      # neither: refused
+        lambda r: tool_call(27, 'record_fact', fact(r, sources=[{'chunk_id': 999_999, 'quote': f'{SENTINEL} xx'}])),
+    ]
+
+
+def knowledge_ready() -> bool:
+    """False while a knowledge tool is still its stage-0 shell (design M4 §13.2: the session's knowledge part
+    turns on when the writers and readers land; until then only the fifteen tools and their arguments)."""
+    import inspect
+    from workmcp import tools
+    return not any('_stage0(' in inspect.getsource(getattr(tools, name))
+                   for name in (*tools.WRITE_TOOL_NAMES, *tools.KNOWLEDGE_READ_TOOL_NAMES))
+
+
+def unique_in_chunk(home: Path, hit: dict) -> None:
+    """The session quotes ``hit['snippet']`` by chunk id: it must occur exactly once in the chunk's units."""
+    from workmcp import store
+    db = store.open_read(home)
+    try:
+        version, first, last = db.execute('SELECT version_id, unit_first, unit_last FROM chunks WHERE id = ?',
+                                          (hit['chunk_id'],)).fetchone()
+        texts = [row[0] for row in db.execute('SELECT text FROM units WHERE version_id = ? AND ordinal BETWEEN ? AND ?',
+                                              (version, first, last))]
+    finally:
+        db.close()
+    assert sum(text.count(hit['snippet']) for text in texts) == 1
+
+
+def snapshot(root: Path) -> dict:
+    """Size, mtime_ns and SHA-256 of every file under ``root`` (the originals must not change)."""
+    import hashlib
+    return {str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns,
+                                          hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in sorted(root.rglob('*')) if path.is_file()}
+
+
+def serve_session(tmp_path, steps, expected_ids, timeout=120, root=None):
+    """Run the wrapper in ``serve [ROOT]`` mode and drive it one message at a time: a step is a message or a
+    callable of the replies so far; after a request its reply is awaited before the next step. Then stdin
+    is closed. Returns every stdout line, stderr and the audit report."""
     log = tmp_path/'audit-serve.json'
     env = {**os.environ, 'WORKMCP_HOME': str(tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
     extra = [str(root)] if root is not None else []
@@ -889,16 +980,20 @@ def serve_session(tmp_path, messages, expected_ids, timeout=60, root=None):
     watchdog = threading.Timer(timeout, proc.kill)
     watchdog.start()
     try:
-        proc.stdin.write(''.join(json.dumps(m) + '\n' for m in messages))
-        proc.stdin.flush()
-        lines, seen = [], set()
-        while not expected_ids <= seen:
-            line = proc.stdout.readline()
-            if not line:
-                break  # server exited or was killed by the watchdog
-            lines.append(line)
-            if line.strip().startswith('{') and (reply_id := json.loads(line).get('id')) is not None:
-                seen.add(reply_id)
+        lines, replies = [], {}
+        for step in steps:
+            message = step(replies) if callable(step) else step
+            proc.stdin.write(json.dumps(message) + '\n')
+            proc.stdin.flush()
+            while 'id' in message and message['id'] not in replies:
+                line = proc.stdout.readline()
+                if not line:
+                    break  # server exited or was killed by the watchdog
+                lines.append(line)
+                if line.strip().startswith('{') and (reply := json.loads(line)).get('id') is not None:
+                    replies[reply['id']] = reply
+            if 'id' in message and message['id'] not in replies:
+                break
         proc.stdin.close()
         rest, stderr = proc.stdout.read(), proc.stderr.read()
         code = proc.wait()
@@ -907,28 +1002,52 @@ def serve_session(tmp_path, messages, expected_ids, timeout=60, root=None):
         proc.kill()
     lines += rest.splitlines(keepends=True)
     assert code == 0, stderr  # (d)
+    assert expected_ids <= set(replies), stderr
     assert log.is_file(), stderr
     report = json.loads(log.read_text(encoding='utf-8'))
     assert report['completed'] is True, stderr
     return lines, stderr, report
 
 
-def body_pieces(envelope: dict) -> list[tuple[dict, str]]:
-    result = envelope.get('result') or {} if envelope.get('ok') else {}
-    found = [(hit['locator'], hit['snippet']) for hit in result.get('hits', ())]
-    for key in ('context_before', 'pieces', 'context_after'):
-        found += [(piece['locator'], piece['text']) for piece in result.get(key, ())]
+def body_pieces(node) -> list[tuple[dict, str]]:
+    """Every ``(locator, text)`` of document text in an answer, found independently of ``tools.pieces_of``: a
+    dict with a ``locator`` and one of ``snippet``/``text``/``quote`` as a string, in JSON order."""
+    found = []
+    if isinstance(node, dict):
+        texts = [node[key] for key in ('snippet', 'text', 'quote') if isinstance(node.get(key), str)]
+        if isinstance(node.get('locator'), dict) and len(texts) == 1:
+            found.append((node['locator'], texts[0]))
+        for value in node.values():
+            found += body_pieces(value)
+    elif isinstance(node, list):
+        for item in node:
+            found += body_pieces(item)
     return found
 
 
 def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
-    """Real ``serve`` over stdio on a scanned and indexed synthetic home (design M3 §12): stdout is JSON-RPC
-    only, sockets loopback only, no name resolution, no process, no open under the source root, exit 0;
-    five unstructured tools answer with envelopes whose delivered_sources are exactly their pieces; every
-    call our code handles is logged once under the client's name, one deliveries row per piece."""
-    from workmcp import locator
+    """Real ``serve`` over stdio on a scanned and indexed synthetic home (design M3 §12, M4 §10): stdout is
+    JSON-RPC only, sockets loopback only, no name resolution, no process, no open (any mode) under the
+    source root and no change to any original, exit 0; fifteen unstructured tools answer with envelopes
+    whose delivered_sources are exactly the document text they carry, and every such text is the stored
+    text under its locator; every call our code handles is logged once under the client's name, one
+    deliveries row per piece, and no query, statement, value, quote, name or reason in the log or stderr.
+    The knowledge part (write -> read -> supersede -> retract) runs once the knowledge tools are in."""
+    from workmcp import binding, locator, store
     home, src, hit = filled_home(tmp_path)
-    lines, stderr, report = serve_session(tmp_path, mcp_session(hit), SERVE_IDS, root=src)
+    knowledge = knowledge_ready()
+    called, errors, delivering = dict(SERVE_CALLED), dict(SERVE_ERRORS), set(SERVE_DELIVERING)
+    steps = mcp_session(hit)
+    if knowledge:
+        unique_in_chunk(home, hit)
+        steps += knowledge_session(hit)
+        called |= KNOWLEDGE_CALLED
+        errors |= KNOWLEDGE_ERRORS
+        delivering |= KNOWLEDGE_DELIVERING
+    expected_ids = SERVE_IDS | set(called)
+    before = snapshot(src)
+    lines, stderr, report = serve_session(tmp_path, steps, expected_ids, root=src)
+    assert snapshot(src) == before                                            # (c) originals unchanged
     stdout = ''.join(lines)
     assert stdout.endswith('\n'), stdout[-200:]  # every message, the last one too, ends with a newline
     records = stdout[:-1].split('\n')  # only that final newline is dropped; blank lines stay and fail below
@@ -936,7 +1055,7 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     messages = [json.loads(record) for record in records]  # ... every stdout line parses ...
     assert all(isinstance(m, dict) and m.get('jsonrpc') == '2.0' for m in messages)  # ... as a JSON-RPC object
     replies = {m['id']: m for m in messages if 'id' in m}
-    assert set(replies) == SERVE_IDS, stderr
+    assert set(replies) == expected_ids, stderr
     assert replies[1]['result']['serverInfo']['name'] == 'workmcp'
     assert 'delivered_sources' in replies[1]['result']['instructions']
     listed = {tool['name']: tool for tool in replies[2]['result']['tools']}   # (d)
@@ -944,15 +1063,15 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     assert {name: set(tool['inputSchema'].get('properties', {})) for name, tool in listed.items()} == SERVE_ARGUMENTS
     assert all('outputSchema' not in tool for tool in listed.values())  # structured_output=False
     envelopes = {}
-    for number in SERVE_CALLED:                                               # (e)
+    for number in called:                                                     # (e)
         result = replies[number]['result']
         assert 'structuredContent' not in result and len(result['content']) == 1 and not result.get('isError')
         envelopes[number] = json.loads(result['content'][0]['text'])
-    for number, code in SERVE_ERRORS.items():                                 # (i)
+    for number, code in errors.items():                                       # (i)
         assert envelopes[number] == {'ok': False, 'error': {'code': code, 'message': envelopes[number]['error'][
-            'message'], 'retryable': False}}
-    for number in set(SERVE_CALLED) - set(SERVE_ERRORS):
-        assert envelopes[number]['ok'] is True, envelopes[number]
+            'message'], 'retryable': False}}, (number, envelopes[number])
+    for number in set(called) - set(errors):
+        assert envelopes[number]['ok'] is True, (number, envelopes[number])
     status = envelopes[3]['result']
     assert status['schema_version'] == 3 and set(status) == STATUS_RESULT_KEYS
     assert status['home'] == str(home) and status['db']['chunks'] > 0
@@ -964,33 +1083,37 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     assert envelopes[6]['result']['chunk']['id'] == hit['chunk_id']
     assert envelopes[7]['result']['pieces'][0] == {'locator': hit['locator'], 'text': hit['snippet'],
                                                    'truncated': False}
-    pieces = 0
-    for number, envelope in envelopes.items():                                # (f)
-        if not envelope['ok']:
-            assert 'delivered_sources' not in envelope
-            continue
-        found = body_pieces(envelope)
-        assert envelope['delivered_sources'] == [locator.display(obj) for obj, _ in found], number
-        assert bool(found) == (SERVE_CALLED[number] in ('search', 'get_snippet')), number
-        pieces += len(found)
+    db = sqlite3.connect(f'{(home/"db"/"work.sqlite3").as_uri()}?mode=ro', uri=True)
+    try:
+        pieces = 0
+        for number, envelope in envelopes.items():                            # (f)
+            if not envelope['ok']:
+                assert 'delivered_sources' not in envelope
+                continue
+            found = body_pieces(envelope['result'])
+            assert envelope['delivered_sources'] == [locator.display(obj) for obj, _ in found], number
+            assert bool(found) == (number in delivering), number
+            for obj, text in found:                                           # the text is the stored text
+                assert binding.validate_locator(db, obj)['text'] == text, number
+            pieces += len(found)
+        calls = db.execute('SELECT client, client_version, tool, ok, error_code, args_json, call_id FROM tool_calls '
+                           'ORDER BY id').fetchall()                          # (g)
+        deliveries = db.execute('SELECT client, COUNT(*) FROM deliveries GROUP BY client').fetchall()
+        if knowledge:
+            check_knowledge_rows(db, envelopes, calls)
+    finally:
+        db.close()
     assert replies[12]['result']['isError'] is True  # (X-2) rejected by the SDK before our code runs
     assert 'limit' in replies[12]['result']['content'][0]['text']
-    assert report['source_opens'] == 0  # (c) the tools never open the originals
-    log = sqlite3.connect(tmp_path/'home'/'db'/'work.sqlite3')               # (g)
-    try:
-        calls = log.execute('SELECT client, client_version, tool, ok, error_code, args_json FROM tool_calls '
-                            'ORDER BY id').fetchall()
-        deliveries = log.execute('SELECT client, COUNT(*) FROM deliveries GROUP BY client').fetchall()
-    finally:
-        log.close()
+    assert report['source_opens'] == 0  # (c) the tools never open the originals, for reading or writing
     assert sorted((c[2], c[3], c[4]) for c in calls) == sorted(
-        (tool, 0 if number in SERVE_ERRORS else 1, SERVE_ERRORS.get(number)) for number, tool in SERVE_CALLED.items())
+        (tool, 0 if number in errors else 1, errors.get(number)) for number, tool in called.items())
     assert {(c[0], c[1]) for c in calls} == {(CLIENT_NAME, '0')}
     assert deliveries == [(CLIENT_NAME, pieces)] and pieces > 0
-    assert SENTINEL not in stderr and not any(SENTINEL in c[5] for c in calls)  # (h) no query text logged
+    assert SENTINEL not in stderr and not any(SENTINEL in c[5] for c in calls)  # (h) no query or knowledge text
     assert 'app virtualization' in stderr  # the start line (design M3 §10.3)
     events = report['events']
-    assert [e for e in events if e['violation']] == []  # (b) loopback only, no name resolution
+    assert [e for e in events if e['violation']] == []  # (b) loopback only, no name resolution, no source write
     for e in events:
         if e['event'] in _audited_server.ADDRESS_EVENTS:
             assert re.search(r"\('(127\.0\.0\.1|::1)', \d+", e['detail']), e
@@ -998,6 +1121,60 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     assert all(re.search(r"\('(127\.0\.0\.1|::1)', 0[,)]", e['detail']) for e in binds), binds  # port 0 only
     assert not [e for e in events if e['event'].startswith(_audited_server.PROCESS_EVENTS)]  # (c)
     assert not [e for e in events if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
+
+
+def check_knowledge_rows(db, envelopes: dict, calls: list) -> None:
+    """The store after the knowledge part (design M4 §10 (e), (h)): what each step wrote, by whom, under
+    which call; every evidence row re-derives from the stored text; the client's text is in the knowledge
+    tables (that is the knowledge base) and nowhere in the call log."""
+    from workmcp import binding
+    ids = {number: envelopes[number]['result']['assertion']['id'] for number in (14, 15, 16, 17, 18)}
+    ids[22] = envelopes[22]['result']['new']['id']
+    assert envelopes[22]['result']['old']['id'] == ids[14]
+    entity = envelopes[13]['result']['entity']['id']
+    assert envelopes[13]['result']['created'] is True
+    assert envelopes[15]['result']['duplicates'] == [ids[14]]
+    assert sorted(c['id'] for c in envelopes[16]['result']['conflicts']) == sorted([ids[14], ids[15]])
+    # the correction keeps the value (a duplicate of 15) and conflicts with the note 16; retracting 16
+    # resolves its conflicts and 15 and the correction become active again
+    assert envelopes[22]['result']['duplicates'] == [ids[15]]
+    assert [c['id'] for c in envelopes[22]['result']['conflicts']] == [ids[16]]
+    assert envelopes[23]['result']['assertion']['status'] == 'withdrawn'
+    assert sorted(envelopes[23]['result']['cleared_conflicts']) == sorted([ids[15], ids[22]])
+    assert [row['id'] for row in envelopes[24]['result']['chain']] == [ids[14], ids[22]]
+    assert entity in [e['id'] for e in envelopes[19]['result']['entities']]
+    assert envelopes[21]['result']['items'] and all(item['evidence'] is None for item in envelopes[21]['result']['items'])
+    call_of = {}                                       # step number -> its tool_calls.call_id, in order
+    handled = sorted(n for n in envelopes)
+    assert len(calls) == len(handled)
+    for number, row in zip(handled, calls):
+        call_of[number] = row[6]
+    rows = {row[0]: row[1:] for row in db.execute('SELECT id, kind, status, recorded_by, source_kind FROM assertions')}
+    assert rows == {
+        ids[14]: ('fact', 'superseded', f'{CLIENT_NAME}/record_fact', 'evidence'),
+        ids[15]: ('fact', 'active', f'{CLIENT_NAME}/record_fact', 'evidence'),
+        ids[16]: ('fact', 'withdrawn', f'{CLIENT_NAME}/record_fact', 'my_note'),
+        ids[17]: ('decision', 'active', f'{CLIENT_NAME}/record_decision', 'evidence'),
+        ids[18]: ('todo', 'active', f'{CLIENT_NAME}/record_task', 'my_note'),
+        ids[22]: ('fact', 'active', f'{CLIENT_NAME}/supersede', 'evidence'),
+    }
+    assert db.execute('SELECT name, created_by FROM entities').fetchall() == [(ENTITY_NAME,
+                                                                              f'{CLIENT_NAME}/record_entity')]
+    evidence = db.execute('SELECT assertion_id, locator_json, quote FROM evidence ORDER BY id').fetchall()
+    assert sorted(row[0] for row in evidence) == sorted([ids[14], ids[15], ids[17], ids[22]])
+    for _, locator_json, quote in evidence:                       # every stored source re-derives
+        assert binding.validate_locator(db, json.loads(locator_json))['text'] == quote
+    kinds = {row[0] for row in db.execute('SELECT kind FROM assertion_events')}
+    assert kinds == {'recorded', 'superseded', 'retracted', 'conflict_marked', 'conflict_cleared'}
+    assert {row[0] for row in db.execute('SELECT relation FROM links')} == {'supersedes', 'conflicts'}
+    event_calls = {row[0]: row[1] for row in db.execute(
+        "SELECT kind, call_id FROM assertion_events WHERE assertion_id = ? AND kind IN ('recorded', 'superseded')",
+        (ids[14],))}
+    assert event_calls == {'recorded': call_of[14], 'superseded': call_of[22]}
+    texts = ' '.join(str(value) for row in db.execute(
+        'SELECT a.statement, a.data_json, e.reason FROM assertions a LEFT JOIN assertion_events e '
+        'ON e.assertion_id = a.id') for value in row)
+    assert SENTINEL in texts and ENTITY_NAME in db.execute('SELECT name FROM entities').fetchone()[0]
 
 
 @pytest.mark.parametrize('event, args, outside', [
