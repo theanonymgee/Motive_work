@@ -861,3 +861,39 @@ def test_document_events_query_filters_orders_and_pages(db):
     assert [r['id'] for r in until] == [second, first]
     page, total = store.document_events_query(db, {}, 1, 1)
     assert total == 3 and [r['id'] for r in page] == [second]
+
+
+def test_an_up_to_date_store_opens_while_another_connection_holds_the_write_lock(tmp_path, monkeypatch):
+    """Review M3 v2 N1: ``migrate`` sees by reading alone that nothing is pending, so opening the store
+    (``serve`` start, any command) does not wait for a running scan's write transaction."""
+    import time
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    store.open_home(home).close()
+    other = store.open_home(home)
+    other.execute('BEGIN IMMEDIATE')
+    try:
+        began = time.perf_counter()
+        opened = store.open_home(home)
+        assert time.perf_counter() - began < 1.0 and store.migrate(opened) == []
+        opened.close()
+        # the read-only check is what makes it work: forced into the write path it waits and fails
+        monkeypatch.setattr(store, '_up_to_date', lambda db: False)
+        late = sqlite3.connect(paths.db_path(home), isolation_level=None)
+        late.execute('PRAGMA busy_timeout=100')
+        with pytest.raises(sqlite3.OperationalError, match='locked'):
+            store.migrate(late)
+        late.close()
+    finally:
+        other.execute('ROLLBACK')
+        other.close()
+
+
+def test_the_read_only_check_still_refuses_a_changed_checksum(tmp_path):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    db = store.open_home(home)
+    try:
+        db.execute("UPDATE schema_migrations SET checksum='0' WHERE version=2")
+        with pytest.raises(RuntimeError, match='checksum changed'):
+            store.migrate(db)
+    finally:
+        db.close()

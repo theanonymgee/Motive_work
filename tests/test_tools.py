@@ -133,7 +133,7 @@ def test_status_has_engine_virtualization_calls_and_process(home):
     warm = tools.status(home, engine)['result']['engine']
     assert (warm['loaded'], warm['idle_seconds'], warm['loads']) == (True, 0.0, 1)
     assert set(result['home_virtualization']) == set(paths.VIRTUALIZATION_KEYS)
-    assert result['calls'] == {'total': 0, 'by_client': {}}
+    assert result['calls'] == {'total': 0, 'by_client': {}, 'pending': 0}
     assert result['process']['started_at'] == '2026-10-24T09:00:00+09:00' and len(result['process']['python']) == 3
     assert tools.status(home)['result']['engine'] is None
 

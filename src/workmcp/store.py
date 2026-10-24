@@ -266,8 +266,29 @@ def fts5_available() -> bool:
         return False
 
 
+def _up_to_date(db: sqlite3.Connection) -> bool:
+    """Every migration is recorded with its checksum, judged by reading only (no write lock); raises
+    on a changed checksum as ``migrate`` does."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").fetchone() is None:
+        return False
+    recorded = dict(db.execute('SELECT version, checksum FROM schema_migrations'))
+    for version, _, sql in MIGRATIONS:
+        if version not in recorded:
+            return False
+        if recorded[version] != hashlib.sha256(sql.encode('utf-8')).hexdigest():
+            raise RuntimeError(f'migration {version} checksum changed; add a new migration instead')
+    return True
+
+
 def migrate(db: sqlite3.Connection) -> list[int]:
-    """Apply pending migrations in one immediate transaction; return the versions applied now."""
+    """Apply pending migrations in one immediate transaction; return the versions applied now.
+
+    A store that is already up to date is recognised by reading alone, so ``serve`` (and every
+    command) starts while another process holds the write lock, e.g. a running ``scan`` (review M3
+    v2 N1). Only a store that needs a migration takes ``BEGIN IMMEDIATE`` (two servers starting a new
+    store together still apply it once)."""
+    if _up_to_date(db):
+        return []
     applied = []
     db.execute('BEGIN IMMEDIATE')
     try:

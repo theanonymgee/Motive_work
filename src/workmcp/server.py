@@ -47,7 +47,8 @@ INSTRUCTIONS = ('응답의 delivered_sources가 이번 응답으로 PC를 떠난
                 '검색 결과 없음 ≠ 회사에 그 정보가 없음.')
 CLIENT_MAX_CHARS = 64
 UNKNOWN_CLIENT = 'unknown'
-LOG_DELAYED_NOTICE = '로컬 전달 기록(deliveries)을 지금 쓰지 못해 대기열에 두었습니다({}건) — 다음 호출에서 씁니다'
+LOG_DELAYED_NOTICE = ('로컬 전달 기록(deliveries)을 대기열에 두었습니다({}건) — 저장소 잠금이 풀리면 씁니다; '
+                      '서버가 그 전에 끝나면 잃을 수 있음')
 LOG_BUSY_MS = 200           # the call log's busy_timeout: a scan's write transaction never holds a call up
 LOG_QUEUE_MAX = 10_000      # calls kept in memory while the store is busy; older ones are dropped (counted)
 MODEL_LOADED_NOTICE = '의미 검색 모델을 이 호출에서 처음 로드했습니다(+{} ms); 다음 질의부터 빠릅니다'
@@ -103,7 +104,7 @@ TOOLS = {
     'list_documents': lambda state, **args: tools.list_documents(state.home, **args),
     'recent_changes': lambda state, **args: tools.recent_changes(state.home, **args),
     'status': lambda state, **args: tools.status(state.home, state.engine, started_at=state.started_at,
-                                                 unloads=state.unloads),
+                                                 unloads=state.unloads, pending=len(state.pending)),
 }
 
 
@@ -317,7 +318,17 @@ def main(argv=None) -> int:
     except config.ConfigError as exc:
         print(exc, file=sys.stderr)
         return 4
-    write_db = store.open_home(home)  # migrates once; kept open for the call log
+    try:
+        write_db = store.open_home(home)  # migrates once (no write lock when up to date); kept for the call log
+    except sqlite3.OperationalError as exc:  # a migration was needed and another process held the store
+        print(f'workmcp: cannot open the store ({exc}): another process (scan or index) holds it while it needs '
+              f'a schema update; start the server again when that process ends', file=sys.stderr)
+        return 3
+    except RuntimeError as exc:
+        if not store.schema_changed(exc):
+            raise
+        print(store.DEV_SCHEMA_HINT.format(db=paths.db_path(home)), file=sys.stderr)
+        return 2
     state = make_state(home, write_db=write_db, settings=settings)
     try:
         build_server(home, state=state).run(transport='stdio')

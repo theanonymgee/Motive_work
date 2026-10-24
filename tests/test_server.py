@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import sys
 import time
 from types import SimpleNamespace
 
@@ -80,7 +81,7 @@ def test_handle_returns_compact_json_envelope_and_logs_the_call(state):
     assert listed['ok'] and listed['result']['documents'] == [] and listed['delivered_sources'] == []
     assert calls(state)[-1] == ('codex', '', 'list_documents', 1, None, 0, 0)
     status = json.loads(server.handle(state, 'status', {}, ('codex', '')))['result']
-    assert status['calls'] == {'total': 2, 'by_client': {'claude-code': 1, 'codex': 1}}
+    assert status['calls'] == {'total': 2, 'by_client': {'claude-code': 1, 'codex': 1}, 'pending': 0}
 
 
 def fake_context(name=None, version=None, *, params=True):
@@ -375,3 +376,91 @@ def test_integer_and_boolean_arguments_are_strict(state, tool, arguments):
     assert calls(state) == []  # our code never ran
     fine = anyio.run(built.call_tool, 'list_documents', {'limit': 3, 'offset': 0})
     assert not fine.is_error
+
+
+# ---- review M3 v2 N1: serve starts while a scan holds the write lock -------------------------------
+
+def start_serve(home, *messages):
+    """``python -I -m workmcp serve`` (the client config's command) with the messages on stdin; returns
+    the process (test code starts it; the package starts no process)."""
+    import os
+    import subprocess
+    env = {**os.environ, 'WORKMCP_HOME': str(home)}
+    proc = subprocess.Popen([sys.executable, '-I', '-m', 'workmcp', 'serve'], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, encoding='utf-8')
+    proc.stdin.write(''.join(json.dumps(m) + '\n' for m in messages))
+    proc.stdin.flush()
+    return proc
+
+
+INITIALIZE = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+              'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'n1', 'version': '0'}}}
+
+
+def test_serve_starts_and_answers_while_another_process_holds_the_write_lock(home):
+    import threading
+    store.open_home(home).close()                       # an up-to-date store
+    other = store.open_home(home)
+    other.execute('BEGIN IMMEDIATE')                    # what a running scan holds
+    began = time.perf_counter()
+    proc = start_serve(home, INITIALIZE, {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+                       {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'status', 'arguments': {}}})
+    watchdog = threading.Timer(60, proc.kill)
+    watchdog.start()
+    try:
+        replies = {}
+        while len(replies) < 2:
+            line = proc.stdout.readline()
+            assert line, proc.stderr.read()
+            message = json.loads(line)
+            replies[message['id']] = (message, time.perf_counter() - began)
+        assert replies[1][0]['result']['serverInfo']['name'] == 'workmcp'
+        status = json.loads(replies[2][0]['result']['content'][0]['text'])
+        assert status['ok'] and status['result']['schema_version'] == store.SCHEMA_VERSION
+        assert status['result']['calls']['pending'] == 0   # its own call is queued after the answer
+        proc.stdin.close()
+        assert proc.wait(timeout=30) == 0
+        stderr = proc.stderr.read()
+    finally:
+        watchdog.cancel()
+        proc.kill()
+        other.execute('ROLLBACK')
+        other.close()
+    assert replies[1][1] < 10  # interpreter start and imports included; no 5-second lock wait
+    db = store.open_read(home)
+    try:
+        written = db.execute('SELECT COUNT(*) FROM tool_calls').fetchone()[0]
+    finally:
+        db.close()
+    assert written == 0 and 'call log entries were not written' in stderr  # held to the end: lost, counted
+
+
+def test_serve_that_needs_a_migration_under_a_held_lock_exits_with_one_line(home):
+    import sqlite3 as sqlite
+    path = paths.db_path(home)
+    other = sqlite.connect(path, isolation_level=None)
+    other.execute('PRAGMA journal_mode=WAL')
+    other.execute('BEGIN IMMEDIATE')
+    other.execute('CREATE TABLE placeholder(x)')        # a new store whose creator still holds it
+    try:
+        proc = start_serve(home, INITIALIZE)
+        out, err = proc.communicate(timeout=60)
+    finally:
+        other.execute('ROLLBACK')
+        other.close()
+    assert proc.returncode == 3 and out == ''
+    lines = [line for line in err.splitlines() if 'app virtualization' not in line]
+    assert len(lines) == 1 and lines[0].startswith('workmcp: cannot open the store') and 'Traceback' not in err
+
+
+def test_status_shows_calls_waiting_in_the_queue(state):
+    other = store.open_home(state.home)
+    other.execute('BEGIN IMMEDIATE')
+    try:
+        first = json.loads(server.handle(state, 'status', {}, ('c', '')))
+        second = json.loads(server.handle(state, 'status', {}, ('c', '')))
+    finally:
+        other.execute('ROLLBACK')
+        other.close()
+    assert first['result']['calls']['pending'] == 0 and second['result']['calls']['pending'] == 1
+    assert second['notice'][-1] == server.LOG_DELAYED_NOTICE.format(2) and '잃을 수 있음' in second['notice'][-1]

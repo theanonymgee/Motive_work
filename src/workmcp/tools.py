@@ -429,7 +429,7 @@ def engine_status(engine, unloads: int = 0) -> dict | None:
             'model_idle_seconds': engine.settings.model_idle_seconds, 'loads': engine.loads, 'unloads': unloads}
 
 
-def status(home: Path, engine=None, *, started_at: str | None = None, unloads: int = 0) -> dict:
+def status(home: Path, engine=None, *, started_at: str | None = None, unloads: int = 0, pending: int = 0) -> dict:
     """Data home, store counts, last finished scan and index run, model availability, FTS5 support,
     the FTS index state, the search engine of this process, app virtualization of the home, tool
     calls per client and this process (design M3 §2.6); no source text."""
@@ -458,7 +458,7 @@ def status(home: Path, engine=None, *, started_at: str | None = None, unloads: i
         'delivery_log_count': count['deliveries'],
         'engine': engine_status(engine, unloads),
         'home_virtualization': paths.virtualization_probe(home, os.environ),
-        'calls': calls,
+        'calls': {**calls, 'pending': pending},  # pending: calls this server could not log yet
         'process': {'pid': os.getpid(), 'started_at': started_at, 'python': list(sys.version_info[:3])},
     }
     notice = ['아직 수집(scan)한 적이 없습니다.'] if result['last_scan'] is None else []

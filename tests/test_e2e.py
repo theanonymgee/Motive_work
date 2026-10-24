@@ -173,6 +173,6 @@ def test_cli_scan_index_then_the_server_tools_answer_with_exact_sources(workmcp_
         finally:
             reader.close()
         calls = json.loads(server.handle(state, 'status', {}, ('e2e', '1')))['result']['calls']
-        assert calls == {'total': 5, 'by_client': {'e2e': 5}}  # a call is logged after its answer is made
+        assert calls == {'total': 5, 'by_client': {'e2e': 5}, 'pending': 0}  # a call is logged after its answer is made
     finally:
         db.close()
