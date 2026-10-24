@@ -1,5 +1,14 @@
 # 진행·재개 기록
 
+### 2026-10-24 — M3 완료 (MCP 서버 v1)
+
+- 1단계(A `83926b5`, B `e4bb9e9`, C `2b475d1`) → 2단계 통합 `c40775a`(hit `units[]` 압축으로 응답 최대 약 31,700자, 없는 정보 신호 R5 채택, 실모델 시험 홈 `C:\Users\jangm\Motive_work_m3test`) → 검토 v1 조건부(중간 4) → `bbcf2c7` → v2 조건부(중간 1) → `6d92726` → **v3 통과**(`87cec83`).
+- 실연결: 피터가 Code 탭에서 `.mcp.json` 서버 승인 → 이 세션에서 도구 5개 호출 성공, `tool_calls.client='claude-code' 2.1.299`, 전달 조각·`deliveries` 일치, 질의 기록 0, `verify` 893/893 (`2835e92`, `doc/validation/2026-10-24_M3-연결확인_v1.md`).
+- Codex: 신뢰 전 프로젝트 설정 미인식, 번들 CLI 우회 실패(모델 거부·code-mode host 없음) → 피터 결정 "codex 일단보류하고 넘어가자" → M5.
+- 피터 결정(설치·실행 형태): 회사 PC의 Claude/Codex에 일반 MCP처럼 설치, 설치 출처만 외부, 서버(로컬 stdio)·데이터는 회사 PC. PLAN §5 M5·§6에 기록.
+- 결과: 1395 passed, `uv lock --check` 통과. PLAN §4를 M4로.
+- 다음: 피터가 PLAN §4의 M4 `/goal`을 등록하면 M4(구조화 지식·시간 이력) 시작.
+
 ### 2026-10-24 — M3 진행 (MCP 서버 v1, 1단계)
 
 - 설계(`M3-설계_v1`, `ccb6fd9`): 읽기 도구 5개(search·get_snippet·list_documents·recent_changes·status), 응답마다 `delivered_sources`와 로컬 `tool_calls`/`deliveries` 기록, 응답 크기 상한 40,000자, 오래 사는 서버의 모델 수명(lifespan ticker), 앱 가상화 탐침·doctor 경고, 클라이언트 설정과 연결 확인 절차(§11.4). 0단계(스키마 v2·도구 봉투·5개 도구 서버 껍데기) `b7217cb`, 1324 passed.
