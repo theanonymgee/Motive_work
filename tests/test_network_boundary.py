@@ -55,7 +55,7 @@ MODULE_IMPORTS = {
     # engine's clock and model release also need time and gc. Exact import forms:
     # ``import numpy as np``, ``import onnxruntime as ort``, ``from tokenizers import Tokenizer``.
     'embedder.py': frozenset({'numpy'}),
-    'index.py': frozenset({'numpy'}),
+    'index.py': frozenset({'numpy', 'time'}),  # time: elapsed seconds of the run
     'search.py': frozenset({'numpy', 'time', 'gc'}),
 }
 # Inside function bodies only: the explicit model download, and the ONNX runtime and tokenizer
@@ -521,7 +521,7 @@ M2_BYPASSES = [
     ('cli.py', 'import numpy as np'),
     ('tools.py', 'import numpy'),
     ('models.py', 'import numpy'),
-    ('index.py', 'import time\nimport gc'),
+    ('index.py', 'import gc'),
 ]
 
 
@@ -652,11 +652,11 @@ def test_checks_accept_clean_snippet():
 
 
 # 5 Runtime layer
-def run_wrapper(tmp_path, mode, *extra):
+def run_wrapper(tmp_path, mode, *extra, home=None, timeout=120):
     log = tmp_path/f'audit-{mode}.json'
-    env = {**os.environ, 'WORKMCP_HOME': str(tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
+    env = {**os.environ, 'WORKMCP_HOME': str(home or tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
     run = subprocess.run([sys.executable, str(WRAPPER), str(log), mode, *map(str, extra)], env=env, cwd=tmp_path,
-                         capture_output=True, text=True, encoding='utf-8', timeout=120)
+                         capture_output=True, text=True, encoding='utf-8', timeout=timeout)
     assert run.returncode == 0, run.stderr
     assert log.is_file(), run.stderr
     report = json.loads(log.read_text(encoding='utf-8'))
@@ -708,8 +708,16 @@ def test_search_path_stays_inside_the_runtime_boundary_and_is_read_only(tmp_path
 
 
 def test_embed_path_stays_inside_the_runtime_boundary(tmp_path):
-    _, report = run_wrapper(tmp_path, 'embed')
+    """The real model, loaded and run under the hook, from the data home that has it
+    (``tests/_real_model.py``: ``WORKMCP_TEST_MODEL_HOME`` or the default data home); skipped without it."""
+    import _real_model
+    home = _real_model.real_model_home()
+    if home is None:
+        pytest.skip(_real_model.SKIP_REASON)
+    _, report = run_wrapper(tmp_path, 'embed', home=home, timeout=600)
     stage_skip(report)
+    assert report['dims'] == 1024 and report['unit_norms'] is True
+    assert report['hub_modules_loaded'] == []
     assert [e for e in report['events'] if e['violation']] == []
     assert report['providers'] == ['CPUExecutionProvider']
 

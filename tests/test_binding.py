@@ -302,3 +302,60 @@ def test_binding_reads_sources_only_through_read_source():
     source = open(binding.__file__, encoding='utf-8').read()
     assert 'open(' not in source.replace('collect.read_source', '') and 'collect.read_source(path)' in source
     assert os.path.basename(binding.__file__) == 'binding.py'
+
+
+# -- chunks re-derived (design M2 §2.7) ------------------------------------------------------
+
+def indexed(db):
+    from workmcp import embedder, index
+    home = paths.resolve_home()
+    return index.run_index(db, home, embedder=embedder.HashEmbedder(64))
+
+
+def test_verify_rederives_chunk_set_after_index(db, bundle):
+    result = indexed(db)
+    report = binding.verify(db)
+    assert report['ok'] and report['failures'] == []
+    assert report['chunks_checked'] == result['chunks_total'] == db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+    assert report['chunks_checked'] > 0 and report['chunks_other_version'] == 0
+
+
+@pytest.mark.parametrize('tamper', [
+    # same text, other range numbers: the text check alone passes, the re-derived set does not
+    "UPDATE chunks SET ordinal = ordinal + 1000 WHERE id = (SELECT MIN(id) FROM chunks)",
+    # a chunk the rules never make (one unit of a multi-unit chunk), text consistent with its range
+    None,
+])
+def test_verify_flags_tampered_chunk_as_chunk_set_mismatch(db, bundle, tamper):
+    indexed(db)
+    if tamper:
+        db.execute(tamper)
+    else:
+        from workmcp import chunks
+        version_id, first, last = db.execute(
+            'SELECT version_id, unit_first, unit_last FROM chunks WHERE unit_last > unit_first LIMIT 1').fetchone()
+        text = db.execute('SELECT text FROM units WHERE version_id=? AND ordinal=?', (version_id, first)).fetchone()[0]
+        spec = chunks.ChunkSpec(9999, first, first, 0, len(text), text)
+        # stage the row under a scratch rule version (store.insert_chunks), then claim the current one
+        store.insert_chunks(db, version_id, 'scratch', [spec])
+        db.execute("UPDATE chunks SET chunk_version=? WHERE chunk_version='scratch'", (chunks.CHUNK_VERSION,))
+    report = binding.verify(db)
+    assert not report['ok']
+    problems = {f['problem'] for f in report['failures']}
+    assert problems == {'chunk_set_mismatch'}
+    assert all(SENTINEL not in json.dumps(f, ensure_ascii=False) for f in report['failures'])
+
+
+def test_other_chunk_version_rows_are_counted_not_failed(db, bundle):
+    indexed(db)
+    version_id, text = db.execute("SELECT v.id, u.text FROM versions v JOIN units u ON u.version_id = v.id "
+                                  "WHERE v.parse_status='ok' AND u.ordinal = 1 LIMIT 1").fetchone()
+    from workmcp import chunks
+    store.insert_chunks(db, version_id, 'units-old-v0', [chunks.ChunkSpec(1, 1, 1, 0, len(text), text)])
+    report = binding.verify(db)
+    assert report['ok'] and report['chunks_other_version'] == 1
+    assert report['chunks_checked'] == db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+    # ... but their text is still checked
+    db.execute("UPDATE chunks SET char_end = char_end - 1 WHERE chunk_version = 'units-old-v0'")
+    report = binding.verify(db)
+    assert {f['problem'] for f in report['failures']} == {'chunk_text_mismatch'}

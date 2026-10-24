@@ -1,6 +1,6 @@
 """``workmcp index``/``search``/``fetch-model``/``verify-model`` wiring and ``doctor``'s index line
-(design M2 §1.2). Stage 0: exit codes decided before the stage-1 bodies run. In-process, temporary
-data home (conftest), synthetic rows only.
+(design M2 §1.2, §4.4): exit codes, the index summary and log, end to end over the synthetic bundle.
+In-process, temporary data home (conftest), synthetic data only.
 """
 import pytest
 
@@ -86,3 +86,70 @@ def test_doctor_reports_the_index_and_an_fts_gap(home, capsys, monkeypatch):
     code, out, _ = run(capsys, 'doctor')
     assert code == 0 and f'index: chunks 1 (chunk_version {chunks.CHUNK_VERSION}), vectors 0' in out
     assert ('run workmcp index --rebuild-fts' in out) is store.fts5_available()
+    from workmcp import tools
+    notice = tools.status(home)['notice']
+    assert any('--rebuild-fts' in line for line in notice) is store.fts5_available()
+
+
+# -- index end to end (design M2 §4.4, §10) --------------------------------------------------
+
+@pytest.fixture
+def scanned(home, tmp_path, capsys):
+    from fixtures.bundle import write_bundle
+    root = tmp_path/'bundle'
+    write_bundle(root)
+    code, _, _ = run(capsys, 'scan', '--root', str(root))
+    assert code == 0
+    return root
+
+
+def test_index_summary_and_log_carry_no_document_text(home, scanned, capsys):
+    from fixtures import SENTINEL, SENTINEL_ASCII
+    code, out, err = run(capsys, 'index', '--model', 'none')
+    assert code == 0, err
+    lines = out.splitlines()
+    assert lines[0].startswith('index #1 started') and 'model none' in lines[0] and chunks.CHUNK_VERSION in lines[0]
+    assert 'chunked' in lines[1] and 'embedded 0' in lines[2] and 'vectors: skipped (model none)' in lines[3]
+    log = next((home/'logs').glob('index-*.log')).read_text(encoding='utf-8')
+    assert ' | chunked | ' in log and 'done | index #1' in log
+    for marker in (SENTINEL, SENTINEL_ASCII):
+        assert marker not in out + err and marker not in log
+    db = store.open_read(home)
+    try:
+        assert db.execute('SELECT COUNT(*) FROM chunks WHERE instr(text, ?) > 0', (SENTINEL,)).fetchone()[0] > 0
+    finally:
+        db.close()
+
+
+def test_index_twice_then_a_change_reindexes_only_that_document(home, scanned, capsys):
+    code, out, _ = run(capsys, 'index', '--model', 'none')
+    assert code == 0 and 'unchanged 0' in out
+    code, out, _ = run(capsys, 'index', '--model', 'none')
+    assert code == 0 and 'chunked 0 (reused 0' in out and 'dropped 0 versions' in out
+    note = scanned/'docs'/'notes_utf8.txt'
+    note.write_text(note.read_text(encoding='utf-8') + '\n바뀐 합성 줄', encoding='utf-8')
+    assert run(capsys, 'scan', '--root', str(scanned))[0] == 0
+    code, out, _ = run(capsys, 'index', '--model', 'none')
+    assert code == 0 and 'chunked 1 (reused 0' in out and 'dropped 1 versions' in out
+    code, out, _ = run(capsys, 'verify')
+    assert code == 0 and 'binding ok' in out
+
+
+def test_index_without_the_model_files_builds_chunks_with_a_note(home, scanned, capsys):
+    code, out, err = run(capsys, 'index')  # default model bge-m3, not in this temporary home
+    assert code == 0, err
+    assert 'vectors: skipped (model_missing' in out
+
+
+def test_doctor_and_status_report_the_index_after_a_run(home, scanned, capsys):
+    from workmcp import tools
+    assert run(capsys, 'index', '--model', 'none')[0] == 0
+    code, out, _ = run(capsys, 'doctor')
+    assert code == 0 and f'(chunk_version {chunks.CHUNK_VERSION})' in out and 'warning' not in out
+    result = tools.status(home)
+    assert result['ok'] and result['notice'] == []
+    index_status = result['result']['index']
+    assert index_status['chunk_version'] == chunks.CHUNK_VERSION
+    assert index_status['last_run']['chunks'] == result['result']['db']['chunks'] > 0
+    assert index_status['model'] == {'name': None, 'model_key': None, 'vectors': 0}
+    assert index_status['fts']['consistent'] is store.fts5_available()

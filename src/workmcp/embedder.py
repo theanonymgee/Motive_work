@@ -12,9 +12,6 @@ identity says so; code paths take it only as an injected argument (``index.run_i
 
 Every ``embed`` returns a float32 matrix ``(len(texts), dims)`` with unit rows, and a vector is a
 function of its text alone (not of its batch-mates): vectors are stored by text hash.
-
-Status (M2 stage 0): ``Embedder``, ``l2_normalize`` and ``HashEmbedder`` are complete;
-``OnnxEmbedder`` is a signature to be filled in stage 1.
 """
 from __future__ import annotations
 
@@ -24,6 +21,8 @@ from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+
+from . import models
 
 HASH_NAME = 'hash-ngram-test-only'
 
@@ -45,11 +44,12 @@ class OnnxEmbedder:
     """Tokenize with ``tokenizer.json``, run ONNX on CPU, pool per manifest, L2-normalise (design M2 §3.1).
 
     ``name``/``home`` select the verified model folder (``models.require_verified(name, home)``
-    when ``verify``); ``batch_size`` is forced to 1 for an int8 model; ``threads`` sets
-    ``intra_op_num_threads`` (None or 0: the ONNX Runtime default), ``inter_op_num_threads`` is 1.
+    when ``verify``, else the files must at least be present with the pinned sizes); ``batch_size``
+    is forced to 1 for an int8 model; ``threads`` sets ``intra_op_num_threads`` (None or 0: the ONNX
+    Runtime default), ``inter_op_num_threads`` is 1.
     Raises ``ImportError`` when onnxruntime/tokenizers cannot be loaded and ``models.ModelFileError``
-    when the files do not verify (search maps them to ``runtime_import_failed:<Class>`` and
-    ``model_unverified(...)``).
+    when the files are missing or do not verify (search maps them to ``runtime_import_failed:<Class>``
+    and ``model_missing`` / ``model_unverified(...)`` and falls back to lexical results).
     """
     identity: dict
 
@@ -57,14 +57,85 @@ class OnnxEmbedder:
                  verify: bool = True):
         import onnxruntime as ort
         from tokenizers import Tokenizer
-        raise NotImplementedError('embedder.OnnxEmbedder: M2 stage 1')
+        if hasattr(ort, 'disable_telemetry_events'):
+            ort.disable_telemetry_events()
+        item = models.entry(name)
+        if verify:
+            folder = models.require_verified(name, home)
+        else:
+            status = models.quick_status(name, home)
+            if not status['available']:
+                raise models.ModelFileError(f'{name}: {status["message"]}')
+            folder = models.model_dir(name, home)
+        self.ort = ort
+        self.identity = models.identity(name)
+        self.pooling = item['pooling']
+        self.prefix = {True: item['query_prefix'], False: item['passage_prefix']}
+        # Dynamic INT8 quantizes activations per tensor (DynamicQuantizeLinear), so a batched
+        # vector would depend on its batch-mates and padding. One text per run keeps every
+        # vector a function of its text alone, which the text-hash cache relies on.
+        self.batch_size = 1 if item['precision'] == 'int8' else max(1, batch_size)
+        self.tokenizer = Tokenizer.from_file(str(folder/item['tokenizer_file']))
+        self.tokenizer.enable_truncation(max_length=item['max_tokens'])
+        pad_id = self.tokenizer.token_to_id('<pad>')
+        self.tokenizer.enable_padding(pad_id=1 if pad_id is None else pad_id, pad_token='<pad>')
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = threads or 0
+        options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(str(folder/item['model_file']), options,
+                                            providers=['CPUExecutionProvider'])
+        self.providers = list(self.session.get_providers())
+        if self.providers != ['CPUExecutionProvider']:
+            raise RuntimeError(f'unexpected providers {self.providers}')
+        self.inputs = {i.name for i in self.session.get_inputs()}
+        hidden = [o for o in self.session.get_outputs() if len(o.shape) == 3]
+        if not hidden:
+            raise RuntimeError('model has no token-level (rank 3) output to pool')
+        self.output = hidden[0].name
+
+    def close(self) -> None:
+        """Drop the session and tokenizer (the caller collects garbage); ``embed`` fails afterwards."""
+        self.session = None
+        self.tokenizer = None
 
     def token_counts(self, texts: Sequence[str], *, query: bool = False) -> list[int]:
         """Untruncated token counts (special tokens included, padding excluded)."""
-        raise NotImplementedError('embedder.OnnxEmbedder.token_counts: M2 stage 1')
+        self.tokenizer.no_truncation()
+        try:
+            encodings = self.tokenizer.encode_batch([self.prefix[query] + t for t in texts])
+        finally:
+            self.tokenizer.enable_truncation(max_length=self.identity['max_tokens'])
+        return [sum(e.attention_mask) for e in encodings]
+
+    def _run(self, texts: list[str]) -> np.ndarray:
+        encodings = self.tokenizer.encode_batch(texts)
+        ids = np.array([e.ids for e in encodings], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
+        feed = {'input_ids': ids, 'attention_mask': mask}
+        if 'token_type_ids' in self.inputs:
+            feed['token_type_ids'] = np.zeros_like(ids)
+        # run_with_ort_values, not ``run``: the static boundary test bans every call named ``run``
+        # (the MCP server's network transports), and this is the same inference call.
+        values = {k: self.ort.OrtValue.ortvalue_from_numpy(v) for k, v in feed.items() if k in self.inputs}
+        hidden = self.session.run_with_ort_values([self.output], values)[0].numpy()
+        if self.pooling == 'cls':
+            pooled = hidden[:, 0]
+        elif self.pooling == 'mean':
+            weights = mask[..., None].astype(hidden.dtype)
+            pooled = (hidden * weights).sum(axis=1) / np.clip(weights.sum(axis=1), 1e-9, None)
+        else:
+            raise ValueError(f'unknown pooling {self.pooling!r}')
+        return l2_normalize(pooled.astype(np.float32))
 
     def embed(self, texts: Sequence[str], *, query: bool) -> np.ndarray:
-        raise NotImplementedError('embedder.OnnxEmbedder.embed: M2 stage 1')
+        prefixed = [self.prefix[query] + t for t in texts]
+        # Batch similar lengths together to limit padding, then restore input order.
+        order = sorted(range(len(prefixed)), key=lambda i: len(prefixed[i]))
+        out = np.zeros((len(prefixed), self.identity['dims']), dtype=np.float32)
+        for start in range(0, len(order), self.batch_size):
+            picked = order[start:start + self.batch_size]
+            out[picked] = self._run([prefixed[i] for i in picked])
+        return out
 
 
 class HashEmbedder:

@@ -1,0 +1,623 @@
+"""Search (design M2 §5, §6.2 S1-S5, §10): the M3 result contract, exact sources that re-derive from
+the current files (completion condition ④), modes, filters, limits, hostile input, the model-less
+path (condition ③, part) and the vector-memory paths. Semantic search runs on ``HashEmbedder``
+(test-only, not a model); real-model numbers are the stage-2 measurement.
+"""
+import ast
+import json
+import sqlite3
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from fixtures import SENTINEL
+from fixtures import bundle as synthetic_bundle
+from fixtures import corpus as corpus_module
+from test_collect import add_root, rewrite, scan
+from workmcp import binding, chunks, collect, index, locator, parsers, paths, search, store
+from workmcp.config import SearchSettings
+from workmcp.embedder import HashEmbedder
+
+SEARCH_PY = Path(search.__file__)
+DIMS = 256
+
+
+def hash_factory(dims=DIMS):
+    return lambda: HashEmbedder(dims)
+
+
+def build_home(home: Path, write) -> tuple[Path, Path]:
+    """A data home with ``write(root)`` scanned and indexed (HashEmbedder); returns (home, root)."""
+    paths.ensure_home(home)
+    root = home.parent/'src'
+    write(root)
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))
+        result = index.run_index(db, home, embedder=HashEmbedder(DIMS))
+        assert result['chunks_total'] > 0
+    finally:
+        db.close()
+    return home, root
+
+
+@pytest.fixture(scope='module')
+def corpus():
+    return corpus_module.build()
+
+
+@pytest.fixture(scope='module')
+def indexed(tmp_path_factory, corpus):
+    """The evaluation corpus, scanned and indexed once for the module."""
+    return build_home(tmp_path_factory.mktemp('corpus')/'home', lambda root: corpus_module.write(corpus, root))
+
+
+@pytest.fixture(scope='module')
+def bundle_home(tmp_path_factory):
+    """The M1 bundle (nine parsers, edge cases, a 20,000-character line split into pieces)."""
+    return build_home(tmp_path_factory.mktemp('bundle')/'home', synthetic_bundle.write_bundle)
+
+
+@pytest.fixture
+def engine(indexed):
+    return search.Engine(indexed[0], embedder_factory=hash_factory())
+
+
+def ro(home):
+    return store.open_read(home)
+
+
+# ---- contract (design M2 §5.7) ---------------------------------------------------------------------
+
+def check_contract(result: dict) -> None:
+    assert set(result) == search.RESULT_KEYS
+    meta = result['meta']
+    assert set(meta) == search.META_KEYS
+    assert meta['mode'] in search.MODES and meta['search_version'] == search.SEARCH_VERSION
+    assert set(meta['lexical']) == search.LEXICAL_META_KEYS and meta['lexical']['engine'] in ('fts5', 'like', 'none')
+    assert set(meta['lexical']['terms']) == {'match', 'short'}
+    assert meta['semantic'] in (search.UNAVAILABLE, search.NOT_REQUESTED) or set(meta['semantic']) == search.SEMANTIC_META_KEYS
+    assert set(meta['filters']) == search.FILTER_KEYS and set(meta['elapsed_ms']) == search.ELAPSED_KEYS
+    assert isinstance(meta['eligible_chunks'], int) and isinstance(result['notice'], list)
+    for rank, hit in enumerate(result['hits'], 1):
+        assert search.HIT_KEYS <= set(hit) <= search.HIT_KEYS | search.HIT_OPTIONAL_KEYS
+        assert hit['rank'] == rank and isinstance(hit['chunk_id'], int) and isinstance(hit['version_id'], int)
+        assert set(hit['doc']) == search.DOC_KEYS
+        assert set(hit['scores']) == search.SCORE_KEYS and hit['scores']['score_is_probability'] is False
+        assert hit['scores']['hit'] in search.HIT_REASONS
+        assert isinstance(hit['snippet'], str) and 0 < len(hit['snippet']) <= chunks.SNIPPET_MAX
+        locator.check_shape(hit['locator'])
+        assert 1 <= len(hit['units']) <= search.UNITS_CAP
+        for item in hit['units']:
+            locator.check_shape(item)
+            assert (item['doc'], item['path'], item['sha256']) == (hit['doc']['id'], hit['doc']['path'],
+                                                                   hit['doc']['sha256'])
+    json.dumps(result, ensure_ascii=False)  # the M3 tool returns it as JSON
+
+
+def test_result_contract_in_every_mode(engine, corpus):
+    for mode in search.MODES:
+        for query in corpus.queries[::12]:
+            result = engine.search(query.text, mode=mode)
+            check_contract(result)
+            assert result['meta']['mode'] == mode
+    lexical = engine.search('사양서 개정판', mode='lexical')
+    assert lexical['meta']['semantic'] == search.NOT_REQUESTED and lexical['meta']['lexical']['engine'] == 'fts5'
+    hybrid = engine.search('사양서 개정판')
+    assert hybrid['meta']['semantic']['model'] == 'hash-ngram-test-only'
+    assert hybrid['meta']['semantic']['real_model'] is False and hybrid['meta']['semantic']['streamed'] is False
+
+
+def rederive(db, hit, parsed_cache):
+    """Completion condition ④ for one hit (design M2 §5.8)."""
+    # (a) the snippet locator checks against the store and quotes exactly the snippet
+    assert binding.validate_locator(db, hit['locator'])['text'] == hit['snippet']
+    # (b) every units[] locator checks too
+    for item in hit['units']:
+        binding.validate_locator(db, item)
+    # (c) the current file parsed again gives the same unit text, and chars cut the snippet
+    path = hit['doc']['path']
+    if path not in parsed_cache:
+        data, sha, _ = collect.read_source(path)
+        assert sha == hit['doc']['sha256']
+        result = parsers.parse(data, hit['doc']['ext'], parsers.Limits())
+        parsed_cache[path] = {parsers.unit_json(u.unit): u.text for u in result.units}
+    units = parsed_cache[path]
+    start, end = hit['locator']['chars']
+    assert units[parsers.unit_json(hit['locator']['unit'])][start:end] == hit['snippet']
+    for item in hit['units']:
+        s, e = item['chars']
+        assert locator.text_sha256(units[parsers.unit_json(item['unit'])][s:e]) == item['text_sha256']
+    # (d) the chunk text is the slice of its joined units
+    first, last, cs, ce, text = db.execute('SELECT unit_first, unit_last, char_start, char_end, text FROM chunks '
+                                           'WHERE id=?', (hit['chunk_id'],)).fetchone()
+    joined = '\n'.join(t for (t,) in db.execute('SELECT text FROM units WHERE version_id=? AND ordinal BETWEEN ? '
+                                                'AND ? ORDER BY ordinal', (hit['version_id'], first, last)))
+    assert joined[cs:ce] == text
+
+
+BUNDLE_QUERIES = ('회의록', '가상 거래처 A', '견적 1,234,000원', 'quote Q-0042', '일정표 초안', SENTINEL,
+                  '글상자 안 문장', '그룹 밖 도형', '두 번째 줄', '가가가가가가')
+
+
+def test_every_hit_rederives_from_the_current_file(bundle_home):
+    home, _ = bundle_home
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    db = ro(home)
+    parsed, seen, split_pieces = {}, 0, 0
+    try:
+        for query in BUNDLE_QUERIES:
+            for mode in search.MODES:
+                result = engine.search(query, mode=mode, limit=20)
+                check_contract(result)
+                assert result['hits'], (query, mode)
+                for hit in result['hits']:
+                    rederive(db, hit, parsed)
+                    seen += 1
+                    split_pieces += hit['units'][0]['chars'][0] > 0 or 'long_line' in hit['doc']['path']
+        report = binding.verify(db)
+        chunk_count = db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+    finally:
+        db.close()
+    assert seen >= 300 and split_pieces > 0
+    assert report['ok'], report
+    assert report['chunks_checked'] == chunk_count
+
+
+def test_hit_has_locator_and_units_with_exact_chars(engine, indexed):
+    db = ro(indexed[0])
+    try:
+        result = engine.search('PRJ-012 사양서 개정판', mode='lexical', limit=5)
+        hit = result['hits'][0]
+        assert hit['doc']['path'].endswith('topic12.' + hit['doc']['ext'].lstrip('.'))
+        assert hit['snippet'].startswith('PRJ-012 사양서 개정판')
+        snippet_unit = hit['locator']['unit']
+        assert any(item['unit'] == snippet_unit for item in hit['units'])  # the snippet is inside a covered unit
+        for item in hit['units']:
+            text = binding.validate_locator(db, item)['text']
+            assert len(text) == item['chars'][1] - item['chars'][0]
+    finally:
+        db.close()
+
+
+def test_snippet_locator_display_has_path_hash_unit_chars(engine):
+    hit = engine.search('PRJ-012 사양서 개정판', mode='lexical', limit=1)['hits'][0]
+    line = locator.display(hit['locator'])
+    start, end = hit['locator']['chars']
+    assert hit['doc']['path'] in line and hit['doc']['sha256'][:12] in line
+    assert locator.unit_label(hit['locator']['unit']) in line and f'chars {start}-{end}' in line
+
+
+def test_units_list_is_capped(tmp_path):
+    lines = [f'{SENTINEL} 짧은 줄 모음'] + [f'항목{n:03d}' for n in range(1, 200)]
+
+    def write(root):
+        root.mkdir(parents=True)
+        (root/'many.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+    home, _ = build_home(tmp_path/'home', write)
+    result = search.search(ro(home), '항목005', mode='lexical')
+    hit = result['hits'][0]
+    assert len(hit['units']) == search.UNITS_CAP and hit['units_truncated'] > 0
+    db = ro(home)
+    first, last = db.execute('SELECT unit_first, unit_last FROM chunks WHERE id=?', (hit['chunk_id'],)).fetchone()
+    db.close()
+    assert hit['units_truncated'] == last - first + 1 - search.UNITS_CAP
+    check_contract(result)
+
+
+# ---- query transformation and hostile input (S3) ---------------------------------------------------
+
+def test_lexical_terms_split_long_short_and_quote_phrases():
+    terms = search.lexical_terms('A사 계약서 "검토"')
+    assert terms.tokens == ('A사', '계약서', '검토') and terms.long == ('계약서',) and terms.short == ('A사', '검토')
+    assert terms.match[0] == '"A사 계약서 ""검토"""'                          # whole query, quotes doubled
+    assert '"A사 계약서"' in terms.match and '"계약서 ""검토"' in terms.match     # neighbour pairs as written
+    assert '"계약서"' in terms.match and '"A사"' not in terms.match              # short tokens never MATCH
+    assert search.lexical_terms('PRJ-012 견적').match[:2] == ('"PRJ-012 견적"', '"PRJ-012"')
+    assert search.lexical_terms('QA').match == () and search.lexical_terms('QA').short == ('QA',)
+    many = search.lexical_terms(' '.join(f'낱말{n}' for n in range(200)))
+    assert len(many.tokens) == search.MAX_TOKENS and len(many.match) <= 130
+
+
+HOSTILE = ['"', '""', '"""', '*', 'NEAR(', 'NEAR(a b, 2)', 'a:b', 'text:견적', '-견적', '^견적', '(견적)', '견적 AND',
+           'OR OR', '\x00\x01견적\x7f', '😀😀😀 견적', 'a' * 1000, '견적서' * 333, '\ud800견적서', '{a b}', '[x]',
+           "'; DROP TABLE chunks; --", '%_\\', 'NOT 견적서', '   견적서   ', '​​견적']
+
+
+def test_fts_expression_never_raises_on_hostile_queries(engine, indexed):
+    for query in HOSTILE:
+        for mode in search.MODES:
+            check_contract(engine.search(query, mode=mode))
+    for bad in ['', '   ', '\x00\x01', '​', None, 'a' * 1001]:
+        with pytest.raises(search.SearchError) as caught:
+            engine.search(bad)
+        assert caught.value.code in ('empty_query', 'query_too_long')
+    db = ro(indexed[0])
+    try:
+        assert db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0] > 0   # nothing was dropped
+    finally:
+        db.close()
+
+
+def test_empty_query_and_limit_errors(engine):
+    cases = [(dict(query=''), 'empty_query'), (dict(query='견적', limit=0), 'limit_out_of_range'),
+             (dict(query='견적', limit=51), 'limit_out_of_range'), (dict(query='견적', limit=10**9), 'limit_out_of_range'),
+             (dict(query='견적', limit=True), 'limit_out_of_range'), (dict(query='견적', limit='5'), 'limit_out_of_range'),
+             (dict(query='견적', mode='fuzzy'), 'mode_invalid'), (dict(query='x' * 1001), 'query_too_long')]
+    for kwargs, code in cases:
+        with pytest.raises(search.SearchError) as caught:
+            engine.search(**kwargs)
+        assert caught.value.code == code
+    assert set(search.ERROR_CODES) >= {code for _, code in cases}
+
+
+def test_limits_are_enforced(engine):
+    bad_filters = [dict(path_prefix=''), dict(path_prefix='x' * 1025), dict(path_prefix='a\x00b'),
+                   dict(ext=['.exe']), dict(ext='.txt'), dict(ext=['.txt'] * 21), dict(ext=[]), dict(ext=[3]),
+                   dict(ext=['txt']), dict(since='yesterday'), dict(until='2031-13-01'),
+                   dict(since='2031-02-01', until='2031-01-01'), dict(ext=['.' + 'a' * 5000])]
+    for kwargs in bad_filters:
+        with pytest.raises(search.SearchError) as caught:
+            engine.search('사양서 개정판', **kwargs)
+        assert caught.value.code == 'filter_invalid', kwargs
+    result = engine.search('사양서 개정판', limit=50)
+    assert len(result['hits']) == 50
+    assert engine.search('사양서 개정판', mode='lexical', limit=1)['hits'][0]['rank'] == 1
+    filters = engine.search('사양서', ext=['.TXT', '.txt', '.md'])['meta']['filters']
+    assert filters['ext'] == ['.md', '.txt']
+
+
+def test_short_only_query_uses_like_fallback_or_notice(indexed):
+    home = indexed[0]
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    result = engine.search('QA', mode='lexical')
+    assert result['meta']['lexical']['engine'] == 'like' and result['hits']
+    assert all('qa' in h['snippet'].casefold() for h in result['hits'])
+    assert result['meta']['lexical']['terms'] == {'match': [], 'short': ['QA']}
+    # (c) MATCH found nothing but a short token is there: LIKE again
+    result = engine.search('견적 없는말이다', mode='lexical')
+    assert result['meta']['lexical']['engine'] == 'like' and result['hits']
+    # over the LIKE cap: no lexical search, a notice instead
+    small = search.Engine(home, replace(SearchSettings(), like_max_chunks=5), embedder_factory=hash_factory())
+    capped = small.search('QA', mode='lexical')
+    assert capped['hits'] == [] and search.SHORT_QUERY_NOTICE in capped['notice']
+    assert capped['meta']['lexical']['engine'] == 'none'
+    assert search.NO_RESULTS_NOTICE in capped['notice']
+
+
+def test_like_is_used_when_fts5_is_missing(indexed, monkeypatch):
+    monkeypatch.setattr(search, 'fts_usable', lambda db: False)
+    result = search.Engine(indexed[0]).search('사양서 개정판', mode='lexical')
+    assert result['meta']['lexical']['engine'] == 'like' and result['hits']
+    assert result['meta']['lexical']['terms']['match'] == []
+
+
+# ---- ranking ---------------------------------------------------------------------------------------
+
+def test_rrf_average_ranks_and_hit_reasons():
+    ranks = search.average_ranks({'a': 3.0, 'b': 2.0, 'c': 2.0, 'd': 1.0})
+    assert ranks == {'a': 1.0, 'b': 2.5, 'c': 2.5, 'd': 4.0}
+    assert search.average_ranks({'x': (5.0, 0.0), 'y': (5.0, 0.5), 'z': (5.0, 0.0)}) == {'y': 1.0, 'x': 2.5, 'z': 2.5}
+    assert search.average_ranks({}) == {}
+    fused = search.rrf([{'a': 1.0, 'b': 2.0}, {'b': 1.0, 'c': 2.0}])
+    assert fused['b'] == pytest.approx(1 / 62 + 1 / 61) and fused['a'] == pytest.approx(1 / 61)
+    assert fused['c'] == pytest.approx(1 / 62)
+    # tied chunks share a contribution (no position bias inside a tie group)
+    tied = search.rrf([search.average_ranks({'p': 1.0, 'q': 1.0})])
+    assert tied['p'] == tied['q'] == pytest.approx(1 / 61.5)
+
+
+def test_modes_lexical_semantic_hybrid(engine):
+    query = 'PRJ-012 사양서 개정판'
+    lexical = engine.search(query, mode='lexical', limit=50)
+    semantic = engine.search(query, mode='semantic', limit=50)
+    hybrid = engine.search(query, mode='hybrid', limit=50)
+    assert {h['scores']['hit'] for h in lexical['hits']} == {'lexical'}
+    assert all(h['scores']['cosine'] is None and h['scores']['bm25'] is not None for h in lexical['hits'])
+    bm25 = [h['scores']['bm25'] for h in lexical['hits']]
+    assert bm25 == sorted(bm25)
+    assert {h['scores']['hit'] for h in semantic['hits']} == {'semantic'}
+    cosines = [h['scores']['cosine'] for h in semantic['hits']]
+    assert cosines == sorted(cosines, reverse=True) and min(cosines) > 0
+    assert semantic['meta']['lexical']['engine'] == 'none'
+    fusion = [h['scores']['fusion'] for h in hybrid['hits']]
+    assert fusion == sorted(fusion, reverse=True)
+    reasons = {h['scores']['hit'] for h in hybrid['hits']}
+    assert 'both' in reasons
+    for hit in hybrid['hits']:
+        expected = sum(1 / (60 + r) for r in (hit['scores']['lexical_rank'], hit['scores']['semantic_rank'])
+                       if r is not None)
+        assert hit['scores']['fusion'] == pytest.approx(expected)
+    # the exact topic sentence is first lexically
+    assert lexical['hits'][0]['doc']['path'].endswith(('topic12.' + lexical['hits'][0]['doc']['ext'][1:]))
+
+
+def test_no_results_notice(engine):
+    result = engine.search('존재하지않는낱말조합입니다', mode='lexical')
+    assert result['hits'] == [] and result['notice'] == [search.NO_RESULTS_NOTICE]
+    assert engine.search('사양서 개정판')['notice'] == []
+
+
+# ---- filters and eligible versions -----------------------------------------------------------------
+
+def test_filters_path_prefix_ext_since_until(engine, indexed):
+    home, root = indexed
+    by_prefix = engine.search('사양서 개정판', path_prefix=str(root/'docx'), limit=50)
+    assert by_prefix['hits'] and all(Path(h['doc']['path']).parent.name == 'docx' for h in by_prefix['hits'])
+    lower = engine.search('사양서 개정판', path_prefix=str(root/'DOCX').upper(), limit=50)   # Windows: case-insensitive
+    assert [h['chunk_id'] for h in lower['hits']] == [h['chunk_id'] for h in by_prefix['hits']]
+    assert engine.search('사양서', path_prefix=str(root/'doc%'))['hits'] == []             # % is literal
+    by_ext = engine.search('사양서 개정판', ext=['.hwp', '.pdf'], limit=50)
+    assert by_ext['hits'] and {h['doc']['ext'] for h in by_ext['hits']} <= {'.hwp', '.pdf'}
+    assert by_ext['meta']['eligible_chunks'] < engine.search('사양서')['meta']['eligible_chunks']
+    for mode in search.MODES:   # semantic candidates are filtered too
+        hits = engine.search('사양서 개정판', mode=mode, ext=['.eml'], limit=50)['hits']
+        assert hits and {h['doc']['ext'] for h in hits} == {'.eml'}
+    everything = engine.search('사양서', since='2000-01-01', until='2999-12-31T23:59:59+09:00')
+    assert everything['hits'] and search.OBSERVED_NOTICE in everything['notice']
+    future = engine.search('사양서', since='2999-01-01')
+    assert future['hits'] == [] and future['meta']['eligible_chunks'] == 0
+    assert engine.search('사양서', until='2000-01-01T00:00:00Z')['hits'] == []
+
+
+def test_latest_active_versions_only(tmp_path):
+    def write(root):
+        root.mkdir(parents=True)
+        (root/'a.txt').write_text(f'{SENTINEL} 첫 판의 고유문장 알파입니다', encoding='utf-8')
+        (root/'b.txt').write_text(f'{SENTINEL} 지워질 문서의 고유문장 베타입니다', encoding='utf-8')
+
+    home, root = build_home(tmp_path/'home', write)
+    rewrite(root/'a.txt', f'{SENTINEL} 둘째 판의 고유문장 감마입니다'.encode())
+    (root/'b.txt').unlink()
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))
+        index.run_index(db, home, embedder=HashEmbedder(DIMS))
+    finally:
+        db.close()
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    for mode in search.MODES:
+        texts = [h['snippet'] for h in engine.search('고유문장', mode=mode, limit=50)['hits']]
+        assert texts and all('감마' in t for t in texts), (mode, texts)
+    assert engine.search('알파입니다', mode='lexical')['hits'] == []
+    assert engine.search('베타입니다', mode='lexical')['hits'] == []
+
+
+# ---- model-less paths (completion condition ③, part) ------------------------------------------------
+
+def test_lexical_only_when_model_missing_with_note(indexed):
+    engine = search.Engine(indexed[0])          # the real manifest model; this home has no model files
+    for mode in ('hybrid', 'semantic'):
+        result = engine.search('사양서 개정판', mode=mode)
+        check_contract(result)
+        assert result['meta']['mode'] == 'lexical' and result['hits']
+        assert result['meta']['semantic'] == search.UNAVAILABLE
+        assert result['meta']['semantic_note'].startswith('model_missing: ')
+    assert engine.status()['loaded'] is False and engine.loads == 1
+
+
+def test_search_survives_runtime_import_failure(indexed):
+    def blocked():
+        raise ImportError('DLL load failed (synthetic)')
+
+    engine = search.Engine(indexed[0], embedder_factory=blocked)
+    result = engine.search('사양서 개정판')
+    assert result['hits'] and result['meta']['mode'] == 'lexical'
+    assert result['meta']['semantic_note'] == 'runtime_import_failed:ImportError'
+    assert {h['scores']['hit'] for h in result['hits']} == {'lexical'}
+
+
+def test_model_load_failure_is_tried_once_per_process(indexed):
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise RuntimeError('synthetic load failure')
+
+    engine = search.Engine(indexed[0], embedder_factory=broken)
+    notes = {engine.search('사양서', mode=m)['meta']['semantic_note'] for m in ('hybrid', 'semantic', 'hybrid')}
+    assert notes == {'runtime_error:RuntimeError'} and len(calls) == 1
+    engine.reset()
+    engine.search('사양서')
+    assert len(calls) == 2
+
+
+def test_search_does_not_load_the_model_for_lexical_mode(indexed):
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return HashEmbedder(DIMS)
+
+    engine = search.Engine(indexed[0], embedder_factory=factory)
+    engine.search('사양서 개정판', mode='lexical')
+    assert calls == [] and engine.status()['loaded'] is False
+    with pytest.raises(search.SearchError):
+        engine.search('', mode='hybrid')          # bad input never touches the model
+    assert calls == []
+    engine.search('사양서 개정판')
+    assert calls == [1]
+
+
+def test_query_embedding_is_called_once_per_search(indexed):
+    class Spy(HashEmbedder):
+        calls = []
+
+        def embed(self, texts, *, query):
+            self.calls.append((len(texts), query))
+            return super().embed(texts, query=query)
+
+    engine = search.Engine(indexed[0], embedder_factory=lambda: Spy(DIMS))
+    engine.search('사양서 개정판')
+    engine.search('견적 금액', mode='semantic')
+    assert Spy.calls == [(1, True), (1, True)]
+
+
+# ---- vector memory (S1) and the engine ---------------------------------------------------------------
+
+def test_matrix_is_float16_and_sized(engine, indexed):
+    engine.search('사양서')
+    cache = engine._vectors
+    db = ro(indexed[0])
+    try:
+        distinct = db.execute('SELECT COUNT(DISTINCT text_sha256) FROM chunks').fetchone()[0]
+    finally:
+        db.close()
+    assert cache.matrix.dtype == np.float16 and cache.matrix.shape == (distinct, DIMS)
+    assert cache.matrix.nbytes == distinct * DIMS * 2 == engine.status()['matrix_bytes']
+    assert len(cache.chunk_ids) == len(cache.chunk_rows) >= distinct and cache.invalid_vectors == 0
+
+
+def test_fp16_matrix_ranks_like_fp32(engine, indexed, corpus):
+    engine.search('사양서')
+    cache = engine._vectors
+    db = ro(indexed[0])
+    try:
+        full = {key: index.from_blob(blob, DIMS) for key, blob in
+                db.execute('SELECT text_sha256, vector FROM chunk_vectors')}
+    finally:
+        db.close()
+    exact = np.stack([full[key] for key in cache.keys]).astype(np.float32)
+    model = HashEmbedder(DIMS)
+    for query in corpus.queries[:30]:
+        q = search.embed_query(model, query.text, DIMS)
+        fp32 = np.argsort(-(exact @ q), kind='stable')[:20]
+        fp16 = np.argsort(-cache.scores(q), kind='stable')[:20]
+        overlap = len(set(fp32) & set(fp16))
+        assert overlap >= 19, (query.text, overlap)
+        assert np.max(np.abs(exact @ q - cache.scores(q))) < 2e-3
+
+
+def test_over_cap_switches_to_streaming(indexed, corpus):
+    home = indexed[0]
+    cached = search.Engine(home, embedder_factory=hash_factory())
+    streamed = search.Engine(home, replace(SearchSettings(), max_vectors_in_memory=10), embedder_factory=hash_factory())
+    for query in corpus.queries[::7]:
+        for kwargs in ({}, {'ext': ['.docx', '.txt']}):
+            a = cached.search(query.text, mode='semantic', limit=50, **kwargs)
+            b = streamed.search(query.text, mode='semantic', limit=50, **kwargs)
+            assert b['meta']['semantic']['streamed'] is True and a['meta']['semantic']['streamed'] is False
+            assert [h['chunk_id'] for h in a['hits']] == [h['chunk_id'] for h in b['hits']]
+            assert [h['scores']['cosine'] for h in a['hits']] == pytest.approx([h['scores']['cosine'] for h in b['hits']])
+    assert streamed.status()['rows'] == 0 and streamed.status()['matrix_bytes'] == 0
+
+
+def test_corrupt_vectors_are_skipped_and_counted(tmp_path):
+    lines = [f'{SENTINEL} 벡터 손상 시험 첫 줄', '두 번째 줄의 고유한 내용']
+
+    def write(root):
+        root.mkdir(parents=True)
+        (root/'v.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+    home, _ = build_home(tmp_path/'home', write)
+    db = sqlite3.connect(paths.db_path(home))
+    db.execute("UPDATE chunk_vectors SET vector = zeroblob(length(vector))")
+    db.commit()
+    db.close()
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    result = engine.search('고유한 내용', mode='hybrid')
+    assert result['hits'] and engine._vectors.invalid_vectors >= 1 and engine._vectors.rows == 0
+    assert {h['scores']['hit'] for h in result['hits']} == {'lexical'}
+
+
+def test_matrix_reloads_when_index_generation_changes(tmp_path):
+    def write(root):
+        root.mkdir(parents=True)
+        (root/'g.txt').write_text(f'{SENTINEL} 세대 시험 문서 첫 판', encoding='utf-8')
+
+    home, root = build_home(tmp_path/'home', write)
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    engine.search('세대 시험')
+    first = engine._vectors
+    engine.search('세대 시험')
+    assert engine._vectors is first                     # same generation: cached
+    (root/'h.txt').write_text(f'{SENTINEL} 새로 생긴 문서의 다른 내용', encoding='utf-8')
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))
+        index.run_index(db, home, embedder=HashEmbedder(DIMS))
+    finally:
+        db.close()
+    result = engine.search('새로 생긴 문서', mode='semantic')
+    assert engine._vectors is not first and engine._vectors.generation != first.generation
+    assert engine._vectors.rows > first.rows and any('새로 생긴' in h['snippet'] for h in result['hits'])
+
+
+def test_engine_unloads_after_idle(indexed):
+    now = [1000.0]
+    engine = search.Engine(indexed[0], replace(SearchSettings(), model_idle_seconds=600),
+                           embedder_factory=hash_factory(), clock=lambda: now[0])
+    assert engine.maybe_unload() is False                          # nothing loaded
+    engine.search('사양서')
+    assert engine.status()['loaded'] and engine.status()['rows'] > 0
+    now[0] += 599
+    assert engine.maybe_unload() is False and engine.status()['loaded']
+    engine.search('견적')                                           # use refreshes the clock
+    now[0] += 599
+    assert engine.maybe_unload() is False
+    assert engine.maybe_unload(now[0] + 1) is True
+    status = engine.status()
+    assert status == {'loaded': False, 'rows': 0, 'generation': None, 'matrix_bytes': 0, 'load_failure': None}
+    assert engine.search('사양서')['meta']['semantic']['vectors'] > 0   # loads again on demand
+    assert engine.loads == 2
+
+
+def test_server_threads_default_is_half_the_cpus():
+    assert SearchSettings().effective_threads(16) == 8 and SearchSettings().effective_threads(1) == 1
+    assert replace(SearchSettings(), threads=3).effective_threads(16) == 3
+
+
+# ---- read-only (S5) and the static "no point outside the table" checks (§6.4) ----------------------
+
+def test_search_opens_read_only(indexed, monkeypatch):
+    seen = []
+    real = sqlite3.connect
+
+    def spy(database, *args, **kwargs):
+        seen.append((str(database), kwargs.get('uri', False)))
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, 'connect', spy)
+    engine = search.Engine(indexed[0], embedder_factory=hash_factory())
+    for mode in search.MODES:
+        engine.search('사양서 개정판', mode=mode)
+    assert seen and all(db.endswith('?mode=ro') and uri for db, uri in seen)   # not even ':memory:'
+
+
+def test_vector_loading_and_fetchall_only_in_allowed_functions():
+    tree = ast.parse(SEARCH_PY.read_text(encoding='utf-8'))
+    places = {'frombuffer': set(), 'from_blob': set(), 'fetchall': set()}
+
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            name = owner
+            if isinstance(child, (ast.FunctionDef, ast.ClassDef)):
+                name = f'{owner}.{child.name}' if owner else child.name
+            if isinstance(child, ast.Attribute) and child.attr in places:
+                places[child.attr].add(owner)
+            if isinstance(child, ast.Name) and child.id in places:
+                places[child.id].add(owner)
+            visit(child, name)
+
+    visit(tree, '')
+    assert places['frombuffer'] <= {'VectorCache.load', 'VectorCache.stream'}
+    assert places['frombuffer'] == {'VectorCache.load', 'VectorCache.stream'}
+    assert places['from_blob'] == set()
+    assert places['fetchall'] == {'_hits'}
+
+
+# ---- console output ----------------------------------------------------------------------------------
+
+def test_format_hits(engine):
+    result = engine.search('PRJ-012 사양서 개정판', limit=3)
+    lines = search.format_hits(result)
+    assert lines[0].startswith('3 hits  mode hybrid  lexical fts5')
+    assert any(locator.display(result['hits'][0]['locator']) in line for line in lines)
+    assert any(line.strip() == ' '.join(result['hits'][0]['snippet'].split()) for line in lines)
+    empty = search.format_hits(engine.search('존재하지않는낱말조합입니다', mode='lexical'))
+    assert empty[0].startswith('0 hits') and empty[-1] == f'notice: {search.NO_RESULTS_NOTICE}'
+    noted = search.format_hits(search.Engine(engine.home).search('사양서'))
+    assert any(line.startswith('semantic: model_missing') for line in noted)

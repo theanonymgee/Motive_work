@@ -19,8 +19,8 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT
 - ``search ROOT`` (M2): as ``index``, then ``search.Engine`` (``HashEmbedder`` factory) over six
   queries in each mode and ``maybe_unload``; every ``sqlite3.connect`` of the search phase is
   recorded (all must be ``mode=ro``) and source opens are counted (must be 0).
-- ``embed`` (M2): the real model from the data home, only when it is there (``mode_embed``, filled in
-  stage 1); otherwise ``skipped: model_missing``.
+- ``embed`` (M2): the real model from the data home, only when it is there: ``mode_embed`` delegates to
+  ``tests/_embed_mode.py`` ``run(home)``; otherwise ``skipped: model_missing``.
   A mode whose package function is still a stage-0 stub reports ``skipped`` (the test skips).
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
@@ -400,9 +400,12 @@ def search(root: Path) -> dict:
 
 
 def mode_embed(home: Path) -> dict:
-    """Stage 1 (B): load ``OnnxEmbedder(models.DEFAULT_MODEL, home)``, embed three texts and one query;
-    return ``{'providers': <session providers>, 'dims': ..., 'texts': 3}`` (counts only, no text)."""
-    raise NotImplementedError('mode_embed: M2 stage 1')
+    """Delegates to ``tests/_embed_mode.py`` ``run(home)`` (B's file: load ``OnnxEmbedder``, embed three
+    texts and one query, return counts and providers only). Without that file: ``model_missing``."""
+    if not (Path(__file__).resolve().parent/'_embed_mode.py').is_file():
+        return {'skipped': 'model_missing'}
+    import _embed_mode
+    return _embed_mode.run(home)
 
 
 def embed() -> dict:

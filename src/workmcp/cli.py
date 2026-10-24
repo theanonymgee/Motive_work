@@ -395,14 +395,17 @@ def index_command(args) -> int:
             try:
                 from . import index
                 try:
+                    loading = datetime.now()
                     embedder, note = _index_embedder(name, home, cfg.index)
+                    load_seconds = (datetime.now() - loading).total_seconds()
+                    if note:
+                        logger.info(f'vectors_skipped |  |  |  | {note}')
                     result = index.run_index(db, home, embedder=embedder, settings=cfg.index,
-                                       on_event=lambda event: _log_index_event(logger, event), limit=args.limit,
-                                       doc_ids=args.doc or None, rebuild_fts=args.rebuild_fts, gc=args.gc,
-                                       keep_history=args.keep_history, vectors_note=note)
-                except NotImplementedError:
-                    print('workmcp index: not implemented yet (M2 stage 1)', file=sys.stderr)
-                    return 1
+                                             on_event=lambda event: _log_index_event(logger, event), limit=args.limit,
+                                             doc_ids=args.doc or None, rebuild_fts=args.rebuild_fts, gc=args.gc,
+                                             keep_history=args.keep_history, vectors_note=note)
+                    result['elapsed']['load'] = load_seconds
+                    result['elapsed']['total'] += load_seconds
                 except Exception as exc:  # class name only: a message could carry a file name or value
                     logger.info(f'aborted |  |  |  | {type(exc).__name__}')
                     print(f'index aborted ({type(exc).__name__}); see {log_file}', file=sys.stderr)

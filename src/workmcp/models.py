@@ -89,7 +89,7 @@ def identity(name: str) -> dict:
     return {'name': name, 'repo': item['repo'], 'revision': item['revision'], 'file_sha256': model['sha256'],
             'backend': 'onnxruntime-cpu', 'precision': item['precision'], 'pooling': item['pooling'],
             'query_prefix': item['query_prefix'], 'passage_prefix': item['passage_prefix'],
-            'dims': item['dims'], 'max_tokens': item['max_tokens']}
+            'dims': item['dims'], 'max_tokens': item['max_tokens'], 'real_model': True}
 
 
 def quick_status(name: str, home: Path) -> dict:
@@ -131,6 +131,35 @@ def available(name: str, home: Path) -> bool:
     return quick_status(name, home)['available']
 
 
+IMPORT_OK = ('ok', 'already_verified')
+
+
+def _source_file(source: Path, spec: dict) -> Path | None:
+    """The file of ``spec`` inside ``source``: flat (``<file name>``) or repository layout (``onnx/...``)."""
+    for candidate in (source/local_name(spec), source/spec['path']):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _copy_hashed(src: Path, partial: Path) -> str:
+    """Copy ``src`` to ``partial`` in 1 MiB blocks, hashing the same blocks; return the SHA-256.
+
+    The partial is removed again when the copy stops for any reason (error or interrupt), so a
+    half-copied file never stays behind; a partial left by a killed process is overwritten next run.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(src, 'rb') as reader, open(partial, 'wb') as writer:
+            while block := reader.read(CHUNK_BYTES):
+                digest.update(block)
+                writer.write(block)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return digest.hexdigest()
+
+
 def import_from(name: str, source: Path, home: Path, *, log=print) -> dict[str, str]:
     """Copy the manifest files of ``name`` from the absolute folder ``source`` into the data home.
 
@@ -138,16 +167,48 @@ def import_from(name: str, source: Path, home: Path, *, log=print) -> dict[str, 
     (repository layout); ``missing_in_source`` / ``size_mismatch_in_source`` without copying;
     ``already_verified`` when the target already matches; else copy in 1 MiB blocks to
     ``<home>/tmp/<name>-<file>.partial`` hashing the same blocks, then ``os.replace`` on a SHA-256
-    match (``ok``) or delete the partial (``sha256_mismatch_in_source``). ``source`` is only read.
-    Returns ``{file name: status}``. Calls no network function.
+    match (``ok``) or delete the partial (``sha256_mismatch_in_source``). A read or write error while
+    copying gives ``copy_failed:<ErrorClass>`` (partial deleted, the other files still go on); an
+    interrupt deletes the partial and propagates. ``source`` is only read. ``log`` gets one line per
+    file that is copied. Returns ``{file name: status}``. Calls no network function.
     """
-    raise NotImplementedError('models.import_from: M2 stage 1')
+    report: dict[str, str] = {}
+    for spec in entry(name)['files']:
+        filename = local_name(spec)
+        target = file_path(name, filename, home)
+        src = _source_file(Path(source), spec)
+        if target.is_file() and target.stat().st_size == spec['size'] and sha256_file(target) == spec['sha256']:
+            report[filename] = 'already_verified'
+        elif src is None:
+            report[filename] = 'missing_in_source'
+        elif src.stat().st_size != spec['size']:
+            report[filename] = 'size_mismatch_in_source'
+        else:
+            partial = home/'tmp'/f'{name}-{filename}.partial'
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            log(f'copy {name}/{filename} ({spec["size"]:,} bytes)')
+            try:
+                actual = _copy_hashed(src, partial)
+            except OSError as exc:
+                report[filename] = f'copy_failed:{type(exc).__name__}'
+            else:
+                if actual == spec['sha256']:
+                    os.replace(partial, target)
+                    report[filename] = 'ok'
+                else:
+                    partial.unlink(missing_ok=True)
+                    report[filename] = 'sha256_mismatch_in_source'
+    return report
 
 
 def cli_fetch_model(args, home: Path) -> int:
     """``workmcp fetch-model NAME --from FOLDER`` body (the CLI checks ``--from`` and the data home):
     ``import_from`` and one line per file; exit 0 when every file is ``ok``/``already_verified``."""
-    raise NotImplementedError('models.cli_fetch_model: M2 stage 1')
+    report = import_from(args.name, Path(args.source), home)
+    for filename, status in report.items():
+        print(f'{args.name}/{filename}: {status}')
+    return 0 if all(value in IMPORT_OK for value in report.values()) else 1
 
 
 def cli_verify_model(args, home: Path) -> int:

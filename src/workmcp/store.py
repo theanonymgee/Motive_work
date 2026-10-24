@@ -367,6 +367,17 @@ def last_scan(db: sqlite3.Connection) -> dict | None:
     return {'at': row[0], **{key: counts.get(key, 0) for key in ('added', 'changed', 'deleted', 'failed')}}
 
 
+def last_index(db: sqlite3.Connection) -> dict | None:
+    """Last finished index run for ``status``: ``{at, chunks, embedded, reused, model, model_key}`` or None."""
+    row = db.execute("SELECT finished_at, model_key, counts_json FROM index_runs WHERE status='done' "
+                     'ORDER BY id DESC LIMIT 1').fetchone()
+    if row is None:
+        return None
+    counts = json.loads(row[2] or '{}')
+    return {'at': row[0], 'chunks': counts.get('chunks_total', 0), 'embedded': counts.get('embedded', 0),
+            'reused': counts.get('reused_vectors', 0), 'model': counts.get('model'), 'model_key': row[1]}
+
+
 # -- chunks and the FTS index (design M2 §4.3, L-8) ------------------------------------------
 # chunks_fts is an external-content FTS5 table: it does not follow chunks by itself, and a delete
 # must hand it the old text. There are no triggers; the only SQL that writes or removes chunk rows

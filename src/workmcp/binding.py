@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 
+from . import chunks as chunk_rules
 from . import collect, locator, parsers, store
 
 SCOPE = ('결속 100% = parse_status가 ok인 버전 중 현재 파일의 sha256이 그 버전과 같은 것 전부에 대해, 저장된 '
@@ -72,7 +73,7 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
     document_id, sha256, size, parse_status, parser_version, path, ext, is_latest = row
     report = {'version_id': version_id, 'document_id': document_id, 'path': path, 'sha12': sha256[:12],
               'latest': bool(is_latest), 'result': None, 'units_total': 0, 'units_bound': 0, 'chunks_checked': 0,
-              'evidence_checked': 0, 'failures': []}
+              'chunks_other_version': 0, 'evidence_checked': 0, 'failures': []}
     if parse_status != 'ok':
         stored = db.execute('SELECT COUNT(*) FROM units WHERE version_id=?', (version_id,)).fetchone()[0]
         if stored:
@@ -144,10 +145,15 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
     report['units_bound'] = bound
 
     units = list(result.units)
-    for ordinal, first, last, start, end, text, text_sha256 in db.execute(
-            'SELECT ordinal, unit_first, unit_last, char_start, char_end, text, text_sha256 FROM chunks '
+    current = set()  # rows of the current chunk rules, compared with the chunks derived again (design M2 §2.7)
+    for chunk_version, ordinal, first, last, start, end, text, text_sha256 in db.execute(
+            'SELECT chunk_version, ordinal, unit_first, unit_last, char_start, char_end, text, text_sha256 FROM chunks '
             'WHERE version_id=? ORDER BY chunk_version, ordinal', (version_id,)):
         report['chunks_checked'] += 1
+        if chunk_version == chunk_rules.CHUNK_VERSION:
+            current.add((ordinal, first, last, start, end, text_sha256))
+        else:
+            report['chunks_other_version'] += 1
         if not 1 <= first <= last <= len(units) or not 0 <= start <= end:
             fail(None, 'chunk_range_invalid')
             continue
@@ -156,6 +162,11 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
             fail(None, 'chunk_text_mismatch')
         elif text_sha256 != _sha(text):
             fail(None, 'chunk_text_sha256_mismatch')
+    if current:
+        derived_chunks = {(c.ordinal, c.unit_first, c.unit_last, c.char_start, c.char_end, c.text_sha256())
+                          for c in chunk_rules.build_chunks([(u.ordinal, u.unit, u.text) for u in units])}
+        if derived_chunks != current:
+            fail(None, 'chunk_set_mismatch')
 
     by_unit = {parsers.unit_json(unit.unit): unit for unit in units}
     for locator_json, quote, quote_sha256 in db.execute(
@@ -213,7 +224,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     cache, files = {}, {}
     versions = {'total': len(ids), 'checked': 0, 'ok': 0, 'failed': 0, 'unverifiable': dict.fromkeys(UNVERIFIABLE, 0)}
     units = {'total': 0, 'bound': 0}
-    chunks = evidence = 0
+    chunks = other_chunks = evidence = 0
     failures, stale_latest = [], set()
     for version_id in ids:
         report = verify_version(db, version_id, cache, limits, files, read_cloud_placeholders=read_cloud_placeholders)
@@ -224,6 +235,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
             units['total'] += report['units_total']
             units['bound'] += report['units_bound']
             chunks += report['chunks_checked']
+            other_chunks += report['chunks_other_version']
             evidence += report['evidence_checked']
             failures += report['failures']
         else:
@@ -237,7 +249,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     return {'scope': SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version
                                                 for ext in sorted(parsers.SUPPORTED_EXTENSIONS)},
             'checked_at': store.now(), 'versions': versions, 'units': units, 'chunks_checked': chunks,
-            'evidence_checked': evidence, 'ok': versions['failed'] == 0, 'failures': failures[:MAX_FAILURES],
+            'chunks_other_version': other_chunks, 'evidence_checked': evidence, 'ok': versions['failed'] == 0, 'failures': failures[:MAX_FAILURES],
             'notice': notice}
 
 
