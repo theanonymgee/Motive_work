@@ -52,6 +52,11 @@ NOT_IMPLEMENTED = 'not_implemented'  # stage 0 only, no tool answers it now; not
 # ``searching.HIT_KEYS`` hits; its ``meta`` is ``searching.META_KEYS`` plus the keys the tool layer adds.
 SEARCH_META_EXTRA_KEYS = frozenset({'collapsed', 'truncated_hits', 'signals', 'engine'})  # beyond M2 §5.7
 SEARCH_ENGINE_KEYS = frozenset({'model_loaded_now', 'load_ms'})
+# A hit's ``units[]`` entry in the tool response: the locator fields that differ per unit; ``v``, ``doc``,
+# ``path`` and ``sha256`` are the hit locator's (``expand_units`` rebuilds the full locators). Coordinator
+# decision 2026-10-24: a full locator per unit made ten hits overflow the 40,000-character budget.
+UNIT_REF_KEYS = frozenset({'unit', 'chars', 'text_sha256'})
+SHARED_LOCATOR_KEYS = ('v', 'doc', 'path', 'sha256')
 SNIPPET_RESULT_KEYS = snippet.RESULT_KEYS
 PIECE_KEYS = snippet.PIECE_KEYS
 DOCUMENT_KEYS = frozenset({'id', 'path', 'ext', 'status', 'skip_reason', 'root_id', 'first_seen_at', 'last_seen_at',
@@ -83,6 +88,25 @@ def dumps(envelope: Mapping) -> str:
 
 # ---- delivered pieces and the size budget (design M3 §3.1, §4) ----------------------------------
 
+def compact_units(hit: dict) -> None:
+    """``hit['units']`` in place as ``UNIT_REF_KEYS`` entries (each unit locator shares the hit's version)."""
+    shared = {key: hit['locator'][key] for key in SHARED_LOCATOR_KEYS}
+    out = []
+    for obj in hit['units']:
+        if any(obj[key] != value for key, value in shared.items()):
+            raise ValueError('a unit locator of another version than its hit')  # never: _hits builds them so
+        out.append({'unit': obj['unit'], 'chars': obj['chars'], 'text_sha256': obj['text_sha256']})
+    hit['units'] = out
+
+
+def expand_units(hit: Mapping) -> list[dict]:
+    """The full locators of a tool hit's compact ``units[]`` (``locator.LOCATOR_KEYS``, the order
+    ``locator.make`` gives), for clients and tests that check them against the store."""
+    return [{'v': hit['locator']['v'], 'doc': hit['locator']['doc'], 'path': hit['locator']['path'],
+             'sha256': hit['locator']['sha256'], 'unit': ref['unit'], 'chars': ref['chars'],
+             'text_sha256': ref['text_sha256']} for ref in hit['units']]
+
+
 def pieces_of(envelope: Mapping) -> list[tuple[dict, str]]:
     """``(locator, text)`` of every piece of document text in a response, in response order: search
     ``hits[*].snippet``; ``get_snippet`` ``context_before``, ``pieces``, ``context_after``. ``units[]``,
@@ -112,8 +136,9 @@ SHRINK_HITS_NOTICE = '응답 크기 상한으로 hit {}개를 뺐습니다 — l
 SHRINK_CONTEXT_NOTICE = '응답 크기 상한으로 문맥 {}단위를 뺐습니다'
 SHRINK_PIECE_NOTICE = '응답 크기 상한으로 조각을 {}자로 줄였습니다'
 SHRINK_ROWS_NOTICE = '응답 크기 상한으로 limit {}으로 줄였습니다; offset으로 이어서 받으세요'
-TRUNCATED_NOTICE = ('잘린 조각이 있습니다(truncated: true, locator의 chars가 잘린 범위) — 이어서 읽으려면 '
-                    'locator의 chars를 바꿔 get_snippet을 다시 부르세요')
+READ_ON = 'locator의 chars를 바꿔'
+TRUNCATED_NOTICE = ('잘린 조각이 있습니다(truncated: true, locator의 chars가 잘린 범위) — 이어 읽으려면 '
+                    f'{READ_ON} get_snippet을 다시 부르세요')
 
 
 def _set_notice(envelope: dict, template: str, value) -> None:
@@ -170,7 +195,7 @@ def shrink_snippet(envelope: dict) -> bool:
         return False
     pieces[longest] = cut
     _set_notice(envelope, SHRINK_PIECE_NOTICE, max(len(piece['text']) for piece in pieces))
-    if TRUNCATED_NOTICE not in envelope['notice']:
+    if not any(READ_ON in line for line in envelope['notice']):  # snippet.notices may have said it already
         envelope['notice'].append(TRUNCATED_NOTICE)
     return True
 
@@ -267,19 +292,20 @@ def _page_error(limit, offset) -> dict | None:
 
 SEMANTIC_NOTE_NOTICE = '의미 검색 사용 불가({}) — 어휘 결과만'
 _NOTE_CODE = re.compile(r'[a-z_]+')
-OLD_VERSION_NOTICE = '이 조각은 옛 버전(seq {})의 것입니다; 현재 버전 id {}'
-DELETED_NOTICE = '이 문서는 삭제됨(현재 버전 없음); 조각은 마지막으로 수집한 버전(seq {})의 것입니다'
 NO_EVENTS_NOTICE = '이 저장소의 과거 scan은 이벤트를 남기지 않았습니다(M3 이전); 다음 scan부터 기록됩니다'
 
 
 def search(home: Path, engine, query: str, *, mode: str = 'hybrid', limit: int = searching.LIMIT_DEFAULT,
                 path_prefix: str | None = None, ext: list[str] | None = None, since: str | None = None,
                 until: str | None = None, collapse_by_document: bool = False) -> dict:
-    """``search`` (design M3 §2.2): ``engine.search(...)`` over ``home``; ``result`` = M2 §5.7 plus
-    ``meta.collapsed/truncated_hits/signals/engine``; ``delivered_sources`` one line per hit snippet.
+    """``search`` (design M3 §2.2): ``engine.search(...)`` over ``home``; ``result`` = M2 §5.7 with compact
+    ``units[]`` (``UNIT_REF_KEYS``, see ``expand_units``) plus ``meta.collapsed/truncated_hits/signals/engine``;
+    ``delivered_sources`` one line per hit snippet.
     Raises ``search.SearchError`` for bad input (``server.handle`` turns it into an error envelope)."""
     result = engine.search(query, mode=mode, limit=limit, path_prefix=path_prefix, ext=ext, since=since, until=until,
                            collapse_by_document=collapse_by_document)
+    for hit in result['hits']:
+        compact_units(hit)
     meta = result['meta']
     meta.setdefault('collapsed', 0)
     meta.setdefault('signals', dict(searching.DEFAULT_SIGNALS))
@@ -321,14 +347,7 @@ def get_snippet(home: Path, *, chunk_id: int | None = None, locator: dict | None
             result = snippet.by_locator(db, locator, context_units=context_units, max_chars=max_chars)
     finally:
         db.close()
-    notice = []
-    version = result['version']
-    if not version['latest']:
-        notice.append(DELETED_NOTICE.format(version['seq']) if version['latest_version_id'] is None
-                      else OLD_VERSION_NOTICE.format(version['seq'], version['latest_version_id']))
-    if any(piece['truncated'] for key in ('context_before', 'pieces', 'context_after') for piece in result[key]):
-        notice.append(TRUNCATED_NOTICE)
-    envelope = ok(result, notice=notice)
+    envelope = ok(result, notice=snippet.notices(result, max_chars))  # old version, deleted, cut pieces
     envelope['delivered_sources'] = delivered(envelope)
     return envelope
 

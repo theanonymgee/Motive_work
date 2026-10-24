@@ -78,11 +78,13 @@ SIGNAL_KEYS = frozenset({'lexical_candidates', 'exact_phrase_hits', 'cosine_top1
 DEFAULT_SIGNALS = {'lexical_candidates': None, 'exact_phrase_hits': None, 'cosine_top1': None, 'cosine_top10': None,
                    'cosine_gap': None, 'low': False}
 # Rules (design M3 §9.3): R1 cosine_top1 < the cosine_top1 threshold, R2 cosine_gap < the gap threshold,
-# R3 no lexical candidate and no exact phrase, R4 = R3 and R1. A rule whose facts are missing (None) is
-# False. R3 needs no threshold; the measured thresholds are in doc/validation/2026-10-24_M3-신호측정_v1.md
-# and replace this default only by decision (design M3 §14.3).
-LOW_SIGNAL_RULES = ('R1', 'R2', 'R3', 'R4')
-LOW_SIGNAL = {'rule': 'R3', 'cosine_top1': None, 'gap': None}
+# R3 no lexical candidate and no exact phrase, R4 = R3 and R1, R5 = R3 or (R1 and no exact phrase): a query
+# found as written is never "low" however far its cosine. A rule whose facts are missing (None) is False
+# (semantic mode has no lexical facts, so R5 is False there). Measured in
+# doc/validation/2026-10-24_M3-신호측정_v1.md; the coordinator adopted R5 with cosine_top1 < 0.49 on the
+# synthetic corpus (to be measured again on real documents in M5).
+LOW_SIGNAL_RULES = ('R1', 'R2', 'R3', 'R4', 'R5')
+LOW_SIGNAL = {'rule': 'R5', 'cosine_top1': 0.49, 'gap': None}
 LOW_SIGNAL_NOTICE = '질의와 가까운 내용이 적습니다(어휘 후보 {lexical}, 코사인 1위 {top1}) — 없는 정보일 수 있음'
 UNAVAILABLE = 'unavailable'     # meta['semantic'] when there is no usable model
 ENGINE_STATUS_KEYS = frozenset({'loaded', 'rows', 'generation', 'data_generation', 'matrix_bytes', 'load_failure',
@@ -277,7 +279,8 @@ def low_signal(signals: Mapping, rule: Mapping | None = None) -> bool:
     r1 = top1 is not None and rule.get('cosine_top1') is not None and top1 < rule['cosine_top1']
     r2 = gap is not None and rule.get('gap') is not None and gap < rule['gap']
     r3 = lexical == 0 and exact == 0
-    return {'R1': r1, 'R2': r2, 'R3': r3, 'R4': r3 and r1}[name]
+    r5 = r3 or (r1 and exact == 0)
+    return {'R1': r1, 'R2': r2, 'R3': r3, 'R4': r3 and r1, 'R5': r5}[name]
 
 
 def signals_of(lexical: int | None, exact: int | None, cosines: Sequence[float],

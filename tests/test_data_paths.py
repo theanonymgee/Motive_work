@@ -292,6 +292,13 @@ def test_virtualization_probe_detects_redirect_into_a_package(tmp_path, monkeypa
 
     monkeypatch.setattr(paths, '_write_marker', redirected_roaming)
     assert paths.virtualization_probe(roaming, env)['redirected_to'] == str(roaming_copy)
+    # inside the packaged app the resolved home is already the package folder (dev PC, 2026-10-24)
+    monkeypatch.setattr(paths, '_write_marker', real)
+    inside = ensure_home(package_home)
+    before = tree(inside)  # holds the copy the fake redirection above left behind
+    assert paths.virtualization_probe(inside, env) == {'checked': True, 'under_appdata': True,
+                                                       'redirected_to': str(inside), 'package': 'Other_pkg'}
+    assert tree(inside) == before  # decided from the path: no marker written
 
 
 def test_virtualization_probe_cleans_its_marker(tmp_path, monkeypatch):
@@ -335,5 +342,5 @@ def test_doctor_reports_app_virtualization(workmcp_home, monkeypatch, capsys, tm
     monkeypatch.setenv('WORKMCP_HOME', str(inside))
     assert cli.main(['doctor']) == 0
     out = capsys.readouterr().out
-    assert 'app virtualization: not redirected' in out
-    assert 'is inside the app package folder' in out and 'Fake_pkg' in out
+    assert f'warning: app virtualization: the data home {inside} lands in package Fake_pkg ({inside})' in out
+    assert 'is inside the app package folder' in out

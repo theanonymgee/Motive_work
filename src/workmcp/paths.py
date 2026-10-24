@@ -187,8 +187,9 @@ def virtualization_probe(home: Path, env: Mapping[str, str]) -> dict:
     outside ``AppData`` is never virtualised: ``checked`` True, nothing redirected. Under ``AppData``
     a marker file is written to ``home/tmp`` and looked up in every
     ``%LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\<Local|Roaming>\\<same relative path>\\tmp``; the
-    package folder that has it is where this process's writes really land. The marker is always
-    removed. A home not created yet (no ``tmp``) or a failing probe is ``checked`` False, never an error.
+    package folder that has it is where this process's writes really land. A home that already lies in
+    ``Packages/<package>/LocalCache`` (what ``validate_home``'s resolve gives inside a packaged app) is
+    reported as redirected into that package without a marker. The marker is always removed. A home not created yet (no ``tmp``) or a failing probe is ``checked`` False, never an error.
     Standard library only (no native calls).
     """
     home = Path(home)
@@ -197,6 +198,11 @@ def virtualization_probe(home: Path, env: Mapping[str, str]) -> dict:
         return {'checked': True, 'under_appdata': False, 'redirected_to': None, 'package': None}
     result = {'checked': False, 'under_appdata': True, 'redirected_to': None, 'package': None}
     packages = _packages_dir(env)
+    if packages is not None and _within(home, packages) and len(home.parts) > len(packages.parts) + 1 \
+            and os.path.normcase(home.parts[len(packages.parts) + 1]) == os.path.normcase('LocalCache'):
+        # The home already names a package folder: inside a packaged app, resolving %LOCALAPPDATA%\...
+        # gives the redirected location itself (seen on the dev PC), so no marker is needed.
+        return {**result, 'checked': True, 'redirected_to': str(home), 'package': home.parts[len(packages.parts)]}
     if packages is None or not (home/'tmp').is_dir():
         return result
     name = f'.virt-probe-{os.getpid()}-{os.urandom(4).hex()}'
@@ -235,7 +241,7 @@ def virtualization_line(home: Path, probe: Mapping) -> str:
         return 'app virtualization: not checked (home under AppData not created yet, or the probe failed)'
     if probe['redirected_to'] is None:
         return 'app virtualization: not redirected'
-    return (f"warning: app virtualization: writes to {home} are redirected into package {probe['package']} "
+    return (f"warning: app virtualization: the data home {home} lands in package {probe['package']} "
             f"({probe['redirected_to']}); clients started outside this app see a different data home - set "
             f'{HOME_ENV} outside AppData (e.g. %USERPROFILE%\\Motive_work) in every client\'s MCP config')
 

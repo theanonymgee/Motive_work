@@ -209,8 +209,10 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
                           collapse_by_document: bool = False, ctx: Context | None = None) -> str:
         """Hybrid (lexical + semantic) search over the collected documents. Returns up to `limit` hits, each
         with a snippet of document text (at most 600 characters) and its exact source locator;
-        delivered_sources lists the source of every snippet in this response. mode: hybrid|lexical|semantic;
-        since/until filter on when a file version was observed, not dates inside documents."""
+        delivered_sources lists the source of every snippet in this response. units[] names the stored units
+        the hit's chunk spans ({unit, chars, text_sha256}; v, doc, path and sha256 are the hit locator's) and
+        carries no text. mode: hybrid|lexical|semantic; since/until filter on when a file version was
+        observed, not dates inside documents."""
         return handle(state, 'search', {'query': query, 'mode': mode, 'limit': limit, 'path_prefix': path_prefix,
                                         'ext': ext, 'since': since, 'until': until,
                                         'collapse_by_document': collapse_by_document}, client_of(ctx))

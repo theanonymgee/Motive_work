@@ -166,7 +166,7 @@ def test_cli_scan_index_then_the_server_tools_answer_with_exact_sources(workmcp_
         assert changes['total'] == listed['result']['total'] > 0
         reader = store.open_read(home)
         try:
-            check_hit_sources(reader, found['result']['hits'])
+            check_hit_sources(reader, [{**h, 'units': tools.expand_units(h)} for h in found['result']['hits']])
             for piece in quoted['result']['context_before'] + quoted['result']['pieces'] + \
                     quoted['result']['context_after']:
                 assert binding.validate_locator(reader, piece['locator'])['text'] == piece['text']

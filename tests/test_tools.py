@@ -1,10 +1,7 @@
 """Tool functions (design M3 §2-§6): envelope helpers, delivered pieces, the size budget, the call-log
 summary, the five tools through ``server.handle`` (the path ``serve`` takes, without stdio), binding
 re-derivation of every delivered piece (§5, D-1..D-5), the size budget per tool (S-1..S-3) and the
-long-lived engine across scans and index runs (E-2, with mutation checks). Synthetic text only.
-
-``get_snippet`` calls ``snippet.by_chunk``/``by_locator`` (stage 1, B): the tests that need them fail
-with ``NotImplementedError`` until B's implementation is in."""
+long-lived engine across scans and index runs (E-2, with mutation checks). Synthetic text only."""
 import hashlib
 import json
 import os
@@ -17,7 +14,8 @@ from fixtures import SENTINEL
 from fixtures import bundle as synthetic_bundle
 from fixtures import corpus as corpus_module
 from test_collect import add_root, rewrite, scan
-from workmcp import binding, collect, config, embedder, index, locator, parsers, paths, search, server, store, tools
+from workmcp import (binding, collect, config, embedder, index, locator, parsers, paths, search, server, snippet,
+                     store, tools)
 
 H = '0' * 64
 DIMS = 64
@@ -241,8 +239,12 @@ def test_search_tool_exposes_m2_contract_plus_signals_and_collapse(state):
         assert set(result['meta']['engine']) == tools.SEARCH_ENGINE_KEYS
         assert result['meta']['truncated_hits'] == 0 and result['meta']['mode'] == mode
         assert 0 < len(result['hits']) <= 5
-        for hit in result['hits']:
+        engine_hits = state.engine.search('합성 프로젝트 주간 회의', mode=mode, limit=5)['hits']  # the M2 result
+        assert [h['chunk_id'] for h in engine_hits] == [h['chunk_id'] for h in result['hits']]
+        for hit, full in zip(result['hits'], engine_hits):
             assert search.HIT_KEYS <= set(hit) <= search.HIT_KEYS | search.HIT_OPTIONAL_KEYS
+            assert all(set(ref) == tools.UNIT_REF_KEYS for ref in hit['units'])
+            assert tools.expand_units(hit) == full['units']           # compact units rebuild the M2 locators
         assert envelope['delivered_sources'] == [locator.display(hit['locator']) for hit in result['hits']]
     collapsed = call(state, 'search', query='합성 프로젝트', mode='hybrid', limit=10, collapse_by_document=True)
     hits = collapsed['result']['hits']
@@ -391,14 +393,14 @@ def test_get_snippet_of_an_old_version_is_returned_with_latest_false(tmp_path):
     version = old['result']['version']
     assert version['id'] == hit['version_id'] and version['latest'] is False
     assert version['latest_version_id'] not in (None, hit['version_id'])
-    assert tools.OLD_VERSION_NOTICE.format(version['seq'], version['latest_version_id']) in old['notice']
+    assert snippet.OLD_VERSION_NOTICE.format(seq=version['seq'], latest=version['latest_version_id']) in old['notice']
     assert old['result']['pieces'][0]['text'] == hit['snippet']
     (folder/'a.txt').unlink()
     rescan(home, root)
     gone = call(state, 'get_snippet', chunk_id=hit['chunk_id'])
     assert gone['ok'] and gone['result']['version']['latest'] is False
     assert gone['result']['version']['latest_version_id'] is None
-    assert tools.DELETED_NOTICE.format(gone['result']['version']['seq']) in gone['notice']
+    assert gone['notice'] == [snippet.DELETED_NOTICE]
 
 
 def test_list_documents_filters_pages_and_indexed_flag(built):
@@ -522,6 +524,9 @@ def check_delivery(state, envelope: dict, reparse: dict | None, sha_of: dict) ->
     db = store.open_read(state.home)
     try:
         ext = {row[0]: row[1] for row in db.execute('SELECT id, ext FROM documents')}
+        for hit in (envelope['result'].get('hits', ()) if envelope['ok'] else ()):
+            for unit in tools.expand_units(hit):                     # units[] carry no text, but bind exactly
+                binding.validate_locator(db, unit)
         for obj, text in found:
             assert binding.validate_locator(db, obj)['text'] == text                      # (b)
             if reparse is not None:                                                         # (c)

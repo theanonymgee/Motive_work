@@ -968,7 +968,15 @@ def test_low_signal_rules():
     facts = {'lexical_candidates': 0, 'exact_phrase_hits': 0, 'cosine_top1': 0.40, 'cosine_top10': 0.35,
              'cosine_gap': 0.05}
     rule = {'cosine_top1': 0.5, 'gap': 0.08}
-    assert [search.low_signal(facts, {**rule, 'rule': r}) for r in search.LOW_SIGNAL_RULES] == [True] * 4
+    assert [search.low_signal(facts, {**rule, 'rule': r}) for r in search.LOW_SIGNAL_RULES] == [True] * 5
+    # R5 (adopted): R3, or a low cosine when no candidate holds the whole query
+    r5 = {**rule, 'rule': 'R5'}
+    assert search.low_signal({**facts, 'lexical_candidates': 3}, r5) is True
+    assert search.low_signal({**facts, 'lexical_candidates': 3, 'exact_phrase_hits': 1}, r5) is False
+    assert search.low_signal({**facts, 'lexical_candidates': 3, 'cosine_top1': 0.6}, r5) is False
+    assert search.low_signal({**facts, 'cosine_top1': 0.6}, r5) is True          # R3 alone
+    assert search.low_signal({**facts, 'lexical_candidates': None, 'exact_phrase_hits': None}, r5) is False
+    assert search.LOW_SIGNAL == {'rule': 'R5', 'cosine_top1': 0.49, 'gap': None}
     assert search.low_signal({**facts, 'lexical_candidates': 3}, {**rule, 'rule': 'R3'}) is False
     assert search.low_signal({**facts, 'lexical_candidates': 3}, {**rule, 'rule': 'R4'}) is False
     assert search.low_signal({**facts, 'cosine_top1': 0.6}, {**rule, 'rule': 'R4'}) is False
@@ -999,7 +1007,7 @@ def test_low_signal_fires_on_absent_query_fixture(engine, corpus, monkeypatch):
         if signals['low']:
             fired += 1
             assert result['hits'] and any(line.startswith('질의와 가까운 내용이 적습니다') for line in result['notice'])
-    assert fired > 0                                   # the default rule (R3) fires on some absent queries
+    assert fired > 0                                   # the default rule (R5) fires on some absent queries
     phrase = engine.search('PRJ-012 사양서 개정판')
     assert phrase['meta']['signals']['low'] is False and phrase['notice'] == []
     # another rule from the constant: every hybrid result is judged by it
