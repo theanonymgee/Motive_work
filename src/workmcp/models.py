@@ -10,8 +10,11 @@ only after its hash matches. Files are stored flat under ``<home>/models/<name>/
 so ONNX external data resolves; downloads go to ``<home>/tmp/*.partial`` and are moved in
 only after size and hash match.
 
-M0 scope: manifest and verification. The download path is a skeleton that is not run or
-tested until M2 (offline bundle import ``--from`` is added then).
+M2: ``import_from`` copies the pinned files from a folder already on the PC (an earlier
+download or an offline bundle) with the same ``.partial`` -> SHA-256 -> ``os.replace`` rule; it
+calls no network function. ``workmcp fetch-model NAME --from FOLDER`` and ``workmcp verify-model``
+reach this module only through ``cli_fetch_model``/``cli_verify_model``. The download path stays a
+skeleton that is neither run nor tested.
 """
 from __future__ import annotations
 
@@ -121,6 +124,38 @@ def verify(name: str, home: Path) -> dict[str, str]:
         else:
             report[local_name(spec)] = 'ok' if sha256_file(path) == spec['sha256'] else 'sha256_mismatch'
     return report
+
+
+def available(name: str, home: Path) -> bool:
+    """Files present with pinned sizes (``quick_status``; no hashing)."""
+    return quick_status(name, home)['available']
+
+
+def import_from(name: str, source: Path, home: Path, *, log=print) -> dict[str, str]:
+    """Copy the manifest files of ``name`` from the absolute folder ``source`` into the data home.
+
+    Per file (design M2 §3.3): read ``source/<file name>`` (flat) or ``source/<manifest path>``
+    (repository layout); ``missing_in_source`` / ``size_mismatch_in_source`` without copying;
+    ``already_verified`` when the target already matches; else copy in 1 MiB blocks to
+    ``<home>/tmp/<name>-<file>.partial`` hashing the same blocks, then ``os.replace`` on a SHA-256
+    match (``ok``) or delete the partial (``sha256_mismatch_in_source``). ``source`` is only read.
+    Returns ``{file name: status}``. Calls no network function.
+    """
+    raise NotImplementedError('models.import_from: M2 stage 1')
+
+
+def cli_fetch_model(args, home: Path) -> int:
+    """``workmcp fetch-model NAME --from FOLDER`` body (the CLI checks ``--from`` and the data home):
+    ``import_from`` and one line per file; exit 0 when every file is ``ok``/``already_verified``."""
+    raise NotImplementedError('models.cli_fetch_model: M2 stage 1')
+
+
+def cli_verify_model(args, home: Path) -> int:
+    """``workmcp verify-model [NAME]`` body: one ``file: status`` line per file; 0 when all ``ok``."""
+    report = verify(args.name, home)
+    for filename, status in report.items():
+        print(f'{args.name}/{filename}: {status}')
+    return 0 if all(value == 'ok' for value in report.values()) else 1
 
 
 def require_verified(name: str, home: Path) -> Path:

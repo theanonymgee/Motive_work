@@ -1,6 +1,6 @@
 """Test-only wrapper: install an audit hook, then run the package (design M0 §7.2, M1 §4.3).
 
-Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT]``
+Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT|index ROOT|search ROOT|embed]``
 
 - ``serve`` (default): ``workmcp.server.main()``; stdin/stdout are the MCP stdio transport.
 - ``imports``: import every package module, build the server and call ``tools.status``.
@@ -13,6 +13,15 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve|imports|probe|scan ROOT
   Settings come from ``config.toml`` in the data home (the test sets a small ``max_file_mb`` so a
   large file goes through ``stream_sha256`` under the hook too).
   The report has counts only (per status/code and per parser), never document text.
+- ``index ROOT`` (M2): one scan of ROOT, then ``index.run_index`` with ``HashEmbedder(1024)`` twice (the
+  second must chunk and embed nothing). Source opens during the index phase are counted (must be 0:
+  indexing reads the store, never the originals).
+- ``search ROOT`` (M2): as ``index``, then ``search.Engine`` (``HashEmbedder`` factory) over six
+  queries in each mode and ``maybe_unload``; every ``sqlite3.connect`` of the search phase is
+  recorded (all must be ``mode=ro``) and source opens are counted (must be 0).
+- ``embed`` (M2): the real model from the data home, only when it is there (``mode_embed``, filled in
+  stage 1); otherwise ``skipped: model_missing``.
+  A mode whose package function is still a stage-0 stub reports ``skipped`` (the test skips).
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
 ::1), no name resolution and no process creation. Loopback is allowed only because the
@@ -166,6 +175,8 @@ def judge_source_write(event: str, args: tuple, root) -> str | None:
 
 EVENTS: list[dict] = []
 SOURCE_ROOT: list[str] = []  # set by scan/probe; empty means no source-write judgement
+CONNECTS: list[str] = []     # sqlite3.connect targets while RECORD_CONNECTS holds an entry (search phase)
+RECORD_CONNECTS: list[bool] = []
 
 
 def _detail(args) -> str:
@@ -176,6 +187,8 @@ def _detail(args) -> str:
 
 
 def hook(event, args):
+    if RECORD_CONNECTS and event == 'sqlite3.connect':
+        CONNECTS.append(str(args[0]) if args else '')
     if SOURCE_ROOT and is_source_event(event):
         root = SOURCE_ROOT[0]
         reason = judge_source_write(event, args, root)
@@ -307,6 +320,102 @@ def scan(root: Path) -> dict:
             'verify': {'ok': report['ok'], 'versions': report['versions'], 'units': report['units']}}
 
 
+NOT_IMPLEMENTED = 'not_implemented (M2 stage 1)'
+QUERY_COUNT = 6
+
+
+def _collect_once(root: Path):
+    """One scan of ``root`` into the data home (store and lock writes are outside ``root``)."""
+    from workmcp import collect, config, paths, store
+    home = paths.ensure_home(paths.resolve_home())
+    path, warnings = config.validate_root(str(root), home, paths.find_repo_root())
+    spec = config.RootSpec(path, str(root), warnings=warnings)
+    lock, _ = store.acquire_scan_lock(home)
+    try:
+        db = store.open_home(home)
+        try:
+            ids = config.sync_roots(db, [spec], from_config=False)
+            total = collect.scan(db, [(ids[spec.key], spec)], config.load(home).scan, partial=True)['total']
+        finally:
+            db.close()
+    finally:
+        store.release_scan_lock(lock)
+    return home, total
+
+
+def _source_opens(since: int) -> int:
+    return sum(1 for e in EVENTS[since:] if e.get('source'))
+
+
+def index(root: Path) -> dict:
+    """``_collect_once`` -> ``index.run_index(HashEmbedder(1024))`` twice; counts only."""
+    from workmcp import embedder, index as index_module, store
+    home, scanned = _collect_once(root)
+    mark = len(EVENTS)
+    lock, _ = store.acquire_lock(home, store.INDEX_LOCK_NAME)
+    try:
+        db = store.open_home(home)
+        try:
+            vectors = embedder.HashEmbedder(1024)
+            try:
+                first = index_module.run_index(db, home, embedder=vectors)
+            except NotImplementedError:
+                return {'skipped': NOT_IMPLEMENTED, 'scanned': scanned}
+            second = index_module.run_index(db, home, embedder=vectors)
+            chunks = db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+            fts_rows = store.fts_rows(db) if store.fts_available(db) else None
+        finally:
+            db.close()
+    finally:
+        store.release_lock(lock)
+    keys = ('chunked', 'embedded', 'reused_chunks', 'reused_vectors', 'dropped_versions', 'chunks_total')
+    return {'scanned': scanned, 'first': {k: first[k] for k in keys}, 'second': {k: second[k] for k in keys},
+            'chunks': chunks, 'fts_rows': fts_rows, 'source_opens_during_index': _source_opens(mark)}
+
+
+def search(root: Path) -> dict:
+    """``index`` then ``search.Engine`` with a ``HashEmbedder`` factory: 6 queries x 3 modes; counts only."""
+    from fixtures import LINES_EN, LINES_KO
+    from workmcp import config, embedder, paths, search as search_module
+    report = index(root)
+    if report.get('skipped'):
+        return report
+    home = paths.resolve_home()
+    queries = [line[:12] for line in (*LINES_KO[:3], *LINES_EN[:3])][:QUERY_COUNT]
+    engine = search_module.Engine(home, config.SearchSettings(), embedder_factory=lambda: embedder.HashEmbedder(1024))
+    mark = len(EVENTS)
+    RECORD_CONNECTS.append(True)
+    hits = 0
+    try:
+        for query in queries:
+            for mode in search_module.MODES:
+                hits += len(engine.search(query, mode=mode)['hits'])
+        released = engine.maybe_unload(now=float('inf'))
+    except NotImplementedError:
+        return {**report, 'skipped': NOT_IMPLEMENTED}
+    finally:
+        RECORD_CONNECTS.clear()
+    return {**report, 'hits': hits, 'released': released, 'connects': list(CONNECTS),
+            'source_opens_during_search': _source_opens(mark)}
+
+
+def mode_embed(home: Path) -> dict:
+    """Stage 1 (B): load ``OnnxEmbedder(models.DEFAULT_MODEL, home)``, embed three texts and one query;
+    return ``{'providers': <session providers>, 'dims': ..., 'texts': 3}`` (counts only, no text)."""
+    raise NotImplementedError('mode_embed: M2 stage 1')
+
+
+def embed() -> dict:
+    from workmcp import models, paths
+    home = paths.ensure_home(paths.resolve_home())
+    if not models.available(models.DEFAULT_MODEL, home):
+        return {'skipped': 'model_missing'}
+    try:
+        return mode_embed(home)
+    except NotImplementedError:
+        return {'skipped': NOT_IMPLEMENTED}
+
+
 def main(argv) -> int:
     log, mode = Path(argv[1]), (argv[2] if len(argv) > 2 else 'serve')
     sys.addaudithook(hook)
@@ -321,10 +430,13 @@ def main(argv) -> int:
         elif mode == 'probe':
             report.update(probe())
             code = 0
-        elif mode == 'scan':
+        elif mode in ('scan', 'index', 'search'):
             root = Path(argv[3]).resolve()
             SOURCE_ROOT.append(str(root))
-            report.update(scan(root))
+            report.update({'scan': scan, 'index': index, 'search': search}[mode](root))
+            code = 0
+        elif mode == 'embed':
+            report.update(embed())
             code = 0
         else:
             raise SystemExit(f'unknown mode {mode!r}')

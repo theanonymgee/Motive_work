@@ -9,8 +9,11 @@ description = "Personal local work-knowledge MCP server (stdio, local-only stora
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mcp==2.2.0",
+    "numpy==2.5.4",
     "olefile==0.47",
+    "onnxruntime==1.31.0",
     "pypdf==6.10.0",
+    "tokenizers==0.23.3",
 ]
 
 [project.scripts]

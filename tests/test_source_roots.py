@@ -170,6 +170,39 @@ def test_bad_config_is_refused(home, text):
         config.load(home)
 
 
+# [index] and [search] (design M2 §1.3)
+def test_index_and_search_settings_default_and_are_read(home):
+    cfg = config.load(home)
+    assert cfg.index == config.IndexSettings() and cfg.search == config.SearchSettings()
+    assert (cfg.index.model, cfg.index.embed_batch, cfg.index.commit_every, cfg.index.threads) == ('bge-m3', 8, 64, 0)
+    assert (cfg.search.lexical_candidates, cfg.search.semantic_candidates, cfg.search.max_vectors_in_memory,
+            cfg.search.threads, cfg.search.model_idle_seconds) == (200, 200, 250_000, 0, 600)
+    write_config(home, '[index]\nmodel = "none"\nembed_batch = 4\ncommit_every = 16\nthreads = 2\n\n'
+                       '[search]\nlexical_candidates = 50\nsemantic_candidates = 60\nmax_vectors_in_memory = 10\n'
+                       'threads = 3\nmodel_idle_seconds = 120\n')
+    cfg = config.load(home)
+    assert cfg.index == config.IndexSettings('none', 4, 16, 2)
+    assert cfg.search == config.SearchSettings(50, 60, 10, 3, 120)
+
+
+def test_server_threads_default_is_half_the_cpus():
+    assert config.SearchSettings().effective_threads(16) == 8
+    assert config.SearchSettings().effective_threads(1) == 1
+    assert config.SearchSettings(threads=3).effective_threads(16) == 3
+    assert config.SearchSettings().effective_threads() >= 1
+
+
+@pytest.mark.parametrize('text', [
+    '[index]\nmodel = "hash-ngram-test-only"\n', '[index]\nmodel = "multilingual-e5-base-int8"\n',
+    '[index]\nembed_batch = 0\n', '[index]\nthreads = -1\n', '[index]\nbatch = 8\n', 'index = 1\n',
+    '[search]\nmax_vectors_in_memory = 0\n', '[search]\nthreads = "4"\n', '[search]\nlike_max_chunks = 5\n',
+    '[search]\nmodel_idle_seconds = 0\n'])
+def test_bad_index_or_search_config_is_refused(home, text):
+    write_config(home, text)
+    with pytest.raises(config.ConfigError):
+        config.load(home)
+
+
 # source_roots mirror (design §2.2)
 def spec(path):
     return config.RootSpec(Path(path), str(path))

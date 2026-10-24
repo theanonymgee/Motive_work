@@ -220,9 +220,7 @@ class _Scan:
             counts['new_versions'] += 1
         else:
             version_id = fill
-            self.db.execute('DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE version_id=?)',
-                            (fill,))
-            self.db.execute('DELETE FROM chunks WHERE version_id=?', (fill,))
+            store.drop_chunks(self.db, fill)  # with their FTS rows; vectors are content-addressed and stay
             self.db.execute('DELETE FROM units WHERE version_id=?', (fill,))
             self.db.execute(
                 'UPDATE versions SET sha256=?, size=?, mtime_ns=?, parser=?, parser_version=?, encoding=?, '

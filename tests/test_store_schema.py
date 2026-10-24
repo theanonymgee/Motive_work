@@ -1,4 +1,5 @@
-"""Empty schema v1, migration ledger and append-only triggers (design §3.2). Synthetic rows only."""
+"""Empty schema v1, migration ledger and append-only triggers (design §3.2), the M2 schema edits and the
+chunk/FTS functions (design M2 §1.4, §4.3). Synthetic rows only."""
 import sqlite3
 
 import pytest
@@ -6,11 +7,11 @@ import pytest
 from workmcp import paths, store, tools
 
 TABLES = {'schema_migrations', 'source_roots', 'documents', 'versions', 'units', 'chunks', 'chunk_vectors',
-          'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans'}
+          'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans', 'meta', 'index_runs'}
 TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_status_guard', 'assertions_no_delete',
             'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace',
             'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq'}
-INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunk_vectors_text'}
+INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunks_text'}
 H = '0' * 64
 NOW = '2026-10-23T09:00:00+09:00'
 LATER = '2026-10-23T10:00:00+09:00'
@@ -466,3 +467,168 @@ def test_versions_unique_keys_are_id_and_document_seq_only(db):
     unique = [r[1] for r in db.execute('PRAGMA index_list(versions)') if r[2]]
     assert len(unique) == 1
     assert [r[2] for r in db.execute(f'PRAGMA index_info({unique[0]})')] == ['document_id', 'seq']
+
+
+# M2 schema edits and the chunk/FTS functions (design M2 §1.4, §4.3)
+def chunk_spec(ordinal, text, unit_first=1, unit_last=1):
+    from workmcp import chunks
+    return chunks.ChunkSpec(ordinal, unit_first, unit_last, 0, len(text), text)
+
+
+def eligible_version(db, doc, seq, sha256, *, status='ok', units=1):
+    return db.execute("INSERT INTO versions(document_id, seq, sha256, size, mtime_ns, observed_at, parse_status, "
+                      "unit_count) VALUES(?, ?, ?, 1, 1, ?, ?, ?)", (doc, seq, sha256, NOW, status, units)).lastrowid
+
+
+def fts_match(db, phrase):
+    return [r[0] for r in db.execute('SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rowid',
+                                     (f'"{phrase}"',))]
+
+
+def test_schema_v1_has_content_addressed_vectors_meta_and_index_runs(db):
+    assert columns(db, 'chunk_vectors') == ['model_key', 'text_sha256', 'dims', 'vector', 'embedded_at']
+    primary = sorted((r[5], r[1]) for r in db.execute('PRAGMA table_info(chunk_vectors)') if r[5])
+    assert [name for _, name in primary] == ['model_key', 'text_sha256']
+    assert db.execute('PRAGMA foreign_key_list(chunk_vectors)').fetchall() == []
+    assert [r[2] for r in db.execute('PRAGMA index_info(chunks_text)')] == ['text_sha256']
+    assert columns(db, 'meta') == ['key', 'value', 'updated_at']
+    assert columns(db, 'index_runs') == ['id', 'started_at', 'finished_at', 'status', 'model_key', 'chunk_version',
+                                         'counts_json', 'note']
+    run = db.execute("INSERT INTO index_runs(started_at, status, chunk_version) VALUES(?, 'running', 'v')",
+                     (NOW,)).lastrowid
+    db.execute("UPDATE index_runs SET status='done', finished_at=? WHERE id=?", (LATER, run))
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO index_runs(started_at, status, chunk_version) VALUES(?, 'finished', 'v')", (NOW,))
+    vector = (b'\0' * 16, NOW)
+    db.execute("INSERT INTO chunk_vectors VALUES('m', ?, 4, ?, ?)", (H, *vector))
+    with pytest.raises(sqlite3.IntegrityError):  # one row per (model_key, text_sha256)
+        db.execute("INSERT INTO chunk_vectors VALUES('m', ?, 4, ?, ?)", (H, *vector))
+    db.execute("INSERT INTO chunk_vectors VALUES('other', ?, 4, ?, ?)", (H, *vector))
+
+
+def test_evidence_chunk_id_has_no_foreign_key(db):
+    assert {r[2] for r in db.execute('PRAGMA foreign_key_list(evidence)')} == {'assertions', 'versions'}
+    version = add_version(db, add_document(db), 1, 'a' * 64)
+    assertion = insert_assertion(db)
+    db.execute("INSERT INTO evidence(assertion_id, version_id, chunk_id, locator_json, quote, quote_sha256) "
+               "VALUES(?, ?, 999, '{}', '합성 인용', ?)", (assertion, version, H))  # no such chunk: still stored
+    assert db.execute('SELECT chunk_id FROM evidence').fetchone() == (999,)
+
+
+@pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
+def test_insert_and_drop_chunks_keep_fts_in_sync(db):
+    doc = add_document(db)
+    first, second = eligible_version(db, doc, 1, 'a' * 64), eligible_version(db, doc, 2, 'b' * 64)
+    assert store.insert_chunks(db, first, 'cv1', [chunk_spec(1, '합성자료 회의록 첫째'), chunk_spec(2, '합성자료 견적서 둘째')]) == 2
+    assert store.insert_chunks(db, second, 'cv1', copy_from=first) == 2
+    assert store.insert_chunks(db, first, 'cv0', [chunk_spec(1, '옛 규칙 회의록')]) == 1
+    assert len(fts_match(db, '회의록')) == 3 and store.fts_status(db)['consistent']
+    row = db.execute("SELECT text, text_sha256 FROM chunks WHERE version_id=? AND ordinal=2", (second,)).fetchone()
+    assert row == ('합성자료 견적서 둘째', chunk_spec(2, '합성자료 견적서 둘째').text_sha256())
+    with pytest.raises(ValueError):
+        store.insert_chunks(db, first, 'cv1', [chunk_spec(1, '두 번')])
+    with pytest.raises(ValueError):
+        store.insert_chunks(db, first, 'cv2', [chunk_spec(1, 'x')], copy_from=second)
+    db.execute("INSERT INTO chunk_vectors VALUES('m', ?, 4, ?, ?)", (row[1], b'\0' * 16, NOW))
+    assert store.drop_chunks(db, first, keep='cv1') == 1  # only the other chunk version
+    assert len(fts_match(db, '회의록')) == 2 and fts_match(db, '옛 규칙') == []
+    assert store.drop_chunks(db, first) == 2
+    assert store.drop_chunks(db, first) == 0
+    remaining = [r[0] for r in db.execute('SELECT id FROM chunks ORDER BY id')]
+    assert fts_match(db, '합성자료') == remaining and len(remaining) == 2
+    status = store.fts_status(db)
+    assert (status['rows'], status['chunks'], status['consistent']) == (2, 2, True)
+    assert db.execute('SELECT COUNT(*) FROM chunk_vectors').fetchone()[0] == 1  # vectors are not touched
+    db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")  # raises if FTS and chunks disagree
+
+
+@pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
+def test_fts_status_reports_mismatch_and_rebuild_fixes_it(db, monkeypatch):
+    version = eligible_version(db, add_document(db), 1, 'a' * 64)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'fts5_available', lambda: False)  # written by a Python without FTS5
+        store.insert_chunks(db, version, 'cv1', [chunk_spec(1, '합성자료 회의록'), chunk_spec(2, '합성자료 견적서')])
+    status = store.fts_status(db)
+    assert (status['available'], status['rows'], status['chunks'], status['consistent']) == (True, 0, 2, False)
+    assert store.meta_get(db, 'fts_rows') is None
+    assert store.rebuild_fts(db) == 2
+    status = store.fts_status(db)
+    assert status['consistent'] and status['synced_at'] and store.meta_get(db, 'fts_rows') == '2'
+    assert len(fts_match(db, '합성자료')) == 2
+
+
+def test_fts_absent_python_still_opens_and_indexes(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, 'fts5_available', lambda: False)
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    db = store.open_home(home)
+    try:
+        assert 'chunks_fts' not in names(db, 'table') and not store.fts_available(db)
+        version = eligible_version(db, add_document(db), 1, 'a' * 64)
+        assert store.insert_chunks(db, version, 'cv1', [chunk_spec(1, '합성 회의록')]) == 1
+        assert store.fts_status(db) == {'available': False, 'rows': None, 'chunks': 1, 'synced_at': None,
+                                        'consistent': False}
+        assert store.rebuild_fts(db) == -1
+        assert store.drop_chunks(db, version) == 1
+    finally:
+        db.close()
+
+
+def test_meta_values_are_set_and_replaced(db):
+    assert store.meta_get(db, 'index_generation') is None
+    assert store.meta_get(db, 'index_generation', '0') == '0'
+    store.meta_set(db, 'index_generation', 1)
+    store.meta_set(db, 'index_generation', '2')
+    assert store.meta_get(db, 'index_generation') == '2'
+    assert db.execute('SELECT COUNT(*) FROM meta').fetchone()[0] == 1
+
+
+def test_latest_chunks_sql_selects_latest_active_ok_versions_only(db):
+    doc = add_document(db)
+    old = eligible_version(db, doc, 1, 'a' * 64)
+    latest = eligible_version(db, doc, 2, 'b' * 64)
+    db.execute('UPDATE versions SET superseded_at=? WHERE id=?', (LATER, old))
+    other = db.execute(r"INSERT INTO documents(root_id, path, path_key, ext, status, first_seen_at, last_seen_at) "
+                       r"SELECT root_id, 'C:\synthetic\b.txt', 'c:\synthetic\b.txt', '.txt', 'deleted', ?, ? "
+                       r"FROM documents", (NOW, NOW)).lastrowid
+    gone = eligible_version(db, other, 1, 'c' * 64)
+    third = db.execute(r"INSERT INTO documents(root_id, path, path_key, ext, status, first_seen_at, last_seen_at) "
+                       r"SELECT root_id, 'C:\synthetic\c.txt', 'c:\synthetic\c.txt', '.txt', 'active', ? , ? "
+                       r"FROM documents LIMIT 1", (NOW, NOW)).lastrowid
+    failed = eligible_version(db, third, 1, 'd' * 64, status='failed')
+    empty_doc = db.execute(r"INSERT INTO documents(root_id, path, path_key, ext, status, first_seen_at, last_seen_at) "
+                           r"SELECT root_id, 'C:\synthetic\d.txt', 'c:\synthetic\d.txt', '.txt', 'active', ? , ? "
+                           r"FROM documents LIMIT 1", (NOW, NOW)).lastrowid
+    empty = eligible_version(db, empty_doc, 1, 'e' * 64, units=0)
+    for version in (old, latest, gone, failed, empty):
+        store.insert_chunks(db, version, 'cv1', [chunk_spec(1, f'합성 청크 {version}')])
+    assert [r[0] for r in db.execute(f'SELECT v.id FROM {store.eligible_versions_sql()} ORDER BY v.id')] == [latest]
+    rows = db.execute(f'SELECT c.version_id FROM {store.latest_chunks_sql()} AND c.chunk_version = ?', ('cv1',))
+    assert [r[0] for r in rows] == [latest]
+
+
+def test_index_lock_is_separate_from_the_scan_lock(tmp_path):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    scan_lock, _ = store.acquire_scan_lock(home)
+    index_lock, warning = store.acquire_lock(home, store.INDEX_LOCK_NAME)
+    assert warning is None and index_lock == store.lock_path(home, 'index.lock') != scan_lock
+    with pytest.raises(store.Locked, match='another index is running') as refused:
+        store.acquire_lock(home, store.INDEX_LOCK_NAME)
+    assert not isinstance(refused.value, store.ScanLocked)
+    with pytest.raises(store.ScanLocked, match='another scan is running'):
+        store.acquire_scan_lock(home)
+    store.release_lock(index_lock)
+    store.release_scan_lock(scan_lock)
+    assert not index_lock.exists() and not scan_lock.exists()
+
+
+@pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
+def test_drop_chunks_removes_only_the_rows_the_fts_index_holds(db, monkeypatch):
+    doc = add_document(db)
+    unindexed, indexed = eligible_version(db, doc, 1, 'a' * 64), eligible_version(db, doc, 2, 'b' * 64)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'fts5_available', lambda: False)
+        store.insert_chunks(db, unindexed, 'cv1', [chunk_spec(1, '합성자료 색인 밖')])
+    store.insert_chunks(db, indexed, 'cv1', [chunk_spec(1, '합성자료 색인 안')])
+    assert store.drop_chunks(db, unindexed) == 1
+    db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+    assert store.fts_status(db)['consistent'] and len(fts_match(db, '합성자료')) == 1

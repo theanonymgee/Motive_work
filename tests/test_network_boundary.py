@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 import _audited_server
+from fixtures import bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT/'src'/'workmcp'
@@ -50,8 +51,17 @@ MODULE_IMPORTS = {
     'parsers/eml.py': frozenset({'email.policy', 'email.parser.BytesParser', 'html.parser.HTMLParser'}),
     'parsers/pdf.py': frozenset({'logging', 'pypdf.PdfReader', 'pypdf.errors.PdfReadError', 'pypdf.errors.LimitReachedError'}),
     'parsers/hwp.py': frozenset({'struct', 'zlib', 'olefile'}),
+    # M2 (design M2 §7.1): numpy at module level for the embedder, index and search; the search
+    # engine's clock and model release also need time and gc. Exact import forms:
+    # ``import numpy as np``, ``import onnxruntime as ort``, ``from tokenizers import Tokenizer``.
+    'embedder.py': frozenset({'numpy'}),
+    'index.py': frozenset({'numpy'}),
+    'search.py': frozenset({'numpy', 'time', 'gc'}),
 }
-FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'})}  # inside function bodies only
+# Inside function bodies only: the explicit model download, and the ONNX runtime and tokenizer
+# loaded in ``OnnxEmbedder.__init__`` (their DLLs never load on import, status or lexical search).
+FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'}),
+                    'embedder.py': frozenset({'onnxruntime', 'tokenizers.Tokenizer'})}
 
 MODELS_DOTTED = 'workmcp.models'
 BANNED_NAMES = frozenset({'exec', 'eval', 'compile', '__import__', '__builtins__', 'globals', 'locals', 'vars',
@@ -68,6 +78,11 @@ NETWORK_SUBMODULES = (('logging', 'handlers'), ('logging', 'config'))
 PROCESS_POOLS = frozenset({'ProcessPoolExecutor'})
 GUARDED_MODULES = ('os', 'sys')  # may not be passed around or rebound (aliasing hides later calls)
 NETWORK_CLIENT_PACKAGES = {'httpx', 'httpx2', 'requests', 'aiohttp', 'huggingface_hub', 'urllib3'}
+# Hub download APIs, banned by name whatever they are called on (design M2 §7.1): tokenizers'
+# ``Tokenizer.from_pretrained`` and huggingface_hub's helpers fetch files over the network.
+HUB_DOWNLOADS = frozenset({'from_pretrained', 'hf_hub_download', 'snapshot_download'})
+# Heavy runtimes the import audit must not see loaded (lazy import, design M2 §7.2).
+LAZY_RUNTIMES = ('onnxruntime', 'tokenizers', 'huggingface_hub')
 
 
 def package_sources():
@@ -180,6 +195,8 @@ def banned_qualified(dotted: str) -> str | None:
         return f'namespace escape {dotted}'
     if parts[-1] in NON_STDIO_RUNNERS:
         return f'non-stdio transport {dotted}'
+    if parts[-1] in HUB_DOWNLOADS:
+        return f'hub download API {dotted}'
     return None
 
 
@@ -224,6 +241,8 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
         elif isinstance(node, ast.Name):
             if node.id in BANNED_NAMES:
                 found.append(f'banned builtin {node.id}')
+            if node.id in HUB_DOWNLOADS:
+                found.append(f'hub download API {node.id}')
             if node.id in {'getattr', 'setattr'} and id(node) not in call_funcs:
                 found.append(f'{node.id} used as a value')
             bare = not (isinstance(parent, ast.Attribute) and parent.value is node)
@@ -235,7 +254,7 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
             dotted = qualify(node, bound)
             if dotted and (reason := banned_qualified(dotted)):
                 found.append(reason)
-            elif node.attr in DYNAMIC_LOADERS | ESCAPE_ATTRS | NON_STDIO_RUNNERS:
+            elif node.attr in DYNAMIC_LOADERS | ESCAPE_ATTRS | NON_STDIO_RUNNERS | HUB_DOWNLOADS:
                 found.append(f'banned attribute {node.attr}')
             root = node
             while isinstance(root, ast.Attribute):
@@ -302,7 +321,7 @@ def test_package_has_sources():
         '__init__.py', '__main__.py', 'cli.py', 'paths.py', 'store.py', 'locator.py', 'models.py', 'tools.py',
         'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
         'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py',
-        'config.py', 'collect.py', 'binding.py'}
+        'config.py', 'collect.py', 'binding.py', 'chunks.py', 'embedder.py', 'index.py', 'search.py'}
 
 
 def test_package_has_no_importable_file_other_than_py():
@@ -331,10 +350,12 @@ def test_allowlists_match_the_sources_exactly():
     common_used = {e for imports in used.values() for dotted, _, _ in imports for e in COMMON_IMPORTS if covered(dotted, {e})}
     assert common_used == COMMON_IMPORTS
     for module, extra in MODULE_IMPORTS.items():
-        names = {dotted for dotted, _, _ in used[module] if not covered(dotted, COMMON_IMPORTS)}
+        names = {dotted for dotted, _, in_function in used[module] if not covered(dotted, COMMON_IMPORTS)
+                 and not (in_function and covered(dotted, FUNCTION_IMPORTS.get(module, frozenset())))}
         assert names == extra
     for module, extra in FUNCTION_IMPORTS.items():
-        names = {dotted for dotted, _, in_function in used[module] if not covered(dotted, COMMON_IMPORTS)}
+        module_level = COMMON_IMPORTS | MODULE_IMPORTS.get(module, frozenset())
+        names = {dotted for dotted, _, _ in used[module] if not covered(dotted, module_level)}
         assert names == extra
         assert all(in_function for dotted, _, in_function in used[module] if covered(dotted, extra))
     special = {e for extras in (*MODULE_IMPORTS.values(), *FUNCTION_IMPORTS.values()) for e in extras}
@@ -351,7 +372,8 @@ def test_models_network_functions_are_transitive():
               'def verify(n):\n    return n\n')
     assert network_functions(source) == {'download', 'fetch', 'main'}
     assert {'download_file', 'fetch', 'main'} <= models_network()
-    assert not models_network() & {'entry', 'verify', 'quick_status', 'identity', 'sha256_file', 'require_verified'}
+    assert not models_network() & {'entry', 'verify', 'quick_status', 'identity', 'sha256_file', 'require_verified',
+                                   'import_from', 'available', 'cli_fetch_model', 'cli_verify_model'}  # N-2
 
 
 # 3 Positive controls carried over from the first M0 version (checked as an ordinary module).
@@ -476,6 +498,52 @@ THROUGH_OTHER_MODULES = [
 ]
 
 
+# M2 (design M2 §7.1): the runtimes only inside embedder functions, no hub client, no hub download API.
+M2_BYPASSES = [
+    ('search.py', 'import onnxruntime'),
+    ('search.py', 'def f():\n    import onnxruntime as ort'),
+    ('index.py', 'from tokenizers import Tokenizer'),
+    ('embedder.py', 'from onnxruntime import InferenceSession'),
+    ('embedder.py', 'import onnxruntime as ort'),
+    ('embedder.py', 'from tokenizers import Tokenizer'),
+    ('embedder.py', 'import huggingface_hub'),
+    ('index.py', 'def f():\n    import huggingface_hub'),
+    ('search.py', 'from huggingface_hub import hf_hub_download'),
+    ('embedder.py', 'def f():\n    from tokenizers import Tokenizer\n    return Tokenizer.from_pretrained("x")'),
+    ('embedder.py', 'tokenizer = Tokenizer.from_pretrained("x")'),
+    ('index.py', 'def f(t):\n    return t.from_pretrained("x")'),
+    ('search.py', 'hf_hub_download("repo", "file")'),
+    ('search.py', 'snapshot_download("repo")'),
+    ('embedder.py', 'def f():\n    from tokenizers import Tokenizer\n    getattr(Tokenizer, "from_pretrained")("x")'),
+    ('chunks.py', 'import numpy as np'),
+    ('binding.py', 'import numpy'),
+    ('collect.py', 'import numpy as np'),
+    ('cli.py', 'import numpy as np'),
+    ('tools.py', 'import numpy'),
+    ('models.py', 'import numpy'),
+    ('index.py', 'import time\nimport gc'),
+]
+
+
+@pytest.mark.parametrize('module, snippet', M2_BYPASSES)
+def test_checks_flag_m2_runtime_and_hub_snippets(module, snippet):
+    assert violations(module, snippet, {'fetch', 'download_file', 'main'})
+
+
+def test_m2_runtime_imports_are_allowed_in_their_functions_only():
+    clean = ('import numpy as np\n'
+             'def load(folder):\n'
+             '    import onnxruntime as ort\n'
+             '    from tokenizers import Tokenizer\n'
+             '    tokenizer = Tokenizer.from_file(str(folder))\n'
+             '    options = ort.SessionOptions()\n'
+             '    return ort.InferenceSession("m.onnx", options, providers=["CPUExecutionProvider"]), tokenizer\n'
+             'x = np.zeros(3).astype(np.float32)\n')
+    assert violations('embedder.py', clean) == []
+    assert violations('search.py', 'import numpy as np\nimport time\nimport gc\ngc.collect()\nt = time.monotonic\n') == []
+    assert violations('index.py', 'import numpy as np\nnp.frombuffer(b"", dtype="<f4")\n') == []
+
+
 @pytest.mark.parametrize('snippet', EARLIER_CONTROLS)
 def test_checks_flag_earlier_violation_snippets(snippet):
     assert violations('search.py', snippet, {'fetch', 'download_file', 'main'})
@@ -584,10 +652,10 @@ def test_checks_accept_clean_snippet():
 
 
 # 5 Runtime layer
-def run_wrapper(tmp_path, mode):
+def run_wrapper(tmp_path, mode, *extra):
     log = tmp_path/f'audit-{mode}.json'
     env = {**os.environ, 'WORKMCP_HOME': str(tmp_path/'home'), 'PYTHONPATH': str(ROOT/'src')}
-    run = subprocess.run([sys.executable, str(WRAPPER), str(log), mode], env=env, cwd=tmp_path,
+    run = subprocess.run([sys.executable, str(WRAPPER), str(log), mode, *map(str, extra)], env=env, cwd=tmp_path,
                          capture_output=True, text=True, encoding='utf-8', timeout=120)
     assert run.returncode == 0, run.stderr
     assert log.is_file(), run.stderr
@@ -601,11 +669,62 @@ def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
     assert {'workmcp.server', 'workmcp.models', 'workmcp.tools', 'workmcp.parsers', 'workmcp.parsers._container',
             'workmcp.parsers.text', 'workmcp.parsers.eml', 'workmcp.parsers.docx', 'workmcp.parsers.pptx',
             'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp', 'workmcp.config', 'workmcp.collect',
-            'workmcp.binding'} <= set(report['modules'])
-    # the parser libraries really were imported under the hook (their import side effects are audited)
-    assert {'pypdf', 'olefile', 'xml.parsers.expat', 'zipfile', 'email.parser'} <= set(report['loaded'])
+            'workmcp.binding', 'workmcp.chunks', 'workmcp.embedder', 'workmcp.index',
+            'workmcp.search'} <= set(report['modules'])
+    # the parser libraries and numpy really were imported under the hook (their import side effects are audited)
+    assert {'pypdf', 'olefile', 'xml.parsers.expat', 'zipfile', 'email.parser', 'numpy'} <= set(report['loaded'])
+    # ... and the heavy runtimes were not: they load inside OnnxEmbedder only (design M2 §7.2)
+    assert not {name for name in report['loaded'] if name.split('.')[0] in LAZY_RUNTIMES}
     assert [e for e in report['events'] if e['violation']] == []
     assert not [e for e in report['events'] if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
+
+
+def stage_skip(report):
+    if report.get('skipped'):
+        pytest.skip(f"audit mode {report['mode']}: {report['skipped']}")
+
+
+def test_index_path_stays_inside_the_runtime_boundary(tmp_path):
+    """scan -> index (HashEmbedder) -> index again: no network, no process, no source write or open."""
+    src = tmp_path/'src'
+    bundle.write_bundle(src)
+    _, report = run_wrapper(tmp_path, 'index', src)
+    stage_skip(report)
+    assert [e for e in report['events'] if e['violation']] == []
+    assert report['source_opens_during_index'] == 0
+    assert report['second']['chunked'] == 0 and report['second']['embedded'] == 0
+    assert report['fts_rows'] == report['chunks'] > 0
+
+
+def test_search_path_stays_inside_the_runtime_boundary_and_is_read_only(tmp_path):
+    src = tmp_path/'src'
+    bundle.write_bundle(src)
+    _, report = run_wrapper(tmp_path, 'search', src)
+    stage_skip(report)
+    assert [e for e in report['events'] if e['violation']] == []
+    assert report['source_opens_during_search'] == 0
+    assert report['connects'] and all('mode=ro' in uri for uri in report['connects'])
+    assert report['hits'] > 0
+
+
+def test_embed_path_stays_inside_the_runtime_boundary(tmp_path):
+    _, report = run_wrapper(tmp_path, 'embed')
+    stage_skip(report)
+    assert [e for e in report['events'] if e['violation']] == []
+    assert report['providers'] == ['CPUExecutionProvider']
+
+
+def test_tokenizers_and_onnxruntime_imports_do_not_load_a_hub_client():
+    """tokenizers depends on huggingface_hub in the lock (transitive, allowed); importing it must not load
+    it or any HTTP client (design M2 §7.1)."""
+    code = ('import sys, json\n'
+            'import numpy, tokenizers, onnxruntime\n'
+            'from tokenizers import Tokenizer\n'
+            'print(json.dumps(sorted(m for m in sys.modules if m.split(".")[0] in '
+            '("huggingface_hub", "requests", "httpx", "urllib3", "hf_xet", "fsspec", "aiohttp"))))\n')
+    run = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout) == []
 
 
 MCP_SESSION = [

@@ -80,12 +80,15 @@ CREATE TABLE chunks(id INTEGER PRIMARY KEY, version_id INTEGER NOT NULL REFERENC
   char_start INTEGER NOT NULL, char_end INTEGER NOT NULL,
   text TEXT NOT NULL, text_sha256 TEXT NOT NULL,
   UNIQUE(version_id, chunk_version, ordinal));
+-- Rows are written and removed only by insert_chunks/drop_chunks below, which keep chunks_fts in step.
+CREATE INDEX chunks_text ON chunks(text_sha256);
 
-CREATE TABLE chunk_vectors(chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-  model_key TEXT NOT NULL,
+-- Derived: a vector is a function of the chunk text (design M2 §4.2), so it is keyed by content and
+-- has no chunk foreign key; the same text in any document or version shares one row. float32
+-- little-endian, unit norm. No triggers: rebuildable, ``index --gc`` drops rows no chunk uses.
+CREATE TABLE chunk_vectors(model_key TEXT NOT NULL,
   text_sha256 TEXT NOT NULL, dims INTEGER NOT NULL, vector BLOB NOT NULL, embedded_at TEXT NOT NULL,
-  PRIMARY KEY(chunk_id, model_key));
-CREATE INDEX chunk_vectors_text ON chunk_vectors(model_key, text_sha256);
+  PRIMARY KEY(model_key, text_sha256));
 
 CREATE TABLE entities(id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL CHECK(kind IN ('person','project','customer','org','term','other')),
@@ -137,7 +140,8 @@ CREATE TRIGGER assertions_no_replace BEFORE INSERT ON assertions
   BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 
 CREATE TABLE evidence(id INTEGER PRIMARY KEY, assertion_id INTEGER NOT NULL REFERENCES assertions(id),
-  version_id INTEGER NOT NULL REFERENCES versions(id), chunk_id INTEGER REFERENCES chunks(id),
+  version_id INTEGER NOT NULL REFERENCES versions(id),
+  chunk_id INTEGER,  -- hint only, no foreign key: chunks may be dropped and rebuilt; locator_json is checked
   locator_json TEXT NOT NULL,
   quote TEXT NOT NULL, quote_sha256 TEXT NOT NULL);
 CREATE TRIGGER evidence_no_update BEFORE UPDATE ON evidence BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -160,12 +164,22 @@ CREATE TABLE scans(id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at
   status TEXT NOT NULL CHECK(status IN ('running','done','aborted')),
   partial INTEGER NOT NULL DEFAULT 0, roots_json TEXT NOT NULL,
   counts_json TEXT NOT NULL DEFAULT '{}', note TEXT);
+
+-- Derived index state (design M2 §4.3): 'chunk_version', 'fts_synced_at', 'fts_rows',
+-- 'index_generation' (integer text, +1 per index run).
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+
+-- Index run history (status.last_index; a 'running' row left by a stopped run becomes 'aborted').
+CREATE TABLE index_runs(id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+  status TEXT NOT NULL CHECK(status IN ('running','done','aborted')),
+  model_key TEXT, chunk_version TEXT NOT NULL, counts_json TEXT NOT NULL DEFAULT '{}', note TEXT);
 """
 
 # (version, name, sql). Never edit an applied entry; append a new one.
 MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1)]
 
 LOCK_NAME = 'scan.lock'
+INDEX_LOCK_NAME = 'index.lock'
 STALE_LOCK_AGE = timedelta(hours=24)
 DEV_SCHEMA_HINT = ('development schema change: delete {db} and scan again (only before the first real install, '
                    'design M1 §10.1)')
@@ -267,12 +281,20 @@ def schema_changed(error: Exception) -> bool:
     return isinstance(error, RuntimeError) and 'checksum changed' in str(error)
 
 
-class ScanLocked(Exception):
+class Locked(Exception):
+    """Another process holds a lock file in the data home (exit code 3)."""
+
+
+class ScanLocked(Locked):
     """Another scan holds ``scan.lock`` (exit code 3)."""
 
 
+def lock_path(home: Path, name: str) -> Path:
+    return Path(home)/name
+
+
 def scan_lock_path(home: Path) -> Path:
-    return Path(home)/LOCK_NAME
+    return lock_path(home, LOCK_NAME)
 
 
 def _lock_started(path: Path) -> datetime | None:
@@ -288,11 +310,14 @@ def _lock_started(path: Path) -> datetime | None:
         return None
 
 
-def acquire_scan_lock(home: Path, at: datetime | None = None) -> tuple[Path, str | None]:
-    """Create ``<home>/scan.lock`` exclusively; ``(path, warning)``. A lock older than 24 hours is
-    removed with a warning; a newer one raises ``ScanLocked``. The process id is recorded but
-    never probed (on Windows ``os.kill(pid, 0)`` terminates the process)."""
-    path = scan_lock_path(home)
+def acquire_lock(home: Path, name: str, at: datetime | None = None) -> tuple[Path, str | None]:
+    """Create ``<home>/<name>`` exclusively; ``(path, warning)``. A lock older than 24 hours is
+    removed with a warning; a newer one raises ``Locked`` (``ScanLocked`` for ``scan.lock``). The
+    process id is recorded but never probed (on Windows ``os.kill(pid, 0)`` terminates the
+    process). ``scan`` holds ``scan.lock`` and ``index`` holds ``index.lock`` (design M2 §4.6)."""
+    path = lock_path(home, name)
+    what = name.removesuffix('.lock')
+    error = ScanLocked if name == LOCK_NAME else Locked
     at = at or datetime.now().astimezone()
     warning = None
     for attempt in (1, 2):
@@ -303,27 +328,34 @@ def acquire_scan_lock(home: Path, at: datetime | None = None) -> tuple[Path, str
             if attempt == 1 and started is not None and at - started > STALE_LOCK_AGE:
                 info = path.read_text(encoding='utf-8', errors='replace')[:200]
                 os.remove(path)
-                warning = f'warning: removed a stale scan lock older than 24 hours ({info.strip()})'
+                warning = f'warning: removed a stale {what} lock older than 24 hours ({info.strip()})'
                 continue
             try:
                 info = json.loads(path.read_text(encoding='utf-8'))
                 holder = f"pid {info.get('pid')}, since {info.get('started_at')}"
             except (OSError, ValueError, AttributeError):
                 holder = 'unknown holder'
-            raise ScanLocked(f'another scan is running ({holder}); if not, delete {path}') from None
+            raise error(f'another {what} is running ({holder}); if not, delete {path}') from None
         try:
             os.write(fd, json.dumps({'pid': os.getpid(), 'started_at': at.isoformat(timespec='seconds')}).encode())
         finally:
             os.close(fd)
         return path, warning
-    raise ScanLocked(f'cannot take the scan lock {path}')
+    raise error(f'cannot take the {what} lock {path}')
 
 
-def release_scan_lock(path: Path) -> None:
+def release_lock(path: Path) -> None:
     try:
         os.remove(path)
     except FileNotFoundError:
         pass
+
+
+def acquire_scan_lock(home: Path, at: datetime | None = None) -> tuple[Path, str | None]:
+    return acquire_lock(home, LOCK_NAME, at)
+
+
+release_scan_lock = release_lock
 
 
 def last_scan(db: sqlite3.Connection) -> dict | None:
@@ -333,3 +365,132 @@ def last_scan(db: sqlite3.Connection) -> dict | None:
         return None
     counts = json.loads(row[1] or '{}').get('total', {})
     return {'at': row[0], **{key: counts.get(key, 0) for key in ('added', 'changed', 'deleted', 'failed')}}
+
+
+# -- chunks and the FTS index (design M2 §4.3, L-8) ------------------------------------------
+# chunks_fts is an external-content FTS5 table: it does not follow chunks by itself, and a delete
+# must hand it the old text. There are no triggers; the only SQL that writes or removes chunk rows
+# lives in insert_chunks and drop_chunks (and the 'rebuild' command in rebuild_fts), checked by
+# tests/test_index.py::test_chunk_sql_lives_only_in_store_insert_and_drop. Callers own the
+# transaction (one version per transaction in ``index``, the fill transaction in ``collect``).
+
+CHUNK_INSERT_BATCH = 1000
+
+# Latest active versions only (design M2 §4.1): what ``index`` chunks and ``search`` returns.
+ELIGIBLE_VERSIONS = ("d.status = 'active' AND v.superseded_at IS NULL AND v.parse_status = 'ok' "
+                     "AND v.unit_count > 0")
+
+
+def eligible_versions_sql() -> str:
+    """``FROM`` body for eligible versions, aliases ``v`` (versions) and ``d`` (documents), ending in
+    a ``WHERE`` clause: ``f'SELECT v.id FROM {store.eligible_versions_sql()} AND ...'``."""
+    return f'versions v JOIN documents d ON d.id = v.document_id WHERE {ELIGIBLE_VERSIONS}'
+
+
+def latest_chunks_sql() -> str:
+    """``FROM`` body for the chunks of eligible versions, aliases ``c`` (chunks), ``v``, ``d``, ending
+    in a ``WHERE`` clause: ``f'SELECT c.id FROM {store.latest_chunks_sql()} AND c.chunk_version = ?'``.
+    It does not filter ``chunk_version``; the caller adds that condition."""
+    return (f'chunks c JOIN versions v ON v.id = c.version_id JOIN documents d ON d.id = v.document_id '
+            f'WHERE {ELIGIBLE_VERSIONS}')
+
+
+def fts_available(db: sqlite3.Connection) -> bool:
+    """This store has ``chunks_fts`` and this Python can use it (FTS5 with trigram)."""
+    exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'").fetchone()
+    return exists is not None and fts5_available()
+
+
+def insert_chunks(db: sqlite3.Connection, version_id: int, chunk_version: str, specs=(), *,
+                  copy_from: int | None = None) -> int:
+    """Store the chunks of one version under ``chunk_version`` and add them to ``chunks_fts``.
+
+    ``specs``: objects with ``ordinal, unit_first, unit_last, char_start, char_end, text``
+    (``chunks.ChunkSpec``); ``text_sha256`` is computed here. Or ``copy_from``: a version id whose
+    ``chunk_version`` rows are copied (same sha256 and parser version, design M2 §4.1 step 2), in
+    which case ``specs`` must be empty. The version must have no rows under ``chunk_version`` yet.
+    Returns the number of rows stored. No transaction control: the caller commits.
+    """
+    if db.execute('SELECT 1 FROM chunks WHERE version_id=? AND chunk_version=? LIMIT 1',
+                  (version_id, chunk_version)).fetchone():
+        raise ValueError(f'version {version_id} already has chunks of {chunk_version}')
+    if copy_from is not None:
+        if specs:
+            raise ValueError('pass specs or copy_from, not both')
+        stored = db.execute(
+            'INSERT INTO chunks(version_id, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
+            'text, text_sha256) SELECT ?, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
+            'text, text_sha256 FROM chunks WHERE version_id=? AND chunk_version=? ORDER BY ordinal',
+            (version_id, copy_from, chunk_version)).rowcount
+    else:
+        sql = ('INSERT INTO chunks(version_id, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
+               'text, text_sha256) VALUES(?,?,?,?,?,?,?,?,?)')
+        stored, batch = 0, []
+        for spec in specs:
+            batch.append((version_id, chunk_version, spec.ordinal, spec.unit_first, spec.unit_last, spec.char_start,
+                          spec.char_end, spec.text, hashlib.sha256(spec.text.encode('utf-8')).hexdigest()))
+            if len(batch) >= CHUNK_INSERT_BATCH:
+                db.executemany(sql, batch)
+                stored, batch = stored + len(batch), []
+        if batch:
+            db.executemany(sql, batch)
+            stored += len(batch)
+    if stored and fts_available(db):
+        db.execute('INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks '
+                   'WHERE version_id=? AND chunk_version=?', (version_id, chunk_version))
+    return stored
+
+
+def drop_chunks(db: sqlite3.Connection, version_id: int, keep: str | None = None) -> int:
+    """Remove the chunks of one version (all, or every ``chunk_version`` other than ``keep``) and
+    their ``chunks_fts`` entries. Vectors are content-addressed and stay (``index --gc`` removes
+    unused ones). Returns the number of rows removed. No transaction control: the caller commits."""
+    where, params = 'version_id=?', [version_id]
+    if keep is not None:
+        where, params = 'version_id=? AND chunk_version<>?', [version_id, keep]
+    if fts_available(db):
+        # Only rows the index holds (a row stored by a Python without FTS5 was never indexed, and an
+        # FTS5 'delete' of a row it does not hold corrupts the index).
+        db.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text) SELECT 'delete', id, text FROM chunks "
+                   f'WHERE {where} AND id IN (SELECT id FROM chunks_fts_docsize)', params)
+    return db.execute(f'DELETE FROM chunks WHERE {where}', params).rowcount
+
+
+def rebuild_fts(db: sqlite3.Connection) -> int:
+    """Rebuild ``chunks_fts`` from ``chunks`` (``index --rebuild-fts``) and record it in ``meta``;
+    returns the row count, or -1 when this store or Python has no FTS5. No transaction control."""
+    if not fts_available(db):
+        return -1
+    db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    rows = fts_rows(db)
+    meta_set(db, 'fts_rows', str(rows))
+    meta_set(db, 'fts_synced_at', now())
+    return rows
+
+
+def fts_rows(db: sqlite3.Connection) -> int:
+    """Rows the FTS index really holds. ``COUNT(*) FROM chunks_fts`` would count the external content
+    table (``chunks``) and never show a gap; the ``chunks_fts_docsize`` shadow table has one row per
+    indexed chunk."""
+    return db.execute('SELECT COUNT(*) FROM chunks_fts_docsize').fetchone()[0]
+
+
+def meta_get(db: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+    return row[0] if row else default
+
+
+def meta_set(db: sqlite3.Connection, key: str, value: str) -> None:
+    db.execute('INSERT INTO meta(key, value, updated_at) VALUES(?,?,?) '
+               'ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at',
+               (key, str(value), now()))
+
+
+def fts_status(db: sqlite3.Connection) -> dict:
+    """``{available, rows, chunks, synced_at, consistent}`` for ``status`` and ``doctor``.
+    ``rows`` is None without FTS5; ``consistent`` is True only when FTS5 is there and the counts match."""
+    chunks = db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+    available = fts_available(db)
+    rows = fts_rows(db) if available else None
+    return {'available': available, 'rows': rows, 'chunks': chunks, 'synced_at': meta_get(db, 'fts_synced_at'),
+            'consistent': available and rows == chunks}

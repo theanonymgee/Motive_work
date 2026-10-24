@@ -26,3 +26,6 @@ logs/
 # Company material must never be added
 company/
 inbox/
+
+# Model weight side files (data home only)
+*.onnx_data

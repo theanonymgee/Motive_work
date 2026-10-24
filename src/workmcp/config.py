@@ -8,6 +8,9 @@ Source roots follow rules that differ from the data-home rules: the user's mater
 anywhere local, but a root must be an existing absolute folder, not on the network unless that
 root opts in (``allow_network = true``), and must not overlap the data home, the repository or
 another root. A root inside a sync folder is allowed with a warning.
+
+M2 adds ``[index]`` (``IndexSettings``) and ``[search]`` (``SearchSettings``), design M2 §1.3. The
+index model is a manifest name or ``"none"``; the test-only hash embedder cannot be chosen here.
 """
 from __future__ import annotations
 
@@ -17,13 +20,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import paths, store
+from . import models, paths, store
 from .parsers import Limits
 
 CONFIG_NAME = 'config.toml'
 SCAN_KEYS = frozenset({'max_file_mb', 'max_units', 'max_text_chars', 'exclude', 'commit_every',
                        'read_cloud_placeholders'})
 SOURCE_KEYS = frozenset({'path', 'exclude', 'allow_network'})
+INDEX_KEYS = frozenset({'model', 'embed_batch', 'commit_every', 'threads'})
+SEARCH_KEYS = frozenset({'lexical_candidates', 'semantic_candidates', 'max_vectors_in_memory', 'threads',
+                         'model_idle_seconds'})
+NO_MODEL = 'none'  # [index] model = "none": chunks and FTS only (lexical search)
 ROOT_CODES = ('source_root_relative', 'source_root_trailing_dot_space', 'source_root_missing', 'source_root_network',
               'source_root_inside_home', 'source_root_contains_home', 'source_root_inside_repo',
               'source_roots_overlap')
@@ -49,6 +56,33 @@ class ScanSettings:
 
 
 @dataclass(frozen=True)
+class IndexSettings:
+    """``[index]`` (design M2 §1.3). ``model`` is a manifest name or ``'none'``."""
+    model: str = models.DEFAULT_MODEL
+    embed_batch: int = 8                        # fp32 batch; an int8 model runs one text per batch
+    commit_every: int = 64                      # vector rows per commit
+    threads: int = 0                            # 0: the ONNX Runtime default (index CLI)
+
+
+@dataclass(frozen=True)
+class SearchSettings:
+    """``[search]`` (design M2 §1.3). ``like_max_chunks`` is not a config key (tests inject it)."""
+    lexical_candidates: int = 200
+    semantic_candidates: int = 200
+    max_vectors_in_memory: int = 250_000        # over this the vectors are streamed per query
+    threads: int = 0                            # 0: max(1, cpu_count // 2), two server processes
+    model_idle_seconds: int = 600               # release the model after this long unused
+    like_max_chunks: int = 200_000              # above this the short-query LIKE path is not used
+
+    def effective_threads(self, cpu_count: int | None = None) -> int:
+        """``intra_op_num_threads`` for the server (design M2 §6.2 M3)."""
+        if self.threads:
+            return self.threads
+        count = os.cpu_count() if cpu_count is None else cpu_count
+        return max(1, (count or 2) // 2)
+
+
+@dataclass(frozen=True)
 class SourceEntry:
     """One ``[[sources]]`` table as written (or one ``scan --root``)."""
     raw: str
@@ -62,6 +96,8 @@ class Config:
     exists: bool
     scan: ScanSettings
     sources: tuple[SourceEntry, ...]
+    index: IndexSettings = IndexSettings()
+    search: SearchSettings = SearchSettings()
 
 
 @dataclass(frozen=True)
@@ -102,12 +138,53 @@ def _positive_int(value, where: str) -> int:
     return value
 
 
+def _count(value, where: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ConfigError(f'{where} must be an integer >= 0')
+    return value
+
+
+def _table(data: dict, name: str, keys: frozenset, file: Path) -> dict:
+    table = data.get(name, {})
+    if not isinstance(table, dict):
+        raise ConfigError(f'{file}: [{name}] must be a table')
+    if unknown := set(table) - keys:
+        raise ConfigError(f'{file}: unknown [{name}] key {sorted(unknown)}')
+    return table
+
+
+def _index_settings(table: dict, file: Path) -> IndexSettings:
+    defaults = IndexSettings()
+    model = table.get('model', defaults.model)
+    if model != NO_MODEL and model not in models.MANIFEST:
+        raise ConfigError(f'{file}: [index] model must be one of {sorted(models.MANIFEST)} or "{NO_MODEL}"')
+    return IndexSettings(
+        model=model,
+        embed_batch=_positive_int(table.get('embed_batch', defaults.embed_batch), '[index] embed_batch'),
+        commit_every=_positive_int(table.get('commit_every', defaults.commit_every), '[index] commit_every'),
+        threads=_count(table.get('threads', defaults.threads), '[index] threads'))
+
+
+def _search_settings(table: dict) -> SearchSettings:
+    d = SearchSettings()
+    return SearchSettings(
+        lexical_candidates=_positive_int(table.get('lexical_candidates', d.lexical_candidates),
+                                         '[search] lexical_candidates'),
+        semantic_candidates=_positive_int(table.get('semantic_candidates', d.semantic_candidates),
+                                          '[search] semantic_candidates'),
+        max_vectors_in_memory=_positive_int(table.get('max_vectors_in_memory', d.max_vectors_in_memory),
+                                            '[search] max_vectors_in_memory'),
+        threads=_count(table.get('threads', d.threads), '[search] threads'),
+        model_idle_seconds=_positive_int(table.get('model_idle_seconds', d.model_idle_seconds),
+                                         '[search] model_idle_seconds'))
+
+
 def parse_config(text: str, file: Path) -> Config:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f'{file} is not valid TOML ({exc})') from None
-    if unknown := set(data) - {'scan', 'sources'}:
+    if unknown := set(data) - {'scan', 'sources', 'index', 'search'}:
         raise ConfigError(f'{file}: unknown table or key {sorted(unknown)}')
     scan = data.get('scan', {})
     if not isinstance(scan, dict):
@@ -140,7 +217,8 @@ def parse_config(text: str, file: Path) -> Config:
         if not isinstance(allow, bool):
             raise ConfigError(f'{file}: {where} allow_network must be true or false')
         entries.append(SourceEntry(item['path'], _strings(item.get('exclude', []), f'{where} exclude'), allow))
-    return Config(file, True, settings, tuple(entries))
+    return Config(file, True, settings, tuple(entries), _index_settings(_table(data, 'index', INDEX_KEYS, file), file),
+                  _search_settings(_table(data, 'search', SEARCH_KEYS, file)))
 
 
 def load(home: Path) -> Config:
