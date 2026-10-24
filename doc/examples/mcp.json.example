@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "workmcp": {
+      "command": "C:\\Users\\<USER>\\Project\\Motive_work\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "workmcp", "serve"],
+      "env": {"WORKMCP_HOME": "C:\\Users\\<USER>\\Motive_work"},
+      "timeout": 120000
+    }
+  }
+}
