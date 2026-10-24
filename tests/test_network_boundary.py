@@ -1059,7 +1059,7 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     for number in set(called) - set(errors):
         assert envelopes[number]['ok'] is True, (number, envelopes[number])
     status = envelopes[3]['result']
-    assert status['schema_version'] == 3 and set(status) == STATUS_RESULT_KEYS
+    assert status['schema_version'] == 4 and set(status) == STATUS_RESULT_KEYS
     assert status['home'] == str(home) and status['db']['chunks'] > 0
     assert set(status['home_virtualization']) == {'checked', 'under_appdata', 'redirected_to', 'package'}
     hits = envelopes[4]['result']['hits']

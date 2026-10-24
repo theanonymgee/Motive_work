@@ -319,6 +319,11 @@ HISTORY_TRUNCATED_NOTICE = f'이력이 {HISTORY_MAX}행을 넘어 최신 {HISTOR
 FIND_QUERY_MAX = 200
 
 
+def notices_for(rows, *, quotes: bool) -> list[str]:
+    """``_notices`` for ``tools``: the size budget recomputes them from the rows it kept (review M4 v2 L-c)."""
+    return _notices(rows, quotes=quotes)
+
+
 def _notices(rows, *, quotes: bool) -> list[str]:
     """Source and conflict lines for the assertions a tool returns (``quotes``: counted per evidence item,
     else per row)."""
@@ -527,40 +532,53 @@ def _links(db, assertion_id: int) -> list[dict]:
 
 
 def chain_ids(db, assertion_id: int) -> tuple[list[int], bool]:
-    """``(ids, complete)``: every row joined to ``assertion_id`` by ``supersedes_id`` in either direction, in
-    recorded order (``recorded_from``, then id). Supersede links form a graph, not a line: an open cut row C
-    can be superseded again while its later-period row N also names it (review M4 v1 M2). ``complete`` is
-    False when the walk stopped at ``HISTORY_GRAPH_MAX`` rows."""
-    seen, queue = {assertion_id}, [assertion_id]
-    while queue:
-        current = queue.pop()
+    """``(ids, complete)``: the rows joined to ``assertion_id`` by ``supersedes_id`` in either direction,
+    nearest first (breadth-first by link distance, ``assertion_id`` first). Supersede links form a graph,
+    not a line: an open cut row C can be superseded again while its later-period row N also names it
+    (review M4 v1 M2). ``complete`` is False when rows were left unvisited at ``HISTORY_GRAPH_MAX``."""
+    order, seen, at, complete = [assertion_id], {assertion_id}, 0, True
+    while at < len(order) and complete:
+        current = order[at]
+        at += 1
         parent = db.execute('SELECT supersedes_id FROM assertions WHERE id = ?', (current,)).fetchone()[0]
-        children = [row[0] for row in db.execute('SELECT id FROM assertions WHERE supersedes_id = ?', (current,))]
+        children = [row[0] for row in db.execute('SELECT id FROM assertions WHERE supersedes_id = ? ORDER BY id',
+                                                 (current,))]
         for other in ([parent] if parent is not None else []) + children:
             if other not in seen:
-                if len(seen) >= HISTORY_GRAPH_MAX:
-                    queue = []
+                if len(order) >= HISTORY_GRAPH_MAX:
+                    complete = False
                     break
                 seen.add(other)
-                queue.append(other)
-    marks = ','.join('?' * len(seen))
-    ordered = [row[0] for row in db.execute(
-        f'SELECT id FROM assertions WHERE id IN ({marks}) ORDER BY julianday(recorded_from), id', sorted(seen))]
-    return ordered, len(seen) < HISTORY_GRAPH_MAX
+                order.append(other)
+    return order, complete
+
+
+def _recorded_order(db, ids) -> list[int]:
+    marks = ','.join('?' * len(ids))
+    return [row[0] for row in db.execute(
+        f'SELECT id FROM assertions WHERE id IN ({marks}) ORDER BY julianday(recorded_from), id', sorted(ids))]
 
 
 def _branches(db, ids: list[int]) -> list[dict]:
-    """``BRANCH_KEYS`` for every row among ``ids`` that two or more of them name as ``supersedes_id``."""
+    """``BRANCH_KEYS`` for every row that two or more of ``ids`` name as ``supersedes_id``."""
     marks = ','.join('?' * len(ids))
+    return branches_of(db.execute(f'SELECT id, supersedes_id FROM assertions WHERE id IN ({marks}) ORDER BY id',
+                                  ids).fetchall())
+
+
+def branches_of(pairs) -> list[dict]:
+    """``BRANCH_KEYS`` from ``(id, supersedes_id)`` pairs: the parents named by two or more of them."""
     children: dict[int, list[int]] = {}
-    for row_id, parent in db.execute(f'SELECT id, supersedes_id FROM assertions WHERE id IN ({marks}) '
-                                     'AND supersedes_id IS NOT NULL ORDER BY id', ids):
-        children.setdefault(parent, []).append(row_id)
+    for row_id, parent in sorted(pairs):
+        if parent is not None:
+            children.setdefault(parent, []).append(row_id)
     return [{'id': parent, 'children': kids} for parent, kids in sorted(children.items()) if len(kids) > 1]
 
 
 HISTORY_BRANCH_NOTICE = ('대체 이력이 갈라집니다(행 {}) — 중간 행(old_valid_to)을 다시 대체하면 생깁니다; '
                          'branches와 각 행의 superseded_by_id·continued_by_ids를 보세요')
+# The lines ``notices_for``/``history_notices`` make, for ``tools`` to replace after dropping rows.
+NOTICE_TEMPLATES = (SOURCE_NOTICE, SOURCE_LIST_NOTICE, CONFLICT_NOTICE, HISTORY_BRANCH_NOTICE)
 
 
 def history(db, assertion_id: int) -> dict:
@@ -574,15 +592,30 @@ def history(db, assertion_id: int) -> dict:
     supersede and conflict links in either direction, resolved ones too."""
     if db.execute('SELECT 1 FROM assertions WHERE id = ?', (assertion_id,)).fetchone() is None:
         raise knowledge.KnowledgeError('assertion_not_found', f'no assertion {assertion_id}')
-    chain, complete = chain_ids(db, assertion_id)
-    truncated = len(chain) > HISTORY_MAX or not complete
-    kept = chain[-HISTORY_MAX:]
+    nearest, complete = chain_ids(db, assertion_id)
+    truncated = len(nearest) > HISTORY_MAX or not complete
+    if complete:      # the whole graph: its latest rows
+        kept = _recorded_order(db, nearest)[-HISTORY_MAX:]
+    else:             # only part was walked (review M4 v2 L-b): the rows nearest the asked one
+        kept = _recorded_order(db, nearest[:HISTORY_MAX])
     rows = [{**_row(db, row_id, with_evidence=True, with_requote=True, recorded_at=None),
              'events': _events(db, row_id), 'links': _links(db, row_id)} for row_id in kept]
     branches = _branches(db, kept)
+    notice = history_notices(rows, branches)
+    if truncated:
+        notice.insert(0, HISTORY_TRUNCATED_NOTICE if complete else
+                      HISTORY_PARTIAL_NOTICE.format(asked=assertion_id, walked=HISTORY_GRAPH_MAX, kept=len(kept)))
+    return {'chain': rows, 'truncated': truncated, 'branches': branches, 'notice': notice}
+
+
+HISTORY_PARTIAL_NOTICE = ('이력이 {walked}행을 넘어 다 걷지 못했습니다 — 부른 행(id {asked})에서 대체 링크로 가까운 '
+                          '{kept}행을 기록 순으로 보입니다(최신 행이 빠졌을 수 있음; 최신 행 id로 다시 부르세요)')
+
+
+def history_notices(rows, branches) -> list[str]:
+    """Branch, source and conflict lines for these ``get_history`` rows (``tools`` calls it again after the
+    size budget dropped rows, review M4 v2 L-c)."""
     notice = _notices(rows, quotes=True)
     if branches:
         notice.insert(0, HISTORY_BRANCH_NOTICE.format(', '.join(str(b['id']) for b in branches)))
-    if truncated:
-        notice.insert(0, HISTORY_TRUNCATED_NOTICE)
-    return {'chain': rows, 'truncated': truncated, 'branches': branches, 'notice': notice}
+    return notice

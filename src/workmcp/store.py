@@ -286,9 +286,17 @@ CREATE TRIGGER assertion_events_no_replace BEFORE INSERT ON assertion_events
   WHEN EXISTS(SELECT 1 FROM assertion_events WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 """
 
+# Review M4 v2 N1: every source check (binding, the read tools' re-check, requote, the cut copy,
+# get_snippet by locator, binding.validate_locator) looks a unit up by (version_id, locator_json); without
+# this index each lookup scans all units of the version. v3 may already be applied to a real home, so the
+# index is its own migration (additive only).
+SCHEMA_V4 = """
+CREATE INDEX units_locator ON units(version_id, locator_json);
+"""
+
 # (version, name, sql). Never edit an applied entry; append a new one.
 MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1), (2, 'tool_calls_events_v2', SCHEMA_V2),
-              (3, 'knowledge_v3', SCHEMA_V3)]
+              (3, 'knowledge_v3', SCHEMA_V3), (4, 'units_locator_v4', SCHEMA_V4)]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 EVENT_KINDS = ('added', 'changed', 'restored', 'deleted', 'reparsed')
 # Knowledge (design M4 §2): the kinds M4 writes ('term' stays in the v1 CHECK, unused), task states,

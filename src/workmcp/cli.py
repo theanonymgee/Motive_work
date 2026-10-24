@@ -266,7 +266,8 @@ def verify_lines(report: dict) -> list[str]:
         f"locked {un['locked']}, unstable {un['unstable']}, parser {un['parser_version_mismatch']}, "
         f"not_ok {un['skipped_not_ok']}, placeholder {un['placeholder']}, timeout {un['timeout']})",
         f"units {u['bound']}/{u['total']} bound ({u['rate'] * 100:.1f}%)  chunks {report['chunks_checked']}  "
-        f"evidence {report['evidence_checked']}",
+        f"evidence {report['evidence_checked']}"
+        + (f" (stale after reparse {stale})" if (stale := report.get('evidence_stale_after_reparse')) else ''),
         *report['notice'],
     ]
     if report['ok']:

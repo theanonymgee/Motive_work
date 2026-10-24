@@ -3,6 +3,7 @@ chunk/FTS functions (design M2 §1.4, §4.3), migration v2 (design M3 §3.4): to
 document events and their queries. Synthetic rows only."""
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -27,7 +28,7 @@ TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_st
             'assertion_events_no_replace'}
 INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunks_text', 'tool_calls_at', 'deliveries_call',
            'document_events_at', 'document_events_doc', 'assertions_subject', 'assertions_object',
-           'assertions_supersedes', 'links_from', 'links_to', 'assertion_events_assertion'}
+           'assertions_supersedes', 'links_from', 'links_to', 'assertion_events_assertion', 'units_locator'}
 H = '0' * 64
 NOW = '2026-10-23T09:00:00+09:00'
 LATER = '2026-10-23T10:00:00+09:00'
@@ -52,8 +53,8 @@ def test_empty_db_has_schema_v1_v2_and_v3(db):
     assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
     assert db.execute('PRAGMA foreign_keys').fetchone()[0] == 1
     rows = db.execute('SELECT version, name FROM schema_migrations').fetchall()
-    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2'), (3, 'knowledge_v3')]
-    assert store.SCHEMA_VERSION == 3
+    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2'), (3, 'knowledge_v3'), (4, 'units_locator_v4')]
+    assert store.SCHEMA_VERSION == 4
     assert all(db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] == 0 for t in TABLES - {'schema_migrations'})
     if store.fts5_available():
         assert 'chunks_fts' in names(db, 'table')
@@ -64,7 +65,7 @@ def test_migrate_is_idempotent_and_detects_edited_migration(db, monkeypatch):
     monkeypatch.setattr(store, 'MIGRATIONS', [(1, 'initial_schema_v1', store.SCHEMA_V1 + '\n-- edited\n')])
     with pytest.raises(RuntimeError, match='checksum changed'):
         store.migrate(db)
-    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 3
+    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 4
 
 
 def test_statement_splitter_keeps_trigger_bodies():
@@ -330,7 +331,7 @@ def test_status_tool_reads_without_migrating(tmp_path):
     response = tools.status(home)
     assert response['ok'] and response['delivered_sources'] == []
     result = response['result']
-    assert result['schema_version'] == 3
+    assert result['schema_version'] == 4
     assert result['db'] == {'documents': 0, 'versions': 0, 'chunks': 0, 'vectors': 0}
     assert result['model']['name'] == 'bge-m3' and result['model']['available'] is False
 
@@ -711,7 +712,7 @@ def test_migration_v2_upgrades_a_v1_store_in_place(tmp_path, monkeypatch):
     monkeypatch.undo()
     upgraded = store.open_home(home)
     try:
-        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3]
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4]
         assert upgraded.execute('SELECT chars, call_id FROM deliveries').fetchall() == [(3, '')]
         assert store.migrate(upgraded) == []
     finally:
@@ -731,10 +732,10 @@ def test_migrations_apply_once_under_two_processes(tmp_path):
                              text=True, env=env) for _ in range(2)]
     outputs = [run.communicate(timeout=120) for run in runs]
     assert [run.returncode for run in runs] == [0, 0], outputs
-    assert [out.strip() for out, _ in outputs] == ['3', '3']
+    assert [out.strip() for out, _ in outputs] == ['4', '4']
     check = sqlite3.connect(paths.db_path(home))
     try:
-        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,)]
+        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]
     finally:
         check.close()
 
@@ -947,7 +948,7 @@ def knowledge_rows(db):
 
 
 def test_migration_v3_adds_knowledge_columns_tables_triggers_indexes(db):
-    assert store.SCHEMA_VERSION == 3 and store.MIGRATIONS[2][:2] == (3, 'knowledge_v3')
+    assert store.SCHEMA_VERSION == 4 and store.MIGRATIONS[2][:2] == (3, 'knowledge_v3')
     assert columns(db, 'assertions')[-2:] == ['predicate', 'object_entity_id']
     assert columns(db, 'assertion_events') == ['id', 'assertion_id', 'at', 'kind', 'reason', 'related_id',
                                                'recorded_by', 'call_id']
@@ -973,7 +974,7 @@ def test_migration_v3_upgrades_a_v2_store_in_place(tmp_path, monkeypatch):
     monkeypatch.undo()
     upgraded = store.open_home(home)
     try:
-        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3]
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4]
         assert upgraded.execute('SELECT predicate, object_entity_id FROM assertions WHERE id=?', (before,)).fetchone() \
             == (None, None)
         # a row from before v3 can still be closed (the shape trigger checks inserts only)
@@ -1093,3 +1094,49 @@ def test_knowledge_counts_for_status(db, known):
     assert counts['tasks_open'] == 2 and counts['assertions'] == {'active': 4, 'conflict': 0, 'withdrawn': 1,
                                                                   'superseded': 0}
     assert set(counts) == tools.KNOWLEDGE_STATUS_KEYS
+
+
+# ---- migration v4: the unit lookup index (review M4 v2 N1) -----------------------------------------------
+
+# The unit lookups of the package, exactly as written (knowledge_query.still_matches/requote, knowledge._targets/
+# _copy_evidence, binding.validate_locator, snippet.by_locator).
+UNIT_LOOKUPS = ('SELECT text FROM units WHERE version_id = ? AND locator_json = ?',
+                'SELECT text FROM units WHERE version_id=? AND locator_json=?',
+                'SELECT id, text FROM units WHERE version_id=? AND locator_json=?',
+                'SELECT ordinal, text FROM units WHERE version_id = ? AND locator_json = ?')
+
+
+def test_unit_lookups_in_the_package_are_the_indexed_forms():
+    root = Path(__file__).resolve().parents[1]/'src'/'workmcp'
+    found = set()
+    for path in root.rglob('*.py'):
+        text = ' '.join(path.read_text(encoding='utf-8').split())
+        for match in re.finditer(r"'(SELECT [^']*FROM units WHERE version_id ?= ?\? AND locator_json ?= ?\?)'", text):
+            found.add(match.group(1))
+    assert found and found <= set(UNIT_LOOKUPS), found
+
+
+@pytest.mark.parametrize('sql', UNIT_LOOKUPS)
+def test_migration_v4_unit_lookups_use_the_locator_index(db, sql):
+    version = add_version(db, add_document(db), 1, H)
+    db.executemany('INSERT INTO units(version_id, ordinal, kind, locator_json, text, text_sha256) VALUES(?,?,?,?,?,?)',
+                   [(version, n, 'line', json.dumps({'kind': 'line', 'line': n}), f'합성 {n}', H) for n in range(1, 500)])
+    db.execute('ANALYZE')
+    plan = ' '.join(row[3] for row in db.execute(f'EXPLAIN QUERY PLAN {sql}', (version, '{}')))
+    assert 'USING INDEX units_locator (version_id=? AND locator_json=?)' in plan, plan
+    assert [[c[2] for c in db.execute('PRAGMA index_info(units_locator)')]] == [['version_id', 'locator_json']]
+
+
+def test_migration_v4_upgrades_a_v3_store_in_place(tmp_path, monkeypatch):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    monkeypatch.setattr(store, 'MIGRATIONS', store.MIGRATIONS[:3])
+    old = store.open_home(home)
+    assert 'units_locator' not in names(old, 'index')
+    old.close()
+    monkeypatch.undo()
+    upgraded = store.open_home(home)
+    try:
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4]
+        assert 'units_locator' in names(upgraded, 'index') and store.migrate(upgraded) == []
+    finally:
+        upgraded.close()

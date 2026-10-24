@@ -715,6 +715,50 @@ def test_reparse_in_place_shows_the_source_as_changed_with_a_requote(kb, monkeyp
     assert listed['items'][0]['source_state'] == 'changed'
 
 
+def forge_evidence(kb, recorded_from: str, quote: str, quote_sha: str | None = None) -> int:
+    """A source written with SQL (no writer does this): a decision citing line 1 of notes.txt with ``quote``."""
+    assertion = kb.db.execute(
+        "INSERT INTO assertions(kind, statement, recorded_from, status, source_kind, recorded_by) "
+        "VALUES('decision', '합성 위조', ?, 'active', 'evidence', 'forger')", (recorded_from,)).lastrowid
+    obj = kb.loc('notes.txt', 1)
+    version = kb.units('notes.txt')[0][3]
+    kb.db.execute('INSERT INTO evidence(assertion_id, version_id, locator_json, quote, quote_sha256) VALUES(?,?,?,?,?)',
+                  (assertion, version, json.dumps(obj, ensure_ascii=False), quote,
+                   quote_sha or hashlib.sha256(quote.encode()).hexdigest()))
+    return assertion
+
+
+def test_verify_counts_sources_stale_after_a_reparse_apart_and_still_fails_forged_ones(kb, monkeypatch):
+    """Review M4 v2 N2: a source recorded before its version was reparsed is a warning, not a failure (the
+    unit text it cited is gone by design); a forged or damaged source still fails ``verify``."""
+    from workmcp import cli
+    entity = kb.entity()
+    kb.fact(entity, '검토 중', sources=[{'locator': kb.loc('notes.txt', 1), 'quote': QUOTE}])
+    assert binding.verify(kb.db)['ok']
+    reparse(kb, monkeypatch, lambda text: '재파싱된 ' + text)
+    report = binding.verify(kb.db)
+    assert report['ok'] and (report['evidence_checked'], report['evidence_stale_after_reparse']) == (1, 1)
+    assert binding.REPARSE_STALE_NOTICE.format(1) in report['notice']
+    lines = cli.verify_lines(report)
+    assert any(line.endswith('evidence 1 (stale after reparse 1)') for line in lines) and lines[-1] == 'binding ok'
+    kb.fact(entity, '승인', predicate='단계', sources=[{'locator': kb.loc('notes.txt', 1), 'quote': QUOTE}])
+    assert binding.verify(kb.db)['evidence_stale_after_reparse'] == 1        # a source bound after it matches
+    forge_evidence(kb, '2999-01-01T00:00:00+09:00', '합성 과제 31의')          # recorded after the reparse
+    later = binding.verify(kb.db)
+    assert not later['ok'] and [f['problem'] for f in later['failures']] == ['evidence:evidence_quote_mismatch']
+    assert later['evidence_stale_after_reparse'] == 1
+
+
+def test_verify_still_fails_a_damaged_source_of_a_reparsed_version(kb, monkeypatch):
+    entity = kb.entity()
+    kb.fact(entity, '검토 중', sources=[{'locator': kb.loc('notes.txt', 1), 'quote': QUOTE}])
+    reparse(kb, monkeypatch, lambda text: '재파싱된 ' + text)
+    forge_evidence(kb, '2000-01-01T00:00:00+09:00', QUOTE, quote_sha='0' * 64)   # before the reparse, bad hash
+    report = binding.verify(kb.db)
+    assert not report['ok'] and [f['problem'] for f in report['failures']] == ['evidence:evidence_quote_sha256_mismatch']
+    assert report['evidence_stale_after_reparse'] == 1
+
+
 def test_cut_supersede_rebinds_a_reparsed_source_found_once(kb, monkeypatch):
     entity = kb.entity()
     old = kb.fact(entity, '검토 중', valid_from='2026-10-01',
@@ -765,6 +809,27 @@ def test_superseding_the_open_cut_row_again_branches_the_history(kb):
     assert values('2026-10-10') == [(fixed, '보류')] and values('2026-10-25') == [(new, '승인')]
 
 
+def test_a_history_larger_than_the_walk_keeps_the_rows_nearest_the_asked_one(kb, monkeypatch):
+    """Review M4 v2 L-b, with the walk limit made small: a complete graph shows its latest rows; a graph
+    the walk could not finish shows the rows nearest the asked one (it included) and says so exactly."""
+    monkeypatch.setattr(knowledge_query, 'HISTORY_GRAPH_MAX', 60)
+    entity = kb.entity()
+    ids = [kb.fact(entity, '값 0')['assertion']['id']]
+    for n in range(1, 60):                                          # 60 rows: the walk sees all of them
+        ids.append(knowledge.supersede(kb.db, ids[-1], reason='합성', recorded_by=BY, call_id='c', my_note=True,
+                                       value=f'값 {n}')['new']['id'])
+    whole = knowledge_query.history(kb.db, ids[0])
+    assert whole['truncated'] and [r['id'] for r in whole['chain']] == ids[-50:]
+    assert whole['notice'][0] == knowledge_query.HISTORY_TRUNCATED_NOTICE
+    for n in range(60, 70):                                         # 70 rows: no longer
+        ids.append(knowledge.supersede(kb.db, ids[-1], reason='합성', recorded_by=BY, call_id='c', my_note=True,
+                                       value=f'값 {n}')['new']['id'])
+    for asked, expected in ((ids[0], ids[:50]), (ids[-1], ids[-50:]), (ids[35], ids[10:60])):
+        part = knowledge_query.history(kb.db, asked)
+        assert part['truncated'] and [r['id'] for r in part['chain']] == expected, asked
+        assert part['notice'][0] == knowledge_query.HISTORY_PARTIAL_NOTICE.format(asked=asked, walked=60, kept=50)
+
+
 def test_conflict_lists_are_capped_with_a_count_of_the_rest(kb):
     entity = kb.entity()
     first = kb.fact(entity, '값 0')['assertion']
@@ -792,3 +857,42 @@ def test_a_failed_answer_after_the_commit_names_the_stored_ids(kb, monkeypatch):
     assert caught.value.code == 'internal_error' and f'stored (id {stored})' in caught.value.message
     assert 'RuntimeError' in caught.value.message and '합성 고장' not in caught.value.message
     assert 'do not repeat' in caught.value.message and not kb.db.in_transaction
+
+
+# ---- review M4 v2 N1: source checks on a large document stay indexed --------------------------------
+
+def test_reads_with_many_sources_in_a_large_document_stay_fast(tmp_path):
+    """The reviewer's probe made smaller (40,000 units, 150 sources): every read re-checks each source
+    against its stored unit, which is one indexed lookup (migration v4) instead of a scan of the version."""
+    import time
+    lines = [f'합성 대형 문서 {n}번째 줄' for n in range(1, 40_001)]
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    (tmp_path/'src').mkdir()
+    (tmp_path/'src'/'big.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, tmp_path/'src'))
+        version, doc, path, sha = db.execute('SELECT v.id, d.id, d.path, v.sha256 FROM versions v JOIN documents d '
+                                             'ON d.id = v.document_id').fetchone()
+        units = {o: (json.loads(u), t) for o, u, t in db.execute(
+            'SELECT ordinal, locator_json, text FROM units WHERE version_id=?', (version,))}
+        assert len(units) == 40_000
+        entity = knowledge.record_entity(db, kind='project', name='합성 대형', recorded_by=BY)['entity']['id']
+        for n in range(50):
+            sources = []
+            for k in range(3):
+                unit, text = units[40_000 - (n * 3 + k) * 97]
+                sources.append({'locator': locator.make(doc, path, sha, unit, text, [0, len(text)]), 'quote': text})
+            knowledge.record(db, 'fact', recorded_by=BY, call_id='c', entity_id=entity, predicate=f'속성 {n}',
+                             value='합성', sources=sources)
+        assert db.execute('SELECT COUNT(*) FROM evidence').fetchone()[0] == 150
+        started = time.perf_counter()
+        listed = knowledge_query.list_assertions(db, {'entity_id': entity}, 50, 0)
+        detail = knowledge_query.entity_detail(db, entity, as_of_valid=None, as_of_recorded=None,
+                                               include_closed=False, source_kind='all', limit=50)
+        elapsed = time.perf_counter() - started
+        assert len(listed['items']) == 50 and len(detail['facts']) == 50
+        assert all(row['source_state'] == 'current' for row in listed['items'])
+        assert elapsed < 1.0, elapsed       # indexed: well under 0.1 s here; without the index 1.9 s
+    finally:
+        db.close()

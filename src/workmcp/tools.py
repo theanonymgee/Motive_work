@@ -331,10 +331,30 @@ def shrink_entity(envelope: dict) -> bool:
             result[key].pop()
             result['has_more'][key] = True
             _set_notice(envelope, SHRINK_ENTITY_NOTICE, _notice_count(envelope, SHRINK_ENTITY_NOTICE) + 1)
+            _renotice(envelope, knowledge_query.notices_for(
+                [row for name in knowledge_query.ENTITY_LISTS for row in result[name]], quotes=True))
             if not any(result.get(name) for name in ENTITY_SHRINK_ORDER):
                 _emptied(envelope)
             return True
     return False
+
+
+_KNOWLEDGE_NOTICE_HEADS = tuple(template.split('{}', 1)[0] for template in knowledge_query.NOTICE_TEMPLATES)
+
+
+def _renotice(envelope: dict, lines: list[str]) -> None:
+    """Replace the source, conflict and branch lines ``knowledge_query`` made for all rows with ``lines``,
+    made for the rows the budget kept (review M4 v2 L-c); the other lines stay."""
+    kept = [line for line in envelope['notice'] if not line.startswith(_KNOWLEDGE_NOTICE_HEADS)]
+    envelope['notice'] = [*lines, *kept]
+
+
+def shrink_knowledge_rows(envelope: dict) -> bool:
+    """``list_knowledge``: drop the last row (``_shrink_rows``), then count the notices over the rows left."""
+    if not _shrink_rows('items')(envelope):
+        return False
+    _renotice(envelope, knowledge_query.notices_for(envelope['result']['items'], quotes=False))
+    return True
 
 
 def shrink_history(envelope: dict) -> bool:
@@ -348,6 +368,8 @@ def shrink_history(envelope: dict) -> bool:
     result['chain'].pop(0)
     result['truncated'] = True
     _set_notice(envelope, SHRINK_HISTORY_NOTICE, _notice_count(envelope, SHRINK_HISTORY_NOTICE) + 1)
+    result['branches'] = knowledge_query.branches_of((row['id'], row['supersedes_id']) for row in result['chain'])
+    _renotice(envelope, knowledge_query.history_notices(result['chain'], result['branches']))
     if not result['chain']:
         _emptied(envelope, SHRINK_HISTORY_NOTICE)
     return True
@@ -357,7 +379,7 @@ SHRINK: dict[str, Callable[[dict], bool]] = {
     'search': shrink_search, 'get_snippet': shrink_snippet, 'list_documents': _shrink_rows('documents'),
     'recent_changes': _shrink_rows('changes'), 'status': shrink_none,
     **{name: shrink_quotes for name in WRITE_TOOL_NAMES}, 'find_entity': _shrink_rows('entities'),
-    'get_entity': shrink_entity, 'list_knowledge': _shrink_rows('items'), 'get_history': shrink_history}
+    'get_entity': shrink_entity, 'list_knowledge': shrink_knowledge_rows, 'get_history': shrink_history}
 
 
 def fit(envelope: dict, shrink: Callable[[dict], bool], budget: int = RESPONSE_MAX_CHARS - NOTICE_RESERVE) -> dict:

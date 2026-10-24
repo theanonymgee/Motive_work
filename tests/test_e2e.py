@@ -154,7 +154,7 @@ def test_cli_scan_index_then_the_server_tools_answer_with_exact_sources(workmcp_
     state = server.make_state(home, write_db=db)
     try:
         status = json.loads(server.handle(state, 'status', {}, ('e2e', '1')))['result']
-        assert status['schema_version'] == 3 and status['last_scan'] is not None
+        assert status['schema_version'] == 4 and status['last_scan'] is not None
         found = json.loads(server.handle(state, 'search', {'query': SENTINEL, 'limit': 3}, ('e2e', '1')))
         assert found['ok'] and found['result']['hits']
         hit = found['result']['hits'][0]

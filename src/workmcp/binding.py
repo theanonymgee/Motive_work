@@ -25,6 +25,12 @@ SCOPE = ('결속 100% = parse_status가 ok인 버전 중 현재 파일의 sha256
 MAX_FAILURES = 20
 UNVERIFIABLE = ('stale', 'missing', 'locked', 'unstable', 'parser_version_mismatch', 'skipped_not_ok', 'placeholder',
                 'timeout')
+# Mismatches a later ``scan --reparse`` of the cited version explains (review M4 v2 N2); a quote whose own
+# hash is wrong, a bad shape or another version is never one of them.
+REPARSE_STALE_CODES = frozenset({'unit_not_found', 'coordinate_out_of_range', 'locator_text_mismatch',
+                                 'evidence_quote_mismatch'})
+REPARSE_STALE_NOTICE = ('warning: 근거 {}건은 인용 뒤 그 버전이 다시 파싱(scan --reparse)돼 원문과 맞지 않습니다 - '
+                        '실패가 아님; 조회 도구가 changed와 requote로 보이며, 필요하면 sources로 다시 인용해 supersede')
 
 
 def _sha(text: str) -> str:
@@ -73,7 +79,8 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
     document_id, sha256, size, parse_status, parser_version, path, ext, is_latest = row
     report = {'version_id': version_id, 'document_id': document_id, 'path': path, 'sha12': sha256[:12],
               'latest': bool(is_latest), 'result': None, 'units_total': 0, 'units_bound': 0, 'chunks_checked': 0,
-              'chunks_other_version': 0, 'evidence_checked': 0, 'failures': []}
+              'chunks_other_version': 0, 'evidence_checked': 0, 'evidence_stale_after_reparse': 0,
+              'failures': []}
     if parse_status != 'ok':
         stored = db.execute('SELECT COUNT(*) FROM units WHERE version_id=?', (version_id,)).fetchone()[0]
         if stored:
@@ -169,10 +176,20 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
             fail(None, 'chunk_set_mismatch')
 
     by_unit = {parsers.unit_json(unit.unit): unit for unit in units}
-    for locator_json, quote, quote_sha256 in db.execute(
-            'SELECT locator_json, quote, quote_sha256 FROM evidence WHERE version_id=? ORDER BY id', (version_id,)):
+    # Review M4 v2 N2: ``scan --reparse`` refills the units of a version in place, so a source recorded before
+    # that no longer matches the re-derived text. Such a source (a reparsed event of this version at or after
+    # its assertion was recorded) is counted as ``evidence_stale_after_reparse``, not a failure; the read
+    # tools show it as ``changed`` with a requote. Any other mismatch (forged, damaged) still fails.
+    for locator_json, quote, quote_sha256, reparsed_after in db.execute(
+            'SELECT e.locator_json, e.quote, e.quote_sha256, EXISTS(SELECT 1 FROM document_events ev '
+            "WHERE ev.version_id = e.version_id AND ev.kind = 'reparsed' "
+            'AND julianday(ev.at) >= julianday(a.recorded_from)) '
+            'FROM evidence e JOIN assertions a ON a.id = e.assertion_id WHERE e.version_id=? ORDER BY e.id',
+            (version_id,)):
         report['evidence_checked'] += 1
         try:
+            if _sha(quote) != quote_sha256:
+                raise locator.LocatorError('evidence_quote_sha256_mismatch')
             obj = locator.check_shape(json.loads(locator_json))
             if obj['doc'] != document_id or obj['sha256'] != sha256:
                 raise locator.LocatorError('evidence_version_mismatch')
@@ -181,11 +198,12 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
                 raise locator.LocatorError('unit_not_found')
             if locator.check_text(obj, unit.text) != quote:
                 raise locator.LocatorError('evidence_quote_mismatch')
-            if _sha(quote) != quote_sha256:
-                raise locator.LocatorError('evidence_quote_sha256_mismatch')
         except (ValueError, TypeError) as exc:  # LocatorError is a ValueError
             code = getattr(exc, 'code', 'evidence_locator_invalid')
-            fail(None, f'evidence:{code}')
+            if reparsed_after and code in REPARSE_STALE_CODES:
+                report['evidence_stale_after_reparse'] += 1
+            else:
+                fail(None, f'evidence:{code}')
     report['result'] = 'failed' if failures else 'ok'
     return report
 
@@ -224,7 +242,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     cache, files = {}, {}
     versions = {'total': len(ids), 'checked': 0, 'ok': 0, 'failed': 0, 'unverifiable': dict.fromkeys(UNVERIFIABLE, 0)}
     units = {'total': 0, 'bound': 0}
-    chunks = other_chunks = evidence = 0
+    chunks = other_chunks = evidence = stale_evidence = 0
     failures, stale_latest = [], set()
     for version_id in ids:
         report = verify_version(db, version_id, cache, limits, files, read_cloud_placeholders=read_cloud_placeholders)
@@ -237,6 +255,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
             chunks += report['chunks_checked']
             other_chunks += report['chunks_other_version']
             evidence += report['evidence_checked']
+            stale_evidence += report['evidence_stale_after_reparse']
             failures += report['failures']
         else:
             versions['unverifiable'][result] += 1
@@ -246,10 +265,13 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     notice = [f'{len(stale_latest)}개 문서가 마지막 스캔 이후 바뀜 - `workmcp scan`을 먼저 실행'] if stale_latest else []
     if mismatched := versions['unverifiable']['parser_version_mismatch']:
         notice.append(f'{mismatched}개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱')
+    if stale_evidence:
+        notice.append(REPARSE_STALE_NOTICE.format(stale_evidence))
     return {'scope': SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version
                                                 for ext in sorted(parsers.SUPPORTED_EXTENSIONS)},
             'checked_at': store.now(), 'versions': versions, 'units': units, 'chunks_checked': chunks,
-            'chunks_other_version': other_chunks, 'evidence_checked': evidence, 'ok': versions['failed'] == 0, 'failures': failures[:MAX_FAILURES],
+            'chunks_other_version': other_chunks, 'evidence_checked': evidence,
+            'evidence_stale_after_reparse': stale_evidence, 'ok': versions['failed'] == 0, 'failures': failures[:MAX_FAILURES],
             'notice': notice}
 
 

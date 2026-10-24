@@ -125,7 +125,7 @@ def test_status_has_engine_virtualization_calls_and_process(home):
     engine = search.Engine(home, config.SearchSettings(model_idle_seconds=60),
                            embedder_factory=lambda: embedder.HashEmbedder(64), clock=clock)
     result = tools.status(home, engine, started_at='2026-10-24T09:00:00+09:00', unloads=2)['result']
-    assert set(result) == tools.STATUS_KEYS and result['schema_version'] == store.SCHEMA_VERSION == 3
+    assert set(result) == tools.STATUS_KEYS and result['schema_version'] == store.SCHEMA_VERSION == 4
     assert result['knowledge'] == {'entities': 0, 'assertions': {'active': 0, 'conflict': 0, 'withdrawn': 0,
                                                                  'superseded': 0},
                                    'tasks_open': 0, 'evidence': 0, 'events': 0}
@@ -1161,7 +1161,9 @@ def test_write_response_drops_quotes_last(kstate):
 
 def entity_envelope(rows: int, quote: str = '합성 인용 문장') -> dict:
     obj, _ = piece(1, quote)
-    item = lambda n: {'id': n, 'evidence': [{'id': n, 'locator': obj, 'quote': quote, 'quote_chars': len(quote)}]}  # noqa: E731
+    item = lambda n: {'id': n, 'supersedes_id': None, 'source_state': 'current', 'conflicts': [],  # noqa: E731
+                      'evidence': [{'id': n, 'locator': obj, 'quote': quote, 'quote_chars': len(quote),
+                                    'source_state': 'current'}]}
     return tools.ok({'entity': {'id': 1}, **{key: [item(n) for n in range(rows)] for key in knowledge_query.ENTITY_LISTS},
                      'predicates_in_use': [], 'has_more': {key: False for key in knowledge_query.ENTITY_LISTS},
                      'as_of': {'valid': None, 'recorded': None}})
@@ -1182,7 +1184,8 @@ def test_get_entity_and_history_shrink_quotes_then_rows():
     fitted = tools.fit(entity_envelope(5), tools.shrink_entity, len(tools.dumps(entity_envelope(5))) // 2)
     assert fitted['ok'] and fitted['delivered_sources'] == [locator.display(o) for o, _ in quotes_of(fitted['result'])]
     obj, _ = piece(1, '합성 이력')
-    chain = [{'id': n, 'evidence': [{'id': n, 'locator': obj, 'quote': f'합성 이력 {n}', 'quote_chars': 7}],
+    chain = [{'id': n, 'supersedes_id': n - 1 if n else None, 'source_state': 'current', 'conflicts': [],
+              'evidence': [{'id': n, 'locator': obj, 'quote': f'합성 이력 {n}', 'quote_chars': 7, 'source_state': 'current'}],
               'events': [], 'links': []} for n in range(3)]
     history = tools.ok({'chain': chain, 'truncated': False})
     for _ in range(3):                                             # quotes from the root on
@@ -1285,11 +1288,12 @@ def test_no_knowledge_text_in_tool_calls_deliveries_or_stderr(kstate, capsys):
 
 def test_a_result_emptied_by_the_budget_says_so_instead_of_paging():
     obj, text = piece(1, '합성 인용 ' * 40)
-    rows = tools.ok({'items': [{'id': 1, 'statement': text}], 'total': 1, 'limit': 1, 'offset': 0, 'has_more': False})
+    rows = tools.ok({'items': [{'id': 1, 'statement': text, 'source_state': None, 'conflicts': []}], 'total': 1, 'limit': 1, 'offset': 0, 'has_more': False})
     budget = len(tools.dumps(tools.ok({'items': [], 'total': 1, 'limit': 0, 'offset': 0, 'has_more': True}))) + 250
     fitted = tools.fit(rows, tools.SHRINK['list_knowledge'], budget)
     assert fitted['ok'] and fitted['result']['items'] == [] and fitted['notice'] == [tools.EMPTIED_NOTICE]
-    history = tools.ok({'chain': [{'id': 1, 'statement': text, 'evidence': []}], 'truncated': False, 'branches': []})
+    history = tools.ok({'chain': [{'id': 1, 'supersedes_id': None, 'statement': text, 'evidence': [], 'source_state': None,
+                                  'conflicts': []}], 'truncated': False, 'branches': []})
     fitted = tools.fit(history, tools.shrink_history, budget)
     assert fitted['result']['chain'] == [] and fitted['notice'] == [tools.EMPTIED_NOTICE]
     detail = entity_envelope(1)
@@ -1323,3 +1327,61 @@ def test_a_write_whose_answer_fails_after_the_commit_names_its_ids(kstate, monke
     assert f'stored (id {stored})' in envelope['error']['message'] and envelope['error']['retryable'] is False
     assert last_call(kstate)[3:5] == (0, 'internal_error')
     assert any(record.exc_info for record in caplog.records)    # the traceback goes to stderr
+
+
+# ---- review M4 v2: L-a (range ends), L-c (notices after the budget) ------------------------------------
+
+@pytest.mark.parametrize('tool, args', [
+    ('search', {'query': '합성 과제', 'since': '0001-01-01'}),
+    ('search', {'query': '합성 과제', 'until': '9999-12-31T23:59:59'}),
+    ('list_knowledge', {'as_of_recorded': '0001-01-01T00:00:00'}),
+    ('list_knowledge', {'recorded_since': '9999-12-31T23:59:59'}),
+    ('get_entity', {'entity_id': 1, 'as_of_recorded': '0001-01-01'}),
+])
+def test_times_at_the_ends_of_the_range_are_refused_or_answered_never_internal(kstate, caplog, tool, args):
+    """Without an offset these take the local zone, which Windows cannot give at the range ends (OSError)."""
+    call(kstate, 'record_entity', kind='project', name='합성 과제')
+    envelope = call(kstate, tool, **args)
+    assert envelope['ok'] or envelope['error']['code'] in ('argument_invalid', 'filter_invalid'), envelope
+    assert not any(record.exc_info for record in caplog.records)
+
+
+def history_row(row_id, parent, conflicts=()):
+    return {'id': row_id, 'supersedes_id': parent, 'source_state': None, 'conflicts': list(conflicts),
+            'evidence': [], 'events': [], 'links': []}
+
+
+def test_history_notices_and_branches_follow_the_rows_the_budget_kept():
+    chain = [history_row(1, None), history_row(2, 1), history_row(3, 2, [{'id': 9}]), history_row(4, 2)]
+    branches = knowledge_query.branches_of((r['id'], r['supersedes_id']) for r in chain)
+    envelope = tools.ok({'chain': chain, 'truncated': False, 'branches': branches},
+                        notice=knowledge_query.history_notices(chain, branches))
+    assert branches == [{'id': 2, 'children': [3, 4]}]
+    assert envelope['notice'] == [knowledge_query.HISTORY_BRANCH_NOTICE.format(2),
+                                  knowledge_query.CONFLICT_NOTICE.format(1)]
+    tools.shrink_history(envelope)                                  # row 1 goes; rows 3 and 4 still branch from 2
+    assert envelope['result']['branches'] == [{'id': 2, 'children': [3, 4]}]
+    tools.shrink_history(envelope)                                  # row 2 goes; 3 and 4 still name it
+    assert envelope['result']['branches'] == [{'id': 2, 'children': [3, 4]}]
+    tools.shrink_history(envelope)                                  # row 3 goes: no branch, no conflict left
+    assert envelope['result']['branches'] == [] and [r['id'] for r in envelope['result']['chain']] == [4]
+    assert envelope['notice'] == [tools.SHRINK_HISTORY_NOTICE.format(3)]
+
+
+def test_entity_and_list_notices_count_only_the_rows_left(kstate):
+    entity = call(kstate, 'record_entity', kind='project', name='합성 과제')['result']['entity']['id']
+    for n in range(25):
+        call(kstate, 'record_fact', entity_id=entity, predicate='충돌많음', value=f'합성 값 {n} ' + '가' * 20,
+             my_note=True)
+    kstate.budget = 10**7
+    full = call(kstate, 'get_entity', entity_id=entity)
+    assert knowledge_query.CONFLICT_NOTICE.format(25) in full['notice']
+    kstate.budget = 6_000
+    tight = call(kstate, 'get_entity', entity_id=entity)
+    left = len(tight['result']['facts'])
+    assert tight['ok'] and 0 < left < 25, left
+    assert knowledge_query.CONFLICT_NOTICE.format(left) in tight['notice']
+    assert knowledge_query.CONFLICT_NOTICE.format(25) not in tight['notice']
+    listed = call(kstate, 'list_knowledge', entity_id=entity)
+    rows = len(listed['result']['items'])
+    assert 0 < rows < 25 and knowledge_query.CONFLICT_NOTICE.format(rows) in listed['notice']
