@@ -936,15 +936,6 @@ def knowledge_session(hit: dict) -> list:
     ]
 
 
-def knowledge_ready() -> bool:
-    """False while a knowledge tool is still its stage-0 shell (design M4 §13.2: the session's knowledge part
-    turns on when the writers and readers land; until then only the fifteen tools and their arguments)."""
-    import inspect
-    from workmcp import tools
-    return not any('_stage0(' in inspect.getsource(getattr(tools, name))
-                   for name in (*tools.WRITE_TOOL_NAMES, *tools.KNOWLEDGE_READ_TOOL_NAMES))
-
-
 def unique_in_chunk(home: Path, hit: dict) -> None:
     """The session quotes ``hit['snippet']`` by chunk id: it must occur exactly once in the chunk's units."""
     from workmcp import store
@@ -1031,19 +1022,14 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     source root and no change to any original, exit 0; fifteen unstructured tools answer with envelopes
     whose delivered_sources are exactly the document text they carry, and every such text is the stored
     text under its locator; every call our code handles is logged once under the client's name, one
-    deliveries row per piece, and no query, statement, value, quote, name or reason in the log or stderr.
-    The knowledge part (write -> read -> supersede -> retract) runs once the knowledge tools are in."""
+    deliveries row per piece, and no query, statement, value, quote, name or reason in the log or stderr;
+    the knowledge part (write -> read -> supersede -> retract) leaves the rows ``check_knowledge_rows`` expects."""
     from workmcp import binding, locator, store
     home, src, hit = filled_home(tmp_path)
-    knowledge = knowledge_ready()
-    called, errors, delivering = dict(SERVE_CALLED), dict(SERVE_ERRORS), set(SERVE_DELIVERING)
-    steps = mcp_session(hit)
-    if knowledge:
-        unique_in_chunk(home, hit)
-        steps += knowledge_session(hit)
-        called |= KNOWLEDGE_CALLED
-        errors |= KNOWLEDGE_ERRORS
-        delivering |= KNOWLEDGE_DELIVERING
+    unique_in_chunk(home, hit)
+    steps = mcp_session(hit) + knowledge_session(hit)
+    called, errors = SERVE_CALLED | KNOWLEDGE_CALLED, SERVE_ERRORS | KNOWLEDGE_ERRORS
+    delivering = SERVE_DELIVERING | KNOWLEDGE_DELIVERING
     expected_ids = SERVE_IDS | set(called)
     before = snapshot(src)
     lines, stderr, report = serve_session(tmp_path, steps, expected_ids, root=src)
@@ -1099,8 +1085,7 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
         calls = db.execute('SELECT client, client_version, tool, ok, error_code, args_json, call_id FROM tool_calls '
                            'ORDER BY id').fetchall()                          # (g)
         deliveries = db.execute('SELECT client, COUNT(*) FROM deliveries GROUP BY client').fetchall()
-        if knowledge:
-            check_knowledge_rows(db, envelopes, calls)
+        check_knowledge_rows(db, envelopes, calls)
     finally:
         db.close()
     assert replies[12]['result']['isError'] is True  # (X-2) rejected by the SDK before our code runs

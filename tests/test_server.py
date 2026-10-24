@@ -374,12 +374,10 @@ def test_writers_get_the_knowledge_connection_recorded_by_and_the_logged_call_id
 ])
 def test_a_tool_argument_named_state_reaches_the_tool_function(state, tool, arguments, expected):
     """Through the SDK (``build_server``): an argument named ``state`` neither shadows the server state nor
-    collides with ``TOOLS``' first parameter (a stage-0 shell answers not_implemented)."""
+    collides with ``TOOLS``' first parameter."""
     built = server.build_server(state.home, state=state)
     result = anyio.run(built.call_tool, tool, arguments)
     envelope = json.loads(result.content[0].text)
-    if not implemented(tool):
-        expected = tools.NOT_IMPLEMENTED
     if expected is None:
         assert envelope['ok'] is True, envelope
         assert calls(state)[-1][2:5] == (tool, 1, None)
@@ -392,14 +390,6 @@ def test_a_tool_argument_named_state_reaches_the_tool_function(state, tool, argu
 
 # ---- M4: the knowledge write path in the server (design M4 §6.1, §6.5, §8.2) -------------------------
 
-def implemented(name: str) -> bool:
-    """False while ``tools.<name>`` is still its stage-0 shell (design M4 §13.2: these tests turn on once
-    the writers and readers land)."""
-    return '_stage0(' not in inspect.getsource(getattr(tools, name))
-
-
-needs_writers = pytest.mark.skipif(not all(map(implemented, tools.WRITE_TOOL_NAMES)),
-                                   reason='knowledge writers are stage-0 shells (design M4 §13.2)')
 KNOWLEDGE_TABLES = ('entities', 'assertions', 'evidence', 'links', 'assertion_events')
 
 
@@ -523,7 +513,7 @@ def test_store_busy_raised_by_a_writer_is_retryable(state, monkeypatch):
     assert envelope['error']['code'] == 'store_busy' and envelope['error']['retryable'] is True
 
 
-# The real writers (design M4 §12 ⑤): turned on once they are implemented.
+# The real writers (design M4 §12 ⑤).
 
 LONG_MARKS = tuple(f'합성긴줄{n:02d}' for n in range(1, 6))
 
@@ -562,7 +552,6 @@ def new_entity(state, name='합성 과제') -> int:
     return made['result']['entity']['id']
 
 
-@needs_writers
 def test_real_writers_wait_for_the_lock_then_answer_store_busy_and_write_nothing(state):
     entity = new_entity(state)
     before = counts(state.home)
@@ -584,7 +573,6 @@ def test_real_writers_wait_for_the_lock_then_answer_store_busy_and_write_nothing
         ('record_entity', 0, 'store_busy'), ('record_fact', 0, 'store_busy'), ('record_task', 0, 'store_busy')]
 
 
-@needs_writers
 def test_write_tool_errors_are_envelopes_and_write_nothing(state, tmp_path, capsys):
     hits = long_lines_home(state, tmp_path)
     entity = new_entity(state, f'합성 과제 {SENTINEL}')
@@ -618,7 +606,6 @@ def test_write_tool_errors_are_envelopes_and_write_nothing(state, tmp_path, caps
     assert not any(SENTINEL in args for _, _, args in rows) and SENTINEL not in capsys.readouterr().err
 
 
-@needs_writers
 def test_write_answers_fit_the_budget_and_deliveries_match_the_quotes_left(home, tmp_path):
     """Five 1,000-character quotes do not fit a 4,000-character budget: the answer drops quotes (design M4
     §6.5), every quote left is in delivered_sources and in deliveries, and the write keeps all five."""
@@ -698,7 +685,6 @@ class Serve:
             self.proc.kill()
 
 
-@needs_writers
 def test_two_servers_write_the_same_store(home):
     """Two serve processes (two clients) on one store, both writing while a third connection holds the
     write lock: once it is released their writes run one after the other (design M4 §8.2): the same entity
