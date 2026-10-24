@@ -265,13 +265,79 @@ def _shrink_rows(key: str) -> Callable[[dict], bool]:
 
 # Per tool: drop one unit from the end (a hit, a context unit, a row) or cut a piece; False when
 # nothing is left to drop.
-# Stage 0 (design M4 §6.5): the writers, get_entity and get_history drop nothing yet; stage 1 puts
-# shrink_quotes, shrink_entity and shrink_history here.
+SHRINK_QUOTES_NOTICE = '응답 크기 상한으로 인용 {}건을 뺐습니다(quote: null, quote_chars) — get_history로 하나씩 받으세요'
+SHRINK_ENTITY_NOTICE = '응답 크기 상한으로 목록 행 {}개를 뺐습니다(has_more 참고) — limit을 줄이거나 list_knowledge로 받으세요'
+SHRINK_HISTORY_NOTICE = '응답 크기 상한으로 이력의 오래된 행 {}개를 뺐습니다(truncated: true)'
+ENTITY_SHRINK_ORDER = ('tasks', 'decisions', 'related', 'facts')   # design M4 §6.5: tasks go first
+
+
+def quote_items(node) -> list[dict]:
+    """The evidence items that carry a quote (a dict with a ``locator`` and a string ``quote``), in JSON
+    order (``pieces_of``'s order)."""
+    found = []
+    if isinstance(node, Mapping):
+        if isinstance(node.get('locator'), Mapping) and isinstance(node.get('quote'), str):
+            found.append(node)
+        for value in node.values():
+            found += quote_items(value)
+    elif isinstance(node, list):
+        for item in node:
+            found += quote_items(item)
+    return found
+
+
+def _drop_quote(envelope: dict, item: dict) -> None:
+    """``quote`` to None (``quote_chars`` keeps its length): it leaves the response and delivered_sources."""
+    item['quote_chars'] = len(item['quote'])
+    item['quote'] = None
+    _set_notice(envelope, SHRINK_QUOTES_NOTICE, _notice_count(envelope, SHRINK_QUOTES_NOTICE) + 1)
+
+
+def shrink_quotes(envelope: dict) -> bool:
+    """Write responses (design M4 §6.5): drop the last quote still in the response."""
+    items = quote_items(envelope['result'])
+    if not items:
+        return False
+    _drop_quote(envelope, items[-1])
+    return True
+
+
+def shrink_entity(envelope: dict) -> bool:
+    """``get_entity``: drop the last quote still in the response (its locator stays; get_history gives it
+    again), then the last row of tasks, decisions, related, facts (``has_more`` true). Quotes go first
+    because they live in the rows: dropping the rows first would leave no quote to drop (design M4 §6.5
+    lists rows first)."""
+    if shrink_quotes(envelope):
+        return True
+    result = envelope['result']
+    for key in ENTITY_SHRINK_ORDER:
+        if result.get(key):
+            result[key].pop()
+            result['has_more'][key] = True
+            _set_notice(envelope, SHRINK_ENTITY_NOTICE, _notice_count(envelope, SHRINK_ENTITY_NOTICE) + 1)
+            return True
+    return False
+
+
+def shrink_history(envelope: dict) -> bool:
+    """``get_history``: drop the quotes from the root on, then the oldest rows (``truncated`` true)."""
+    result = envelope['result']
+    if items := quote_items(result['chain']):
+        _drop_quote(envelope, items[0])
+        return True
+    if not result['chain']:
+        return False
+    result['chain'].pop(0)
+    result['truncated'] = True
+    _set_notice(envelope, SHRINK_HISTORY_NOTICE, _notice_count(envelope, SHRINK_HISTORY_NOTICE) + 1)
+    return True
+
+
 SHRINK: dict[str, Callable[[dict], bool]] = {
     'search': shrink_search, 'get_snippet': shrink_snippet, 'list_documents': _shrink_rows('documents'),
     'recent_changes': _shrink_rows('changes'), 'status': shrink_none,
-    **{name: shrink_none for name in WRITE_TOOL_NAMES}, 'find_entity': _shrink_rows('entities'),
-    'get_entity': shrink_none, 'list_knowledge': _shrink_rows('items'), 'get_history': shrink_none}
+    **{name: shrink_quotes for name in WRITE_TOOL_NAMES}, 'find_entity': _shrink_rows('entities'),
+    'get_entity': shrink_entity, 'list_knowledge': _shrink_rows('items'), 'get_history': shrink_history}
 
 
 def fit(envelope: dict, shrink: Callable[[dict], bool], budget: int = RESPONSE_MAX_CHARS - NOTICE_RESERVE) -> dict:
@@ -672,8 +738,20 @@ def knowledge_envelope(out: Mapping) -> dict:
     return envelope
 
 
-def _stage0(tool: str) -> dict:
-    return error(NOT_IMPLEMENTED, f'{tool}: M4 stage 1')
+def _written(db, write: Callable[[], Mapping]) -> dict:
+    """The envelope of one knowledge write; ``store_missing`` when the server has no write connection."""
+    if db is None:
+        return error('store_missing', 'this server has no knowledge write connection')
+    return knowledge_envelope(write())
+
+
+def _read(home: Path, read: Callable[..., Mapping]) -> dict:
+    """The envelope of one knowledge read on a read-only connection (``FileNotFoundError``: store_missing)."""
+    db = store.open_read(home)
+    try:
+        return knowledge_envelope(read(db))
+    finally:
+        db.close()
 
 
 def record_entity(db, *, recorded_by: str, call_id: str | None, kind: str, name: str,
@@ -682,7 +760,8 @@ def record_entity(db, *, recorded_by: str, call_id: str | None, kind: str, name:
     if failure := _check({'kind': knowledge.ENTITY_KINDS, 'name': 'text', 'aliases': 'texts?', 'note': 'text?'},
                          {'kind': kind, 'name': name, 'aliases': aliases, 'note': note}):
         return failure
-    return _stage0('record_entity')
+    return _written(db, lambda: knowledge.record_entity(db, kind=kind, name=name, aliases=aliases, note=note,
+                                                       recorded_by=recorded_by))
 
 
 FACT_RULES = {'entity_id': 'id', 'predicate': 'text', 'value': 'text?', 'unit': 'text?', 'object_entity_id': 'id?',
@@ -708,7 +787,8 @@ def record_fact(db, *, recorded_by: str, call_id: str | None, entity_id: int, pr
             'valid_to': valid_to}
     if failure := _check(FACT_RULES, args) or _evidence_error(sources, my_note):
         return failure
-    return _stage0('record_fact')
+    return _written(db, lambda: knowledge.record(db, 'fact', recorded_by=recorded_by, call_id=call_id, sources=sources,
+                                                my_note=my_note, **args))
 
 
 def record_decision(db, *, recorded_by: str, call_id: str | None, statement: str, entity_id: int | None = None,
@@ -720,7 +800,8 @@ def record_decision(db, *, recorded_by: str, call_id: str | None, statement: str
             'rationale': rationale, 'decided_on': decided_on, 'valid_to': valid_to}
     if failure := _check(DECISION_RULES, args) or _evidence_error(sources, my_note):
         return failure
-    return _stage0('record_decision')
+    return _written(db, lambda: knowledge.record(db, 'decision', recorded_by=recorded_by, call_id=call_id,
+                                                sources=sources, my_note=my_note, **args))
 
 
 def record_task(db, *, recorded_by: str, call_id: str | None, statement: str, entity_id: int | None = None,
@@ -731,7 +812,8 @@ def record_task(db, *, recorded_by: str, call_id: str | None, statement: str, en
             'state': state, 'done_at': done_at}
     if failure := _check(TASK_RULES, args) or _evidence_error(sources, my_note):
         return failure
-    return _stage0('record_task')
+    return _written(db, lambda: knowledge.record(db, 'todo', recorded_by=recorded_by, call_id=call_id, sources=sources,
+                                                my_note=my_note, **args))
 
 
 def supersede(db, *, recorded_by: str, call_id: str | None, assertion_id: int, reason: str,
@@ -751,14 +833,18 @@ def supersede(db, *, recorded_by: str, call_id: str | None, assertion_id: int, r
             'owner_entity_id': owner_entity_id, 'state': state, 'done_at': done_at}
     if failure := _check(SUPERSEDE_RULES, args) or _evidence_error(sources, my_note):
         return failure
-    return _stage0('supersede')
+    fields = {name: value for name, value in args.items() if name not in ('assertion_id', 'reason', 'old_valid_to')}
+    return _written(db, lambda: knowledge.supersede(db, assertion_id, reason=reason, recorded_by=recorded_by,
+                                                   call_id=call_id, sources=sources, my_note=my_note,
+                                                   old_valid_to=old_valid_to, **fields))
 
 
 def retract(db, *, recorded_by: str, call_id: str | None, assertion_id: int, reason: str) -> dict:
     """``retract`` (design M4 §4.2, §6.2): ``RETRACT_RESULT_KEYS`` (``knowledge.retract``)."""
     if failure := _check({'assertion_id': 'id', 'reason': 'text'}, {'assertion_id': assertion_id, 'reason': reason}):
         return failure
-    return _stage0('retract')
+    return _written(db, lambda: knowledge.retract(db, assertion_id, reason=reason, recorded_by=recorded_by,
+                                                 call_id=call_id))
 
 
 def find_entity(home: Path, *, query: str, kind: str | None = None, limit: int = FIND_LIMIT_DEFAULT) -> dict:
@@ -770,7 +856,8 @@ def find_entity(home: Path, *, query: str, kind: str | None = None, limit: int =
         return failure
     if not _int_in(limit, 1, FIND_LIMIT_MAX):
         return error('argument_invalid', f'limit must be an integer 1-{FIND_LIMIT_MAX}')
-    return _stage0('find_entity')
+    query = knowledge.norm_text(query, 'query', FIND_QUERY_MAX)
+    return _read(home, lambda db: knowledge_query.find_entities(db, query, kind, limit))
 
 
 AS_OF_RULES = {'as_of_valid': 'date?', 'as_of_recorded': 'instant?', 'source_kind': knowledge_query.SOURCE_FILTERS}
@@ -792,7 +879,14 @@ def get_entity(home: Path, *, entity_id: int | None = None, kind: str | None = N
         return failure
     if not _int_in(limit, 1, ENTITY_LIMIT_MAX):
         return error('argument_invalid', f'limit must be an integer 1-{ENTITY_LIMIT_MAX}')
-    return _stage0('get_entity')
+    recorded = None if as_of_recorded is None else _instant(as_of_recorded, 'as_of_recorded')
+    name = None if name is None else knowledge.norm_text(name, 'name', knowledge.NAME_MAX)
+
+    def read(db):
+        found = entity_id if entity_id is not None else knowledge_query.entity_by_name(db, kind, name)
+        return knowledge_query.entity_detail(db, found, as_of_valid=as_of_valid, as_of_recorded=recorded,
+                                             include_closed=include_closed, source_kind=source_kind, limit=limit)
+    return _read(home, read)
 
 
 def list_knowledge(home: Path, *, kind: str = 'all', entity_id: int | None = None, predicate: str | None = None,
@@ -813,7 +907,14 @@ def list_knowledge(home: Path, *, kind: str = 'all', entity_id: int | None = Non
         return error('argument_invalid', f'limit must be an integer 1-{KNOWLEDGE_LIMIT_MAX}')
     if not _int_in(offset, 0):
         return error('argument_invalid', 'offset must be an integer >= 0')
-    return _stage0('list_knowledge')
+    filters = {'kind': kind, 'entity_id': entity_id,
+               'predicate': None if predicate is None else knowledge.norm_text(predicate, 'predicate',
+                                                                               knowledge.PREDICATE_MAX),
+               'status': status, 'state': state, 'due_before': due_before, 'source_kind': source_kind,
+               'as_of_valid': as_of_valid,
+               'as_of_recorded': None if as_of_recorded is None else _instant(as_of_recorded, 'as_of_recorded'),
+               'recorded_since': None if recorded_since is None else _instant(recorded_since, 'recorded_since')}
+    return _read(home, lambda db: knowledge_query.list_assertions(db, filters, limit, offset))
 
 
 def get_history(home: Path, *, assertion_id: int) -> dict:
@@ -821,4 +922,4 @@ def get_history(home: Path, *, assertion_id: int) -> dict:
     in ``delivered_sources``."""
     if failure := _check({'assertion_id': 'id'}, {'assertion_id': assertion_id}):
         return failure
-    return _stage0('get_history')
+    return _read(home, lambda db: knowledge_query.history(db, assertion_id))

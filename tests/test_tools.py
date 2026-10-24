@@ -972,20 +972,14 @@ NOTE = {'my_note': True}
     ('supersede', {'assertion_id': 1, 'reason': '합성 교정', 'value': '새 값', 'old_valid_to': '2026-10-20', **NOTE}),
     ('supersede', {'assertion_id': 1, 'reason': '합성 완료', 'state': 'done', **NOTE}),
     ('retract', {'assertion_id': 1, 'reason': '합성 철회'}),
-    ('find_entity', {'query': '합성'}),
-    ('get_entity', {'entity_id': 1, 'as_of_valid': '2026-10-10', 'as_of_recorded': '2026-10-25T10:00:00+09:00'}),
-    ('get_entity', {'kind': 'project', 'name': '합성 P', 'include_closed': True, 'source_kind': 'my_note'}),
-    ('list_knowledge', {'kind': 'todo', 'state': 'open', 'status': 'all', 'due_before': '2026-12-01', 'limit': 200}),
-    ('get_history', {'assertion_id': 1}),
 ])
-def test_knowledge_tools_check_arguments_then_answer_not_implemented(state, tool, args):
-    """Stage 0: valid arguments pass the checks and reach the stage-1 body (``not_implemented``); the
-    call is logged with its summary."""
+def test_writers_check_arguments_before_the_write_connection(state, tool, args):
+    """Valid arguments pass the type checks and reach the write connection, which this state lacks
+    (``store_missing``); the call is logged with its summary."""
     envelope = call(state, tool, **args)
-    assert envelope == {'ok': False, 'error': {'code': tools.NOT_IMPLEMENTED, 'message': f'{tool}: M4 stage 1',
-                                               'retryable': False}}
+    assert envelope['ok'] is False and envelope['error']['code'] == 'store_missing', envelope
     _, client, logged_tool, ok, error_code, pieces, chars, args_json = last_call(state)
-    assert (client, logged_tool, ok, error_code, pieces, chars) == (CLIENT[0], tool, 0, tools.NOT_IMPLEMENTED, 0, 0)
+    assert (client, logged_tool, ok, error_code, pieces, chars) == (CLIENT[0], tool, 0, 'store_missing', 0, 0)
     assert json.loads(args_json) == tools.summarize_args(tool, args)
 
 
@@ -1022,8 +1016,8 @@ def test_knowledge_tools_check_arguments_then_answer_not_implemented(state, tool
     ('list_knowledge', {'offset': -1}, 'argument_invalid'),
     ('get_history', {'assertion_id': -1}, 'argument_invalid'),
 ])
-def test_knowledge_tool_argument_errors_are_envelopes_without_text(state, tool, args, code):
-    envelope = call(state, tool, **args)
+def test_knowledge_tool_argument_errors_are_envelopes_without_text(kstate, tool, args, code):
+    envelope = call(kstate, tool, **args)
     assert envelope['ok'] is False and envelope['error']['code'] == code, envelope
     assert '합성' not in envelope['error']['message']   # names and ranges, never what the client sent
 
@@ -1073,3 +1067,186 @@ def test_knowledge_envelope_moves_notice_and_delivers_the_quotes():
                                                                                     'quote': text}]},
                                                'conflicts': [], 'duplicates': []},
                         'delivered_sources': [locator.display(obj)], 'notice': ['합성 안내']}
+
+
+# ---- M4 stage 1: the writers through server.handle (design M4 §6.2, §6.5, §7) ------------------------
+
+@pytest.fixture
+def kstate(tmp_path):
+    """A small scanned and indexed home (``test_knowledge.KB``) with both write connections."""
+    from test_knowledge import KB
+    kb = KB(tmp_path)
+    write_db = store.open_home(kb.home)
+    value = server.make_state(kb.home, engine=hash_engine(kb.home), write_db=write_db, know_db=kb.db)
+    value.kb = kb
+    yield value
+    write_db.close()
+    kb.db.close()
+
+
+def quotes_of(node) -> list[tuple[dict, str]]:
+    """Evidence quotes in a response, read from its structure (independently of ``tools.pieces_of``)."""
+    return [(item['locator'], item['quote']) for item in tools.quote_items(node)]
+
+
+def test_write_tools_return_envelopes_with_assertion_keys(kstate):
+    kb = kstate.kb
+    entity = call(kstate, 'record_entity', kind='project', name='합성 과제 31', aliases=['과제31'])
+    assert entity['ok'] and set(entity['result']) == tools.RECORD_ENTITY_RESULT_KEYS
+    assert set(entity['result']['entity']) == tools.ENTITY_KEYS and entity['delivered_sources'] == []
+    assert entity['result']['entity']['created_by'] == f'{CLIENT[0]}/record_entity'
+    entity_id = entity['result']['entity']['id']
+    quote = '계약 상태는 검토 중'
+    fact = call(kstate, 'record_fact', entity_id=entity_id, predicate='계약 상태', value='검토 중',
+                sources=[{'chunk_id': kb.chunk('notes.txt', 1), 'quote': quote}], valid_from='2026-10-01')
+    decision = call(kstate, 'record_decision', statement='합성 결정', options=['A', 'B'], chosen='A', my_note=True)
+    task = call(kstate, 'record_task', statement='합성 할 일', due='2026-11-01', my_note=True)
+    for envelope in (fact, decision, task):
+        assert envelope['ok'], envelope
+        assert set(envelope['result']) == tools.RECORD_RESULT_KEYS
+        assert set(envelope['result']['assertion']) == tools.ASSERTION_KEYS
+    [evidence] = fact['result']['assertion']['evidence']
+    assert set(evidence) == tools.EVIDENCE_KEYS and evidence['quote'] == quote
+    assert fact['delivered_sources'] == [locator.display(evidence['locator'])]
+    assert fact['result']['assertion']['recorded_by'] == f'{CLIENT[0]}/record_fact'
+    assert decision['delivered_sources'] == [] and task['result']['assertion']['data']['state'] == 'open'
+    new = call(kstate, 'supersede', assertion_id=fact['result']['assertion']['id'], reason='합성 갱신', value='승인',
+               old_valid_to='2026-10-20', sources=[{'locator': kb.loc('notes.txt', 1), 'quote': '합성 과제 31'}])
+    assert new['ok'] and set(new['result']) == tools.SUPERSEDE_RESULT_KEYS
+    assert all(set(new['result'][key]) == tools.ASSERTION_KEYS for key in ('old', 'cut', 'new'))
+    assert new['delivered_sources'] == [locator.display(obj) for obj, _ in quotes_of(new['result'])]
+    assert len(new['delivered_sources']) == 2                      # the cut's copied source and the new one
+    closed = call(kstate, 'retract', assertion_id=task['result']['assertion']['id'], reason='합성 철회')
+    assert closed['ok'] and set(closed['result']) == tools.RETRACT_RESULT_KEYS and closed['delivered_sources'] == []
+    events = kb.db.execute('SELECT kind, recorded_by, call_id FROM assertion_events ORDER BY id').fetchall()
+    logged = dict(kstate.write_db.execute('SELECT call_id, tool FROM tool_calls').fetchall())
+    assert all(logged[call_id] == by.split('/')[1] and by.startswith(CLIENT[0] + '/') for _, by, call_id in events)
+
+
+def test_write_errors_are_envelopes_and_leave_nothing(kstate):
+    kb = kstate.kb
+    entity = call(kstate, 'record_entity', kind='project', name='합성 과제')['result']['entity']['id']
+    before = {t: kb.count(t) for t in ('assertions', 'evidence', 'assertion_events', 'links')}
+    for args, code in (({'sources': [{'chunk_id': kb.chunk('notes.txt', 1), 'quote': '없는 문장'}]},
+                        'evidence_quote_not_found'),
+                       ({'sources': [{'chunk_id': 999_999, 'quote': '합성 과제'}]}, 'chunk_not_found'),
+                       ({}, 'evidence_required'),
+                       ({'entity_id': 999, 'my_note': True}, 'entity_not_found')):
+        envelope = call(kstate, 'record_fact', **{'entity_id': entity, 'predicate': '담당', 'value': '합성 값', **args})
+        assert envelope['ok'] is False and envelope['error']['code'] == code, envelope
+        assert last_call(kstate)[3:6] == (0, code, 0)
+    assert call(kstate, 'retract', assertion_id=999, reason='합성')['error']['code'] == 'assertion_not_found'
+    assert {t: kb.count(t) for t in before} == before
+
+
+def test_write_response_drops_quotes_last(kstate):
+    kb = kstate.kb
+    sources = [{'locator': kb.loc('notes.txt', n), 'quote': text} for n, text in
+               ((1, '합성 과제 31의 계약'), (3, '여러 개인 합성'), (5, '표지 문장은'), (6, '걸친 인용의'), (7, '여기 있습니다'))]
+    roomy = call(kstate, 'record_decision', statement='합성 결정', sources=sources)
+    size = len(tools.dumps(roomy))
+    kstate.budget = size - 1                                     # one quote has to go
+    tight = call(kstate, 'record_decision', statement='합성 결정 2', sources=sources)
+    assert tight['ok'], tight
+    evidence = tight['result']['assertion']['evidence']
+    assert [e['quote'] for e in evidence[:-1]] == [s['quote'] for s in sources[:-1]] and evidence[-1]['quote'] is None
+    assert evidence[-1]['quote_chars'] == len(sources[-1]['quote'])
+    assert tight['delivered_sources'] == [locator.display(e['locator']) for e in evidence[:-1]]
+    assert tools.SHRINK_QUOTES_NOTICE.format(1) in tight['notice']
+    assert last_call(kstate)[5] == len(sources) - 1                # pieces logged: the quotes that left
+    kstate.budget = 600
+    assert call(kstate, 'record_decision', statement='합성 결정 3', sources=sources)['error']['code'] == \
+        'response_too_large'
+
+
+def entity_envelope(rows: int, quote: str = '합성 인용 문장') -> dict:
+    obj, _ = piece(1, quote)
+    item = lambda n: {'id': n, 'evidence': [{'id': n, 'locator': obj, 'quote': quote, 'quote_chars': len(quote)}]}  # noqa: E731
+    return tools.ok({'entity': {'id': 1}, **{key: [item(n) for n in range(rows)] for key in knowledge_query.ENTITY_LISTS},
+                     'predicates_in_use': [], 'has_more': {key: False for key in knowledge_query.ENTITY_LISTS},
+                     'as_of': {'valid': None, 'recorded': None}})
+
+
+def test_get_entity_and_history_shrink_quotes_then_rows():
+    envelope = entity_envelope(2)
+    for _ in range(8):                                             # every quote first, the last one first
+        assert tools.shrink_entity(envelope)
+    assert all(row['evidence'][0]['quote'] is None for key in knowledge_query.ENTITY_LISTS
+               for row in envelope['result'][key])
+    assert tools.SHRINK_QUOTES_NOTICE.format(8) in envelope['notice']
+    for expected in ('tasks', 'tasks', 'decisions', 'decisions', 'related', 'related', 'facts', 'facts'):
+        assert tools.shrink_entity(envelope)
+        assert envelope['result']['has_more'][expected] is True
+    assert tools.SHRINK_ENTITY_NOTICE.format(8) in envelope['notice']
+    assert not tools.shrink_entity(envelope)
+    fitted = tools.fit(entity_envelope(5), tools.shrink_entity, len(tools.dumps(entity_envelope(5))) // 2)
+    assert fitted['ok'] and fitted['delivered_sources'] == [locator.display(o) for o, _ in quotes_of(fitted['result'])]
+    obj, _ = piece(1, '합성 이력')
+    chain = [{'id': n, 'evidence': [{'id': n, 'locator': obj, 'quote': f'합성 이력 {n}', 'quote_chars': 7}],
+              'events': [], 'links': []} for n in range(3)]
+    history = tools.ok({'chain': chain, 'truncated': False})
+    for _ in range(3):                                             # quotes from the root on
+        assert tools.shrink_history(history)
+    assert [row['evidence'][0]['quote'] for row in history['result']['chain']] == [None, None, None]
+    assert tools.shrink_history(history) and history['result']['truncated'] is True
+    assert [row['id'] for row in history['result']['chain']] == [1, 2]
+    assert tools.SHRINK_QUOTES_NOTICE.format(3) in history['notice']
+    assert tools.SHRINK_HISTORY_NOTICE.format(1) in history['notice']
+
+
+def test_read_tools_return_entity_and_assertion_keys_and_deliver_only_quotes(kstate):
+    kb = kstate.kb
+    entity = call(kstate, 'record_entity', kind='project', name='합성 과제 31', aliases=['과제31'])['result']['entity']
+    source = [{'locator': kb.loc('notes.txt', 1), 'quote': '계약 상태는 검토 중'}]
+    fact = call(kstate, 'record_fact', entity_id=entity['id'], predicate='계약 상태', value='검토 중', sources=source)
+    call(kstate, 'record_fact', entity_id=entity['id'], predicate='계약 상태', value='승인', my_note=True)  # conflict
+    call(kstate, 'record_task', statement='합성 할 일', entity_id=entity['id'], my_note=True)
+    found = call(kstate, 'find_entity', query='과제31')
+    assert found['ok'] and set(found['result']) == tools.FIND_RESULT_KEYS and found['delivered_sources'] == []
+    assert [e['id'] for e in found['result']['entities']] == [entity['id']]
+    assert all(set(e) == tools.ENTITY_KEYS for e in found['result']['entities'])
+    detail = call(kstate, 'get_entity', entity_id=entity['id'])
+    by_name = call(kstate, 'get_entity', kind='project', name=' 합성 과제 31 ')
+    for envelope in (detail, by_name):
+        assert envelope['ok'] and set(envelope['result']) == tools.ENTITY_RESULT_KEYS, envelope
+        assert envelope['result']['entity']['id'] == entity['id']
+        assert all(set(row) == tools.ASSERTION_KEYS for key in knowledge_query.ENTITY_LISTS
+                   for row in envelope['result'][key])
+        assert envelope['delivered_sources'] == [locator.display(o) for o, _ in quotes_of(envelope['result'])]
+        assert len(envelope['delivered_sources']) == 1
+    assert last_call(kstate)[5] == 1                                 # one piece logged
+    listed = call(kstate, 'list_knowledge', entity_id=entity['id'], kind='fact')
+    assert listed['ok'] and set(listed['result']) == tools.KNOWLEDGE_LIST_RESULT_KEYS
+    assert listed['delivered_sources'] == [] and len(listed['result']['items']) == 2
+    assert all(row['evidence'] is None and set(row) == tools.ASSERTION_KEYS for row in listed['result']['items'])
+    history = call(kstate, 'get_history', assertion_id=fact['result']['assertion']['id'])
+    assert history['ok'] and set(history['result']) == tools.HISTORY_RESULT_KEYS
+    assert history['delivered_sources'] == [locator.display(o) for o, _ in quotes_of(history['result'])] != []
+    assert call(kstate, 'get_entity', kind='project', name='없는 합성')['error']['code'] == 'entity_not_found'
+    assert call(kstate, 'get_history', assertion_id=999)['error']['code'] == 'assertion_not_found'
+    kstate.budget = len(tools.dumps(detail)) - 1                    # the quote goes before any row
+    tight = call(kstate, 'get_entity', entity_id=entity['id'])
+    assert tight['ok'] and tight['delivered_sources'] == [] and quotes_of(tight['result']) == []
+    assert [row['id'] for row in tight['result']['facts']] == [row['id'] for row in detail['result']['facts']]
+
+
+def test_no_knowledge_text_in_tool_calls_deliveries_or_stderr(kstate, capsys):
+    kb = kstate.kb
+    text = f'{SENTINEL} 합성 본문'
+    entity = call(kstate, 'record_entity', kind='person', name=text, aliases=[text], note=text)
+    entity_id = entity['result']['entity']['id']
+    fact = call(kstate, 'record_fact', entity_id=entity_id, predicate=text, value=text, statement=text,
+                sources=[{'locator': kb.loc('notes.txt', 5), 'quote': SENTINEL}])
+    assert fact['ok'], fact
+    call(kstate, 'supersede', assertion_id=fact['result']['assertion']['id'], reason=text, value=text + ' 2',
+         my_note=True)
+    call(kstate, 'record_decision', statement=text, rationale=text, my_note=True)
+    call(kstate, 'record_fact', entity_id=entity_id, predicate=text, value=text,
+         sources=[{'locator': kb.loc('notes.txt', 1), 'quote': text}])       # not found: no text in the error
+    for row in kstate.write_db.execute('SELECT * FROM tool_calls'):
+        assert not any(SENTINEL in str(value) for value in row), row
+    deliveries = kstate.write_db.execute('SELECT locator_json, chars FROM deliveries').fetchall()
+    assert len(deliveries) == 1 and json.loads(deliveries[0][0])['unit'] == {'kind': 'line', 'line': 5}
+    assert kb.db.execute('SELECT COUNT(*) FROM assertions WHERE data_json LIKE ?', (f'%{SENTINEL}%',)).fetchone()[0] == 3  # the knowledge store holds it
+    captured = capsys.readouterr()
+    assert SENTINEL not in captured.err and SENTINEL not in captured.out
