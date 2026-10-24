@@ -565,8 +565,8 @@ def test_fts_absent_python_still_opens_and_indexes(tmp_path, monkeypatch):
         assert 'chunks_fts' not in names(db, 'table') and not store.fts_available(db)
         version = eligible_version(db, add_document(db), 1, 'a' * 64)
         assert store.insert_chunks(db, version, 'cv1', [chunk_spec(1, '합성 회의록')]) == 1
-        assert store.fts_status(db) == {'available': False, 'rows': None, 'chunks': 1, 'synced_at': None,
-                                        'consistent': False}
+        assert store.fts_status(db) == {'available': False, 'rows': None, 'chunks': 1, 'missing': None,
+                                        'extra': None, 'synced_at': None, 'dirty': True, 'consistent': False}
         assert store.rebuild_fts(db) == -1
         assert store.drop_chunks(db, version) == 1
     finally:
@@ -628,7 +628,42 @@ def test_drop_chunks_removes_only_the_rows_the_fts_index_holds(db, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(store, 'fts5_available', lambda: False)
         store.insert_chunks(db, unindexed, 'cv1', [chunk_spec(1, '합성자료 색인 밖')])
+    # once a write skipped the index, later writes leave it alone too until a rebuild (review M2-2)
     store.insert_chunks(db, indexed, 'cv1', [chunk_spec(1, '합성자료 색인 안')])
     assert store.drop_chunks(db, unindexed) == 1
+    status = store.fts_status(db)
+    assert status['dirty'] and not status['consistent'] and (status['missing'], status['extra']) == (1, 0)
+    assert store.rebuild_fts(db) == 1
     db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
     assert store.fts_status(db)['consistent'] and len(fts_match(db, '합성자료')) == 1
+
+
+@pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
+def test_fts_write_without_fts5_is_never_taken_as_consistent(db, monkeypatch):
+    """Review M2-2: equal row counts (even reused ids) do not hide a write that skipped the index."""
+    version = eligible_version(db, add_document(db), 1, 'a' * 64)
+    store.insert_chunks(db, version, 'cv1', [chunk_spec(1, '합성자료 첫째'), chunk_spec(2, '합성자료 둘째')])
+    assert store.fts_status(db)['consistent']
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'fts5_available', lambda: False)
+        store.drop_chunks(db, version, keep='none')       # both rows gone from chunks, still in the index
+        store.insert_chunks(db, version, 'cv2', [chunk_spec(1, '새 합성자료 하나'), chunk_spec(2, '새 합성자료 둘')])
+    status = store.fts_status(db)
+    assert (status['rows'], status['chunks']) == (2, 2)     # the counts agree, and the ids are reused ...
+    assert status['dirty'] and not status['consistent']     # ... the skipped write still shows
+    assert fts_match(db, '새 합성자료') == []                # the index holds the old texts
+    assert store.rebuild_fts(db) == 2 and store.fts_status(db)['consistent']
+    assert len(fts_match(db, '새 합성자료')) == 2
+
+
+@pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
+def test_fts_differences_count_missing_and_stale_ids(db):
+    version = eligible_version(db, add_document(db), 1, 'a' * 64)
+    store.insert_chunks(db, version, 'cv1', [chunk_spec(1, '합성자료 첫째'), chunk_spec(2, '합성자료 둘째')])
+    assert store.fts_differences(db) == (0, 0)
+    first = db.execute('SELECT id, text FROM chunks ORDER BY id').fetchone()
+    db.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?, ?)", first)  # outside store
+    assert store.fts_differences(db) == (1, 0) and not store.fts_status(db)['consistent']
+    db.execute('INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)', first)
+    db.execute("INSERT INTO chunks_fts(rowid, text) VALUES(9999, '유령 항목')")
+    assert store.fts_differences(db) == (0, 1) and not store.fts_status(db)['consistent']

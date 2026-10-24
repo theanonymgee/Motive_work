@@ -139,6 +139,7 @@ class _Scan:
     def tick(self):
         self.pending += 1
         if self.pending >= self.settings.commit_every:
+            store.bump_data_generation(self.db)  # documents/versions changed: long-lived searches re-map
             self.db.execute('COMMIT')
             self.db.execute('BEGIN IMMEDIATE')
             self.pending = 0
@@ -478,6 +479,7 @@ def scan(db, roots, settings, *, partial=False, retry_failed=False, reparse=Fals
             job.walk(root_id, spec, counts)
         for (root_id, _), (_, counts) in zip(roots, per_root):
             job.judge_deleted(root_id, counts)
+        store.bump_data_generation(db)
         db.execute('COMMIT')
     except BaseException as exc:
         if db.in_transaction:

@@ -59,6 +59,7 @@ def status(home: Path) -> dict:
     notice = ['아직 수집(scan)한 적이 없습니다.'] if result['last_scan'] is None else []
     fts = index['fts']
     if fts['available'] and not fts['consistent']:
-        notice.append(f"전문 색인(chunks_fts) {fts['rows']}행이 청크 {fts['chunks']}개와 다릅니다 - "
+        notice.append(f"전문 색인(chunks_fts)이 청크와 맞지 않습니다(빠짐 {fts['missing']}, 남은 항목 {fts['extra']}"
+                      f"{', FTS5 없이 바뀐 청크 있음' if fts['dirty'] else ''}) - "
                       f'workmcp index --rebuild-fts를 실행하세요.')
     return ok(result, notice=notice)

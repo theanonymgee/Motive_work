@@ -410,7 +410,7 @@ def mode_embed(home: Path) -> dict:
 
 def embed() -> dict:
     from workmcp import models, paths
-    home = paths.ensure_home(paths.resolve_home())
+    home = paths.resolve_home()  # read only: the test may point at the user's data home (review M2-L4)
     if not models.available(models.DEFAULT_MODEL, home):
         return {'skipped': 'model_missing'}
     try:

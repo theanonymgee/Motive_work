@@ -875,3 +875,11 @@ def test_only_models_imports_network_inside_functions():
     imports = list(absolute_imports(ast.parse((PACKAGE/'models.py').read_text(encoding='utf-8'))))
     assert all(covered(d, COMMON_IMPORTS) for d, _, inside in imports if not inside)
     assert {d for d, _, inside in imports if inside} == {'urllib.error', 'urllib.request'}
+
+
+def test_embed_mode_reads_the_home_and_never_creates_it(tmp_path):
+    """Review M2-L4: the ``embed`` audit mode may point at the user's data home, so it only reads it."""
+    home = tmp_path/'not-created-home'
+    _, report = run_wrapper(tmp_path, 'embed', home=home)
+    assert report['skipped'] == 'model_missing'
+    assert not home.exists()

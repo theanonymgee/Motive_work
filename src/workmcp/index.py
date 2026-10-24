@@ -154,13 +154,11 @@ def _start_run(db: sqlite3.Connection, key: str | None) -> tuple[int, str]:
 
 
 def _sync_fts(db: sqlite3.Connection, force: bool) -> bool:
-    """Rebuild ``chunks_fts`` when asked, when its row count differs from ``chunks``, or when this
-    store has chunks but no record of a sync (made by a Python without FTS5). True when rebuilt."""
+    """Rebuild ``chunks_fts`` when asked, when its id set differs from the chunk ids, or when chunks
+    changed without it (no sync recorded: written by a Python without FTS5). True when rebuilt."""
     if not store.fts_available(db):
         return False
-    chunk_rows = db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
-    never_synced = store.meta_get(db, 'fts_rows') is None and chunk_rows > 0
-    if not (force or never_synced or store.fts_rows(db) != chunk_rows):
+    if not (force or not store.fts_status(db)['consistent']):
         return False
     db.execute('BEGIN IMMEDIATE')
     try:
@@ -216,8 +214,14 @@ def _embed(db: sqlite3.Connection, embedder, key: str, todo: list[str], settings
 
     for at in range(0, len(todo), batch_size):
         hashes = todo[at:at + batch_size]
-        texts = [db.execute('SELECT text FROM chunks WHERE text_sha256 = ? LIMIT 1', (sha,)).fetchone()[0]
+        found = [(sha, db.execute('SELECT text FROM chunks WHERE text_sha256 = ? LIMIT 1', (sha,)).fetchone())
                  for sha in hashes]
+        # a concurrent scan --reparse may have removed a chunk since the list was made: skip it (it is
+        # counted in 'remaining' and the next run picks the text up if a chunk still has it)
+        hashes = [sha for sha, row in found if row is not None]
+        texts = [row[0] for _, row in found if row is not None]
+        if not texts:
+            continue
         matrix = embedder.embed(texts, query=False)
         vectors = validate_vectors(matrix, len(texts), dims or int(getattr(matrix, 'shape', (0, 0))[1]))
         if counter is not None and max_tokens:

@@ -497,3 +497,61 @@ def test_index_holds_one_version_at_a_time(workmcp_home, tmp_path):
         db.close()
     assert result['chunked'] == 3
     assert peak <= max(bounds) < sum(bounds) / 2, (peak, bounds)
+
+
+@pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
+def test_index_by_a_python_without_fts5_is_detected_and_rebuilt(text_home, monkeypatch, capsys):
+    """Review M2-2: a change indexed without FTS5 leaves chunks_fts behind even when the row counts agree;
+    ``status``/``doctor`` report it and the next run with FTS5 rebuilds it, so lexical search finds the text."""
+    from workmcp import cli, search, tools
+    home, db, root = text_home
+    index.run_index(db, home)
+    lines = long_lines('합성가')
+    lines[5] = '교체된 줄 고유어휘조합 확인용'
+    (root/'a.txt').write_text('\n'.join(lines), encoding='utf-8')
+    scan_root(db, root)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'fts5_available', lambda: False)
+        result = index.run_index(db, home)
+        assert result['chunked'] == 1 and result['dropped_versions'] == 1 and result['fts_rows'] is None
+    status = store.fts_status(db)
+    assert status['dirty'] and not status['consistent']
+    assert any('--rebuild-fts' in line for line in tools.status(home)['notice'])
+    assert cli.main(['doctor']) == 0 and 'run workmcp index --rebuild-fts' in capsys.readouterr()[0]
+    hits = search.Engine(home).search('고유어휘조합', mode='lexical')['hits']
+    assert hits == []                           # the index does not hold the new chunk yet
+    result = index.run_index(db, home)
+    assert result['fts_rebuilt'] and store.fts_status(db)['consistent']
+    hits = search.Engine(home).search('고유어휘조합', mode='lexical')['hits']
+    assert hits and Path(hits[0]['doc']['path']).name == 'a.txt'
+    assert tools.status(home)['notice'] == []
+
+
+def test_a_chunk_removed_during_the_vector_step_is_skipped(text_home):
+    """Review M2-L3: a concurrent ``scan --reparse`` may remove chunks after the list of texts was made;
+    the run skips them (counted in ``remaining``) instead of stopping."""
+    home, db, _ = text_home
+    index.run_index(db, home)
+    victim = latest_version(db, 'c.md')
+    gone = len(chunk_hashes(db, victim))
+    total = count(db, 'SELECT COUNT(DISTINCT text_sha256) FROM chunks')
+
+    class Remover:
+        identity = embedder.HashEmbedder(64).identity
+
+        def __init__(self):
+            self.inner, self.calls = embedder.HashEmbedder(64), 0
+
+        def embed(self, texts, *, query):
+            self.calls += 1
+            if self.calls == 1:  # as if another process dropped c.md's chunks now
+                db.execute('BEGIN IMMEDIATE')
+                store.drop_chunks(db, victim)
+                db.execute('COMMIT')
+            return self.inner.embed(texts, query=query)
+
+    result = index.run_index(db, home, embedder=Remover(), settings=config.IndexSettings(embed_batch=2))
+    assert result['remaining'] > 0 and result['remaining'] <= gone
+    assert result['embedded'] + result['remaining'] == total
+    assert count(db, 'SELECT COUNT(*) FROM chunk_vectors') == result['embedded']
+    assert db.execute('SELECT status FROM index_runs ORDER BY id DESC LIMIT 1').fetchone() == ('done',)

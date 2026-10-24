@@ -184,3 +184,19 @@ def test_index_loads_the_model_only_when_there_is_new_text(home, scanned, capsys
     code, out, _ = run(capsys, 'index')
     assert code == 0 and len(loads) == 1 and 'embedded 0' in out and 'remaining 0' in out
     assert 'load 0.0s' in out
+
+
+def test_index_model_runtime_failure_keeps_chunks_and_exits_0(home, scanned, capsys, monkeypatch):
+    """Review M2-L2: a load failure other than import or verification (session, provider) is
+    ``runtime_error:<Class>``; chunks and FTS are built and the exit code is 0 (design M2 §3.3-3.4)."""
+    from workmcp import embedder
+
+    class Broken:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError('unexpected providers (synthetic)')
+
+    monkeypatch.setattr(models, 'quick_status', lambda name, home: {'name': name, 'available': True, 'message': 'ok'})
+    monkeypatch.setattr(embedder, 'OnnxEmbedder', Broken)
+    code, out, err = run(capsys, 'index')
+    assert code == 0, err
+    assert 'vectors: skipped (runtime_error:RuntimeError)' in out and 'synthetic' not in out + err

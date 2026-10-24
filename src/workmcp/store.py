@@ -446,9 +446,13 @@ def insert_chunks(db: sqlite3.Connection, version_id: int, chunk_version: str, s
         if batch:
             db.executemany(sql, batch)
             stored += len(batch)
-    if stored and fts_available(db):
-        db.execute('INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks '
-                   'WHERE version_id=? AND chunk_version=?', (version_id, chunk_version))
+    if stored:
+        if fts_in_step(db):
+            db.execute('INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks '
+                       'WHERE version_id=? AND chunk_version=?', (version_id, chunk_version))
+        else:
+            fts_mark_unsynced(db)
+        bump_data_generation(db)
     return stored
 
 
@@ -459,12 +463,40 @@ def drop_chunks(db: sqlite3.Connection, version_id: int, keep: str | None = None
     where, params = 'version_id=?', [version_id]
     if keep is not None:
         where, params = 'version_id=? AND chunk_version<>?', [version_id, keep]
-    if fts_available(db):
-        # Only rows the index holds (a row stored by a Python without FTS5 was never indexed, and an
-        # FTS5 'delete' of a row it does not hold corrupts the index).
+    if fts_in_step(db):
+        # Only rows the index holds (an FTS5 'delete' of a row it does not hold corrupts the index).
         db.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text) SELECT 'delete', id, text FROM chunks "
                    f'WHERE {where} AND id IN (SELECT id FROM chunks_fts_docsize)', params)
-    return db.execute(f'DELETE FROM chunks WHERE {where}', params).rowcount
+        removed = db.execute(f'DELETE FROM chunks WHERE {where}', params).rowcount
+    else:
+        removed = db.execute(f'DELETE FROM chunks WHERE {where}', params).rowcount
+        if removed:
+            fts_mark_unsynced(db)
+    if removed:
+        bump_data_generation(db)
+    return removed
+
+
+def fts_in_step(db: sqlite3.Connection) -> bool:
+    """``chunks_fts`` can be kept in step here: FTS5 works and no earlier write skipped the index. Once
+    a write skipped it (``fts_dirty``), later writes leave it alone too (a stale entry may share a
+    reused chunk id) until ``rebuild_fts``."""
+    return fts_available(db) and meta_get(db, 'fts_dirty') is None
+
+
+def fts_mark_unsynced(db: sqlite3.Connection) -> None:
+    """Chunks changed without ``chunks_fts`` (a Python without FTS5, or an index already out of step):
+    record ``fts_dirty`` and forget the last sync, so the next ``index`` with FTS5 rebuilds the index
+    and ``status``/``doctor`` report it (review M2-2)."""
+    meta_set(db, 'fts_dirty', '1')
+    db.execute("DELETE FROM meta WHERE key IN ('fts_rows', 'fts_synced_at')")
+
+
+def bump_data_generation(db: sqlite3.Connection) -> None:
+    """``meta.data_generation`` + 1. Every commit that can change which chunks are eligible (chunk rows
+    written or removed here; documents and versions changed by ``collect.scan``) bumps it, so a
+    long-lived ``search.Engine`` re-maps its vector cache before the next query (review M2-1)."""
+    meta_set(db, 'data_generation', str(int(meta_get(db, 'data_generation', '0') or 0) + 1))
 
 
 def rebuild_fts(db: sqlite3.Connection) -> int:
@@ -473,6 +505,7 @@ def rebuild_fts(db: sqlite3.Connection) -> int:
     if not fts_available(db):
         return -1
     db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    db.execute("DELETE FROM meta WHERE key = 'fts_dirty'")
     rows = fts_rows(db)
     meta_set(db, 'fts_rows', str(rows))
     meta_set(db, 'fts_synced_at', now())
@@ -497,11 +530,24 @@ def meta_set(db: sqlite3.Connection, key: str, value: str) -> None:
                (key, str(value), now()))
 
 
+def fts_differences(db: sqlite3.Connection) -> tuple[int, int]:
+    """``(missing, extra)``: chunk ids the FTS index lacks, and ids it holds that are no chunk. Equal row
+    counts can hide both (review M2-2), so consistency compares the id sets."""
+    missing = db.execute('SELECT COUNT(*) FROM chunks WHERE id NOT IN (SELECT id FROM chunks_fts_docsize)').fetchone()[0]
+    extra = db.execute('SELECT COUNT(*) FROM chunks_fts_docsize WHERE id NOT IN (SELECT id FROM chunks)').fetchone()[0]
+    return missing, extra
+
+
 def fts_status(db: sqlite3.Connection) -> dict:
-    """``{available, rows, chunks, synced_at, consistent}`` for ``status`` and ``doctor``.
-    ``rows`` is None without FTS5; ``consistent`` is True only when FTS5 is there and the counts match."""
+    """``{available, rows, chunks, missing, extra, synced_at, consistent}`` for ``status`` and ``doctor``.
+    ``rows``/``missing``/``extra`` are None without FTS5. ``consistent``: FTS5 is there, the id sets
+    match, and the last chunk change was made with FTS5 (``synced_at`` set, unless there are no chunks)."""
     chunks = db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
     available = fts_available(db)
     rows = fts_rows(db) if available else None
-    return {'available': available, 'rows': rows, 'chunks': chunks, 'synced_at': meta_get(db, 'fts_synced_at'),
-            'consistent': available and rows == chunks}
+    missing, extra = fts_differences(db) if available else (None, None)
+    synced_at = meta_get(db, 'fts_synced_at')
+    dirty = meta_get(db, 'fts_dirty') is not None
+    return {'available': available, 'rows': rows, 'chunks': chunks, 'missing': missing, 'extra': extra,
+            'synced_at': synced_at, 'dirty': dirty,
+            'consistent': available and missing == 0 and extra == 0 and not dirty}

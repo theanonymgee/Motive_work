@@ -330,7 +330,11 @@ class VectorCache:
 
     In memory: a float16 matrix of the distinct texts that have a vector, and two arrays mapping
     every eligible chunk to its matrix row. Over ``max_vectors_in_memory`` texts nothing is held
-    (``streamed``) and each query reads the vectors in blocks."""
+    (``streamed``) and each query reads the vectors in blocks.
+
+    The matrix belongs to ``generation`` (``meta.index_generation``: new vectors); the chunk mapping
+    belongs to ``data_generation`` (``meta.data_generation``: every commit that changes which chunks are
+    eligible, scans included). ``Engine`` re-maps when only the latter moved (review M2-1)."""
 
     def __init__(self, model_key: str, dims: int, generation: str, keys: list[str], matrix: np.ndarray,
                  chunk_ids: np.ndarray, chunk_rows: np.ndarray, *, streamed: bool, total: int, invalid: int = 0):
@@ -344,6 +348,7 @@ class VectorCache:
         self.streamed = streamed
         self.total = total              # distinct texts with a vector for this model (eligible chunks)
         self.invalid_vectors = invalid
+        self.data_generation: str | None = None
 
     @property
     def rows(self) -> int:
@@ -378,7 +383,19 @@ class VectorCache:
             matrix[len(keys):len(keys) + len(values)] = values.astype(np.float16)
             keys.extend(key for (key, _), ok in zip(sized, good) if ok)
         matrix = matrix[:len(keys)] if len(keys) < total else matrix
-        row_of = {key: row for row, key in enumerate(keys)}
+        cache = cls(model_key, dims, generation, keys, matrix, empty_ids, np.zeros(0, dtype=np.int64),
+                    streamed=False, total=total, invalid=invalid)
+        cache.remap(db)
+        return cache
+
+    def remap(self, db: sqlite3.Connection) -> None:
+        """Map every chunk eligible now to its matrix row (chunks whose text has no row are left out).
+        Called after a load and whenever ``meta.data_generation`` moved since the last mapping."""
+        self.data_generation = store.meta_get(db, 'data_generation', '0')
+        if self.streamed:
+            return
+        body, params = _scope({})
+        row_of = {key: row for row, key in enumerate(self.keys)}
         ids, rows = [], []
         for chunk_id, text_sha256 in db.execute(f'SELECT c.id, c.text_sha256 FROM {body} ORDER BY c.id', params):
             row = row_of.get(text_sha256)
@@ -386,8 +403,15 @@ class VectorCache:
                 ids.append(chunk_id)
                 rows.append(row)
         del row_of
-        return cls(model_key, dims, generation, keys, matrix, np.array(ids, dtype=np.int64),
-                   np.array(rows, dtype=np.int64), streamed=False, total=total, invalid=invalid)
+        self.chunk_ids = np.array(ids, dtype=np.int64)
+        self.chunk_rows = np.array(rows, dtype=np.int64)
+
+    def expected_texts(self, ids) -> dict[int, str]:
+        """``chunk id -> text_sha256`` of the matrix row each candidate was scored with (``_hits`` checks
+        the chunk still has that text)."""
+        where = np.searchsorted(self.chunk_ids, np.asarray(ids, dtype=np.int64))
+        return {int(i): self.keys[int(self.chunk_rows[w])] for i, w in zip(ids, where)
+                if w < len(self.chunk_ids) and self.chunk_ids[w] == i}
 
     def scores(self, query: np.ndarray) -> np.ndarray:
         """Cosine per matrix row (float32), converting ``SCORE_BLOCK`` rows at a time."""
@@ -441,22 +465,32 @@ def embed_query(embedder, text: str, dims: int) -> np.ndarray:
 
 # ---- hits ---------------------------------------------------------------------------------------
 
-def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Sequence[str]) -> list[dict]:
+def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Sequence[str],
+          expected: Mapping[int, str] | None = None) -> list[dict]:
     """Hit dicts (``HIT_KEYS``) for ``ranked`` ``(chunk_id, scores)``: snippet and locator inside one
-    unit, ``units[]`` with the chunk's range in each unit (at most ``UNITS_CAP``)."""
+    unit, ``units[]`` with the chunk's range in each unit (at most ``UNITS_CAP``).
+
+    A chunk is returned only if it is still eligible now (latest active version, current chunk rules)
+    and, when ``expected`` names a text hash for it, still holds that text (review M2-1: a candidate
+    from an older mapping, or a chunk id reused since, never becomes a hit)."""
     if not ranked:
         return []
     ids = [chunk_id for chunk_id, _ in ranked]
     rows = db.execute('SELECT c.id, c.version_id, c.unit_first, c.unit_last, c.char_start, c.char_end, '
-                      'v.sha256, v.observed_at, d.id, d.path, d.ext FROM chunks c '
+                      'v.sha256, v.observed_at, d.id, d.path, d.ext, c.text_sha256 FROM chunks c '
                       'JOIN versions v ON v.id = c.version_id JOIN documents d ON d.id = v.document_id '
-                      f'WHERE c.id IN ({",".join("?" * len(ids))})', ids).fetchall()
+                      f'WHERE c.id IN ({",".join("?" * len(ids))}) AND {store.ELIGIBLE_VERSIONS} '
+                      'AND c.chunk_version = ?', [*ids, chunks.CHUNK_VERSION]).fetchall()
     by_id = {row[0]: row for row in rows}
+    expected = expected or {}
     out = []
     for chunk_id, scores in ranked:
         if chunk_id not in by_id:
-            continue  # dropped by an index run between the candidate query and now
-        _, version_id, first, last, char_start, char_end, sha256, observed_at, doc_id, path, ext = by_id[chunk_id]
+            continue  # no longer eligible (scan or index since the candidates were taken)
+        (_, version_id, first, last, char_start, char_end, sha256, observed_at, doc_id, path, ext,
+         text_sha256) = by_id[chunk_id]
+        if expected.get(chunk_id, text_sha256) != text_sha256:
+            continue  # the id now holds another text than the one scored
         units = db.execute('SELECT ordinal, locator_json, text FROM units WHERE version_id = ? '
                            'AND ordinal BETWEEN ? AND ? ORDER BY ordinal', (version_id, first, last)).fetchall()
         covered, offset = [], 0
@@ -531,6 +565,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
 
     # Semantic candidates.
     cosine: dict[int, float] = {}
+    expected: dict[int, str] = {}
     semantic_meta = NOT_REQUESTED if requested == 'lexical' else UNAVAILABLE
     if mode != 'lexical':
         identity = embedder.identity
@@ -550,6 +585,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
                 allowed = np.array([row[0] for row in db.execute(f'SELECT c.id FROM {scope[0]}', scope[1])],
                                    dtype=np.int64)
             ids, scores = vectors.candidates(query_vector, settings.semantic_candidates, allowed)
+            expected = vectors.expected_texts(ids)
         cosine = {int(i): float(s) for i, s in zip(ids, scores)}
         elapsed['semantic'] = _ms(time.perf_counter() - started)
         semantic_meta = {'model': identity.get('name'), 'model_key': key,
@@ -584,7 +620,7 @@ def search(db: sqlite3.Connection, query: str, *, embedder=None, vectors: Vector
             'fusion': fusion.get(k, 0.0), 'exact_phrase': k in exact,
             'hit': 'both' if in_lex and in_sem else 'lexical' if in_lex else 'semantic',
             'score_is_probability': False}))
-    hits = _hits(db, ranked, terms.snippet_terms)
+    hits = _hits(db, ranked, terms.snippet_terms, expected)
     if not hits:
         notice.append(NO_RESULTS_NOTICE)
     if filters['since'] or filters['until']:
@@ -679,7 +715,10 @@ class Engine:
         return self._embedder
 
     def vectors(self, db: sqlite3.Connection) -> VectorCache | None:
-        """Vector cache for the current ``meta.index_generation`` (reloaded when it changes)."""
+        """Vector cache for the current store: the matrix is reloaded when ``meta.index_generation`` (or
+        the model) changes, the chunk mapping when ``meta.data_generation`` does (a scan, or an index
+        run that stopped before it finished) — a long-lived Engine never maps to chunks that are no
+        longer eligible (review M2-1)."""
         model = self.embedder()
         if model is None:
             return None
@@ -689,6 +728,8 @@ class Engine:
         if cache is None or cache.generation != generation or cache.model_key != key:
             self._vectors = None
             self._vectors = VectorCache.load(db, key, int(model.identity['dims']), self.settings)
+        elif cache.data_generation != store.meta_get(db, 'data_generation', '0'):
+            cache.remap(db)
         return self._vectors
 
     def maybe_unload(self, now: float | None = None) -> bool:

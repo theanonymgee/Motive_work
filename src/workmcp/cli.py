@@ -124,7 +124,8 @@ def _index_lines(db) -> list[str]:
         fts_part = 'fts unavailable (lexical search falls back to LIKE)'
     lines = [f'index: {chunk_part}, {vector_part}, {fts_part}']
     if fts['available'] and not fts['consistent']:
-        lines.append(f"warning: chunks_fts has {fts['rows']:,} rows for {fts['chunks']:,} chunks; "
+        lines.append(f"warning: chunks_fts is out of step with chunks ({fts['missing']:,} chunks missing, "
+                     f"{fts['extra']:,} stale entries{', written without FTS5' if fts['dirty'] else ''}); "
                      f'run workmcp index --rebuild-fts')
     return lines
 
@@ -342,6 +343,8 @@ class _LazyModel:
                 bad = {key: value for key, value in models.verify(self.name, self.home).items() if value != 'ok'}
                 raise index.EmbedderUnavailable(
                     'model_unverified(' + ', '.join(f'{key}: {value}' for key, value in bad.items()) + ')') from None
+            except Exception as exc:  # session or provider failure: chunks and FTS only (design M2 §3.3-3.4)
+                raise index.EmbedderUnavailable(f'runtime_error:{type(exc).__name__}') from None
             finally:
                 self.load_seconds = (datetime.now() - began).total_seconds()
         return self._loaded

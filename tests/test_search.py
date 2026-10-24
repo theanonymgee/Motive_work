@@ -657,3 +657,112 @@ def test_hybrid_puts_chunks_holding_the_whole_query_first(tmp_path):
     finally:
         db.close()
     assert '[both, exact]' in search.format_hits(result)[1] or '[lexical, exact]' in search.format_hits(result)[1]
+
+
+# ---- review M2-1: a long-lived Engine follows scan, not only index -------------------------------
+
+STALE_TEXTS = {'a.txt': '합성 삭제 대상 문서 알파 회의록 내용 첫째 줄입니다.\n알파 문서 둘째 줄 납품 일정 확인.\n',
+               'b.txt': '합성 변경 대상 문서 베타 견적서 원래 내용입니다.\n베타 문서 둘째 줄 검수 결과 보고.\n',
+               'c.txt': '합성 그대로 문서 감마 사양서 내용입니다.\n감마 문서 둘째 줄 담당자 회의 기록.\n'}
+NEW_B = '합성 변경 대상 문서 베타 새로 쓴 내용입니다.\n베타 문서 둘째 줄 새 견적 금액 확정.\n'
+STALE_QUERIES = ('알파 회의록 내용', '베타 견적서 원래', '베타 새로 쓴 내용', '감마 사양서 내용', '합성 문서')
+
+
+def stale_home(tmp_path):
+    def write(root):
+        root.mkdir(parents=True)
+        for name, text in STALE_TEXTS.items():
+            (root/name).write_text(text, encoding='utf-8')
+    return build_home(tmp_path/'home', write)
+
+
+def eligible_versions(home) -> dict[str, int]:
+    db = ro(home)
+    try:
+        return {Path(path).name: version for version, path in
+                db.execute(f'SELECT v.id, d.path FROM {store.eligible_versions_sql()}')}
+    finally:
+        db.close()
+
+
+def assert_only_eligible(engine, home):
+    latest = eligible_versions(home)
+    seen = 0
+    for query in STALE_QUERIES:
+        for mode in search.MODES:
+            for hit in engine.search(query, mode=mode, limit=20)['hits']:
+                name = Path(hit['doc']['path']).name
+                assert name in latest and hit['version_id'] == latest[name], (mode, query, name)
+                seen += 1
+    assert seen > 0
+    return latest
+
+
+def test_long_lived_engine_never_returns_deleted_or_superseded_versions_after_scan(tmp_path):
+    home, root = stale_home(tmp_path)
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    before = assert_only_eligible(engine, home)   # the cache is loaded now
+    assert set(before) == {'a.txt', 'b.txt', 'c.txt'}
+    (root/'a.txt').unlink()
+    rewrite(root/'b.txt', NEW_B.encode('utf-8'))
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))              # scan only: no index run, index_generation unchanged
+    finally:
+        db.close()
+    latest = assert_only_eligible(engine, home)
+    assert set(latest) == {'b.txt', 'c.txt'}      # b's new version is the latest, but has no chunks yet
+    for mode in search.MODES:
+        names = {Path(h['doc']['path']).name for h in engine.search('합성 문서', mode=mode, limit=20)['hits']}
+        assert names == {'c.txt'}, mode
+    db = store.open_home(home)
+    try:
+        index.run_index(db, home, embedder=HashEmbedder(DIMS))
+    finally:
+        db.close()
+    latest = assert_only_eligible(engine, home)
+    assert set(latest) == {'b.txt', 'c.txt'}
+    for mode in search.MODES:                     # the new version is found in every mode
+        top = engine.search('베타 새로 쓴 내용', mode=mode)['hits']
+        assert top and Path(top[0]['doc']['path']).name == 'b.txt' and top[0]['version_id'] == latest['b.txt']
+
+
+def test_long_lived_engine_after_an_index_run_that_stopped(tmp_path):
+    """Chunks dropped and added by an index run that never reached its end (no index_generation bump)."""
+    home, root = stale_home(tmp_path)
+    engine = search.Engine(home, embedder_factory=hash_factory())
+    assert_only_eligible(engine, home)
+    rewrite(root/'b.txt', NEW_B.encode('utf-8'))
+
+    class Failing:
+        identity = HashEmbedder(DIMS).identity
+
+        def embed(self, texts, *, query):
+            raise KeyboardInterrupt
+
+    db = store.open_home(home)
+    try:
+        scan(db, add_root(db, root))
+        generation = store.meta_get(db, 'index_generation')
+        with pytest.raises(KeyboardInterrupt):
+            index.run_index(db, home, embedder=Failing())
+        assert store.meta_get(db, 'index_generation') == generation
+    finally:
+        db.close()
+    latest = assert_only_eligible(engine, home)
+    assert set(latest) == {'a.txt', 'b.txt', 'c.txt'}
+    lexical = engine.search('베타 새로 쓴 내용', mode='lexical')['hits']
+    assert lexical[0]['version_id'] == latest['b.txt']
+
+
+def test_hits_drop_a_candidate_whose_chunk_text_changed(tmp_path):
+    home, _ = stale_home(tmp_path)
+    db = ro(home)
+    try:
+        chunk_id, text_sha256 = db.execute('SELECT id, text_sha256 FROM chunks ORDER BY id').fetchone()
+        scores = {'bm25': None, 'lexical_rank': None, 'cosine': 0.5, 'semantic_rank': 1.0, 'fusion': 0.01,
+                  'exact_phrase': False, 'hit': 'semantic', 'score_is_probability': False}
+        assert len(search._hits(db, [(chunk_id, scores)], [], {chunk_id: text_sha256})) == 1
+        assert search._hits(db, [(chunk_id, scores)], [], {chunk_id: 'f' * 64}) == []
+    finally:
+        db.close()
