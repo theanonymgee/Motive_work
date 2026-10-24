@@ -132,6 +132,9 @@ def _instant(value, name: str) -> str:
         raise SearchError('filter_invalid', f'{name} must be an ISO 8601 date or time') from None
     if moment.tzinfo is None:
         moment = moment.astimezone()
+    offset = moment.utcoffset()
+    if offset.seconds % 60 or offset.microseconds:  # julianday() cannot read it (review M4 v1 L4)
+        raise SearchError('filter_invalid', f'{name} must be an ISO 8601 date or time (offset in whole minutes)')
     return moment.isoformat(timespec='seconds')
 
 

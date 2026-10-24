@@ -1279,3 +1279,47 @@ def test_no_knowledge_text_in_tool_calls_deliveries_or_stderr(kstate, capsys):
     assert kb.db.execute('SELECT COUNT(*) FROM assertions WHERE data_json LIKE ?', (f'%{SENTINEL}%',)).fetchone()[0] == 3  # the knowledge store holds it
     captured = capsys.readouterr()
     assert SENTINEL not in captured.err and SENTINEL not in captured.out
+
+
+# ---- review M4 v1: L3 (emptied by the budget), L4 (offsets), L8 (answer failed after the commit) ----------
+
+def test_a_result_emptied_by_the_budget_says_so_instead_of_paging():
+    obj, text = piece(1, '합성 인용 ' * 40)
+    rows = tools.ok({'items': [{'id': 1, 'statement': text}], 'total': 1, 'limit': 1, 'offset': 0, 'has_more': False})
+    budget = len(tools.dumps(tools.ok({'items': [], 'total': 1, 'limit': 0, 'offset': 0, 'has_more': True}))) + 250
+    fitted = tools.fit(rows, tools.SHRINK['list_knowledge'], budget)
+    assert fitted['ok'] and fitted['result']['items'] == [] and fitted['notice'] == [tools.EMPTIED_NOTICE]
+    history = tools.ok({'chain': [{'id': 1, 'statement': text, 'evidence': []}], 'truncated': False, 'branches': []})
+    fitted = tools.fit(history, tools.shrink_history, budget)
+    assert fitted['result']['chain'] == [] and fitted['notice'] == [tools.EMPTIED_NOTICE]
+    detail = entity_envelope(1)
+    for _ in range(4 + 4):                                         # four quotes, then four rows
+        tools.shrink_entity(detail)
+    assert tools.EMPTIED_NOTICE in detail['notice']
+
+
+@pytest.mark.parametrize('value, ok', [('2026-10-25T06:35:00+05:30', True), ('2026-10-25T06:35:00+05:30:15', False),
+                                       ('2026-10-25T06:35:00-03:30', True), ('2026-10-25T06:35:00-04:00:30', False)])
+def test_offsets_with_seconds_are_refused(kstate, value, ok):
+    for tool, args in (('list_knowledge', {'as_of_recorded': value}), ('list_knowledge', {'recorded_since': value}),
+                       ('search', {'query': '합성 과제', 'since': value})):
+        envelope = call(kstate, tool, **args)
+        assert envelope['ok'] is ok, (tool, envelope)
+        if not ok:
+            assert envelope['error']['code'] in ('argument_invalid', 'filter_invalid')
+    if not ok:
+        with pytest.raises(knowledge.KnowledgeError):
+            knowledge_query.recorded_instant(value)
+
+
+def test_a_write_whose_answer_fails_after_the_commit_names_its_ids(kstate, monkeypatch, caplog):
+    def broken(*args, **kwargs):
+        raise RuntimeError('합성 고장')
+    entity = call(kstate, 'record_entity', kind='project', name='합성 과제')['result']['entity']['id']
+    monkeypatch.setattr(knowledge_query, 'assertion_row', broken)
+    envelope = call(kstate, 'record_fact', entity_id=entity, predicate='p', value='v', my_note=True)
+    stored = kstate.kb.db.execute('SELECT MAX(id) FROM assertions').fetchone()[0]
+    assert envelope['ok'] is False and envelope['error']['code'] == 'internal_error'
+    assert f'stored (id {stored})' in envelope['error']['message'] and envelope['error']['retryable'] is False
+    assert last_call(kstate)[3:5] == (0, 'internal_error')
+    assert any(record.exc_info for record in caplog.records)    # the traceback goes to stderr

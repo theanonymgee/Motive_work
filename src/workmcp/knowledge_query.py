@@ -14,7 +14,9 @@ which ``tools`` moves into the envelope. Errors are ``knowledge.KnowledgeError``
 
 Source state (design M4 §3.4): an ``evidence`` row never changes and names one version; when it is read,
 its document's status and whether that version is still the latest give ``source_state`` (the document
-status first: ``deleted``, ``skipped``; then ``changed`` for a superseded version; else ``current``).
+status first: ``deleted``, ``skipped``; then ``changed`` for a superseded version, or when the stored unit
+no longer gives the quote at its locator — ``scan --reparse`` refills the units of the same version, review
+M4 v1 M1; else ``current``).
 For a ``changed`` source, get_entity and get_history add ``requote``: whether the same unit of the latest
 version still holds the quote exactly once, with that locator as a suggestion (never stored).
 
@@ -32,10 +34,16 @@ from . import knowledge, locator, parsers, store
 # One assertion as every knowledge tool shows it (design M4 §6.1). ``evidence`` is a list where the tool
 # carries quotes (write responses, get_entity, get_history) and None in list_knowledge; ``evidence_count``
 # is always there. ``source_state`` is the worst state of the row's sources (None for a note).
+# ``superseded_by_id`` is the row that closed this one (its ``superseded`` event; None while open);
+# ``continued_by_ids`` are the other rows whose ``supersedes_id`` is this one (the cut row C of an old row,
+# the later-period row N of an open C; review M4 v1 M2). ``conflicts`` holds at most ``CONFLICTS_MAX``
+# entries, ``conflicts_more`` counts the rest (review L3).
 ASSERTION_KEYS = frozenset({'id', 'kind', 'entity_id', 'entity', 'predicate', 'object_entity_id', 'object',
                             'statement', 'data', 'valid_from', 'valid_to', 'recorded_from', 'recorded_to', 'status',
                             'status_as_of', 'source_kind', 'source_label', 'source_state', 'supersedes_id',
-                            'superseded_by_id', 'recorded_by', 'conflicts', 'evidence', 'evidence_count'})
+                            'superseded_by_id', 'continued_by_ids', 'recorded_by', 'conflicts', 'conflicts_more',
+                            'evidence', 'evidence_count'})
+CONFLICTS_MAX = 20
 ENTITY_REF_KEYS = frozenset({'kind', 'name'})              # ``entity`` / ``object`` of an assertion
 CONFLICT_KEYS = frozenset({'id', 'value', 'valid_from', 'valid_to', 'recorded_from'})
 # ``quote`` is document text (a piece for delivered_sources); None when the size budget dropped it, then
@@ -51,6 +59,7 @@ EVENT_KEYS = frozenset({'id', 'at', 'kind', 'reason', 'related_id', 'recorded_by
 LINK_KEYS = frozenset({'id', 'from_id', 'to_id', 'relation', 'recorded_at', 'recorded_by', 'resolved_at',
                        'resolved_by_id'})
 HISTORY_ROW_EXTRA_KEYS = frozenset({'events', 'links'})    # a get_history chain row: ASSERTION_KEYS + these
+BRANCH_KEYS = frozenset({'id', 'children'})                # a get_history branch: a row superseded by two or more
 STATUS_AS_OF = ('open', 'withdrawn', 'superseded')
 
 # Tool results (``notice`` comes on top and goes to the envelope).
@@ -60,8 +69,9 @@ ENTITY_RESULT_KEYS = frozenset({'entity', 'facts', 'related', 'decisions', 'task
 ENTITY_LISTS = ('facts', 'related', 'decisions', 'tasks')   # the keys of ``has_more``
 AS_OF_KEYS = frozenset({'valid', 'recorded'})
 LIST_RESULT_KEYS = frozenset({'items', 'total', 'limit', 'offset', 'has_more', 'as_of'})
-HISTORY_RESULT_KEYS = frozenset({'chain', 'truncated'})
+HISTORY_RESULT_KEYS = frozenset({'chain', 'truncated', 'branches'})
 HISTORY_MAX = 50
+HISTORY_GRAPH_MAX = 1_000      # rows walked along supersedes_id before the history stops looking further
 
 # ``list_assertions`` filters, checked and normalised by ``tools.list_knowledge``: kind
 # fact|decision|todo|all, entity_id int|None, predicate str|None, status open|conflict|closed|all,
@@ -111,16 +121,20 @@ def recorded_instant(value, name: str = 'as_of_recorded') -> str | None:
         if not isinstance(value, str) or len(value) > 64:
             raise ValueError
         moment = datetime.fromisoformat(value.strip())
-    except ValueError:
-        raise knowledge.KnowledgeError('argument_invalid', f'{name} must be an ISO 8601 date or time') from None
-    if moment.tzinfo is None:
-        moment = moment.astimezone()
+        if moment.tzinfo is None:
+            moment = moment.astimezone()
+        offset = moment.utcoffset()
+        if offset.seconds % 60 or offset.microseconds:
+            raise ValueError       # SQLite's julianday() cannot read an offset with seconds (review L4)
+    except (ValueError, OverflowError, OSError):
+        raise knowledge.KnowledgeError('argument_invalid', f'{name} must be an ISO 8601 date or time '
+                                                           '(offset in whole minutes)') from None
     return moment.isoformat(timespec='seconds')
 
 
 _ROW_SQL = ('SELECT id, kind, entity_id, predicate, object_entity_id, statement, data_json, valid_from, valid_to, '
             'recorded_from, recorded_to, status, source_kind, supersedes_id, recorded_by FROM assertions WHERE id = ?')
-_EVIDENCE_SQL = ('SELECT e.id, e.locator_json, e.quote, v.superseded_at, d.status, d.id, d.path '
+_EVIDENCE_SQL = ('SELECT e.id, e.locator_json, e.quote, v.superseded_at, d.status, d.id, d.path, e.version_id '
                  'FROM evidence e JOIN versions v ON v.id = e.version_id JOIN documents d ON d.id = v.document_id '
                  'WHERE e.assertion_id = ? ORDER BY e.id')
 
@@ -132,11 +146,23 @@ def _entity_ref(db, entity_id: int | None) -> dict | None:
     return None if row is None else {'kind': row[0], 'name': row[1]}
 
 
-def source_state(document_status: str, superseded_at: str | None) -> str:
-    """``SOURCE_STATES`` of one stored source (design M4 §3.4): the document's status first."""
+def source_state(document_status: str, superseded_at: str | None, matches: bool = True) -> str:
+    """``SOURCE_STATES`` of one stored source (design M4 §3.4): the document's status first; ``changed`` for
+    a superseded version, or when the stored unit no longer holds the quote at its locator (``matches``
+    False: ``scan --reparse`` refilled the units of that same version, review M4 v1 M1)."""
     if document_status in ('deleted', 'skipped'):
         return document_status
-    return 'changed' if superseded_at is not None else 'current'
+    return 'changed' if superseded_at is not None or not matches else 'current'
+
+
+def still_matches(db, version_id: int, obj: Mapping, quote: str) -> bool:
+    """The stored unit of ``version_id`` named by ``obj`` still gives ``quote`` at ``obj['chars']``."""
+    try:
+        unit = db.execute('SELECT text FROM units WHERE version_id = ? AND locator_json = ?',
+                          (version_id, parsers.unit_json(obj['unit']))).fetchone()
+        return unit is not None and locator.check_text(dict(obj), unit[0]) == quote
+    except (locator.LocatorError, KeyError, TypeError):
+        return False
 
 
 def worst_state(states) -> str | None:
@@ -166,10 +192,10 @@ def requote(db, document_id: int, path: str, obj: dict, quote: str) -> dict:
 
 def _evidence(db, assertion_id: int, *, with_requote: bool) -> list[dict]:
     items = []
-    for evidence_id, locator_json, quote, superseded_at, doc_status, doc_id, path in db.execute(
+    for evidence_id, locator_json, quote, superseded_at, doc_status, doc_id, path, version_id in db.execute(
             _EVIDENCE_SQL, (assertion_id,)).fetchall():
         obj = json.loads(locator_json)
-        state = source_state(doc_status, superseded_at)
+        state = source_state(doc_status, superseded_at, still_matches(db, version_id, obj, quote))
         items.append({'id': evidence_id, 'locator': obj, 'quote': quote, 'quote_chars': len(quote),
                       'source_state': state,
                       'requote': requote(db, doc_id, path, obj, quote) if with_requote and state == 'changed' else None})
@@ -218,12 +244,20 @@ def _row(db, assertion_id: int, *, with_evidence: bool, with_requote: bool, reco
     (row_id, kind, entity_id, predicate, object_id, statement, data_json, valid_from, valid_to, recorded_from,
      recorded_to, status, source_kind, supersedes_id, recorded_by) = row
     evidence = _evidence(db, row_id, with_requote=with_requote)
-    later_sql = 'SELECT MIN(id) FROM assertions WHERE supersedes_id = ?'
+    closed = _closed_at(db, recorded_to, recorded_at)
+    superseded_by = None
+    if closed and status == 'superseded':      # the row its closing event names (review M4 v1 M2)
+        found = db.execute("SELECT related_id FROM assertion_events WHERE assertion_id = ? AND kind = 'superseded' "
+                           'ORDER BY id DESC LIMIT 1', (row_id,)).fetchone()
+        superseded_by = found[0] if found else None
+    later_sql = 'SELECT id FROM assertions WHERE supersedes_id = ?'
     later_params: list = [row_id]
     if recorded_at is not None:
         later_sql += ' AND julianday(recorded_from) <= julianday(?)'
         later_params.append(recorded_at)
-    closed = _closed_at(db, recorded_to, recorded_at)
+    continued = [later for (later,) in db.execute(later_sql + ' ORDER BY id', later_params).fetchall()
+                 if later != superseded_by]
+    others = [] if closed else _conflict_ids(db, row_id, recorded_at)
     count = len(evidence)
     return {'id': row_id, 'kind': kind, 'entity_id': entity_id, 'entity': _entity_ref(db, entity_id),
             'predicate': predicate, 'object_entity_id': object_id, 'object': _entity_ref(db, object_id),
@@ -233,9 +267,10 @@ def _row(db, assertion_id: int, *, with_evidence: bool, with_requote: bool, reco
             'source_label': knowledge.MY_NOTE_LABEL if source_kind == 'my_note' else knowledge.EVIDENCE_LABEL.format(count),
             'source_state': worst_state(item['source_state'] for item in evidence),
             'supersedes_id': supersedes_id,
-            'superseded_by_id': db.execute(later_sql, later_params).fetchone()[0],
+            'superseded_by_id': superseded_by, 'continued_by_ids': continued,
             'recorded_by': recorded_by,
-            'conflicts': [] if closed else [_conflict(db, other) for other in _conflict_ids(db, row_id, recorded_at)],
+            'conflicts': [_conflict(db, other) for other in others[:CONFLICTS_MAX]],
+            'conflicts_more': max(0, len(others) - CONFLICTS_MAX),
             'evidence': evidence if with_evidence else None, 'evidence_count': count}
 
 
@@ -246,7 +281,8 @@ def assertion_row(db, assertion_id: int, *, with_evidence: bool,
     ``KnowledgeError('assertion_not_found')``.
 
     ``status_as_of`` is ``open`` unless the row was closed by then (then its stored status); a closed row
-    has no ``conflicts``. ``superseded_by_id`` is the row that superseded it, if recorded by then.
+    has no ``conflicts``. ``superseded_by_id`` is the row that closed it by superseding (None while open);
+    ``continued_by_ids`` the other rows recorded by then that supersede it (a cut row, a later-period row).
     ``requote`` is None here (write responses); get_entity and get_history fill it."""
     return _row(db, assertion_id, with_evidence=with_evidence, with_requote=False,
                 recorded_at=recorded_instant(as_of_recorded))
@@ -490,37 +526,63 @@ def _links(db, assertion_id: int) -> list[dict]:
         (assertion_id, assertion_id)).fetchall()]
 
 
-def chain_ids(db, assertion_id: int) -> list[int]:
-    """The supersede chain through ``assertion_id``, root to latest: back along ``supersedes_id``, forward
-    to the row that supersedes each one (one at most: a closed row cannot be superseded again)."""
-    back, current = [], assertion_id
-    while current is not None and current not in back:
-        back.append(current)
-        current = db.execute('SELECT supersedes_id FROM assertions WHERE id = ?', (current,)).fetchone()[0]
-    chain, current = back[::-1], assertion_id
-    while True:
-        later = db.execute('SELECT MIN(id) FROM assertions WHERE supersedes_id = ?', (current,)).fetchone()[0]
-        if later is None or later in chain:
-            return chain
-        chain.append(later)
-        current = later
+def chain_ids(db, assertion_id: int) -> tuple[list[int], bool]:
+    """``(ids, complete)``: every row joined to ``assertion_id`` by ``supersedes_id`` in either direction, in
+    recorded order (``recorded_from``, then id). Supersede links form a graph, not a line: an open cut row C
+    can be superseded again while its later-period row N also names it (review M4 v1 M2). ``complete`` is
+    False when the walk stopped at ``HISTORY_GRAPH_MAX`` rows."""
+    seen, queue = {assertion_id}, [assertion_id]
+    while queue:
+        current = queue.pop()
+        parent = db.execute('SELECT supersedes_id FROM assertions WHERE id = ?', (current,)).fetchone()[0]
+        children = [row[0] for row in db.execute('SELECT id FROM assertions WHERE supersedes_id = ?', (current,))]
+        for other in ([parent] if parent is not None else []) + children:
+            if other not in seen:
+                if len(seen) >= HISTORY_GRAPH_MAX:
+                    queue = []
+                    break
+                seen.add(other)
+                queue.append(other)
+    marks = ','.join('?' * len(seen))
+    ordered = [row[0] for row in db.execute(
+        f'SELECT id FROM assertions WHERE id IN ({marks}) ORDER BY julianday(recorded_from), id', sorted(seen))]
+    return ordered, len(seen) < HISTORY_GRAPH_MAX
+
+
+def _branches(db, ids: list[int]) -> list[dict]:
+    """``BRANCH_KEYS`` for every row among ``ids`` that two or more of them name as ``supersedes_id``."""
+    marks = ','.join('?' * len(ids))
+    children: dict[int, list[int]] = {}
+    for row_id, parent in db.execute(f'SELECT id, supersedes_id FROM assertions WHERE id IN ({marks}) '
+                                     'AND supersedes_id IS NOT NULL ORDER BY id', ids):
+        children.setdefault(parent, []).append(row_id)
+    return [{'id': parent, 'children': kids} for parent, kids in sorted(children.items()) if len(kids) > 1]
+
+
+HISTORY_BRANCH_NOTICE = ('대체 이력이 갈라집니다(행 {}) — 중간 행(old_valid_to)을 다시 대체하면 생깁니다; '
+                         'branches와 각 행의 superseded_by_id·continued_by_ids를 보세요')
 
 
 def history(db, assertion_id: int) -> dict:
-    """``get_history`` (design M4 §5.2): the supersede chain root to latest (at most ``HISTORY_MAX``, latest
-    kept, ``truncated``), each row ``ASSERTION_KEYS`` + ``events`` (``EVENT_KEYS``) + ``links``
-    (``LINK_KEYS``), evidence with quotes and ``requote``. Returns ``HISTORY_RESULT_KEYS`` + ``notice``.
-    Raises ``KnowledgeError('assertion_not_found')``.
+    """``get_history`` (design M4 §5.2, review M4 v1 M2): every row joined to ``assertion_id`` by supersede
+    links, in recorded order (at most ``HISTORY_MAX``, latest kept, ``truncated``), each row ``ASSERTION_KEYS``
+    + ``events`` (``EVENT_KEYS``) + ``links`` (``LINK_KEYS``), evidence with quotes and ``requote``;
+    ``branches`` (``BRANCH_KEYS``) names the rows superseded by two or more rows. Returns
+    ``HISTORY_RESULT_KEYS`` + ``notice``. Raises ``KnowledgeError('assertion_not_found')``.
 
     No time axis: every row with its stored status (``status_as_of`` now). ``links`` holds the row's
     supersede and conflict links in either direction, resolved ones too."""
     if db.execute('SELECT 1 FROM assertions WHERE id = ?', (assertion_id,)).fetchone() is None:
         raise knowledge.KnowledgeError('assertion_not_found', f'no assertion {assertion_id}')
-    chain = chain_ids(db, assertion_id)
-    truncated = len(chain) > HISTORY_MAX
+    chain, complete = chain_ids(db, assertion_id)
+    truncated = len(chain) > HISTORY_MAX or not complete
+    kept = chain[-HISTORY_MAX:]
     rows = [{**_row(db, row_id, with_evidence=True, with_requote=True, recorded_at=None),
-             'events': _events(db, row_id), 'links': _links(db, row_id)} for row_id in chain[-HISTORY_MAX:]]
+             'events': _events(db, row_id), 'links': _links(db, row_id)} for row_id in kept]
+    branches = _branches(db, kept)
     notice = _notices(rows, quotes=True)
+    if branches:
+        notice.insert(0, HISTORY_BRANCH_NOTICE.format(', '.join(str(b['id']) for b in branches)))
     if truncated:
         notice.insert(0, HISTORY_TRUNCATED_NOTICE)
-    return {'chain': rows, 'truncated': truncated, 'notice': notice}
+    return {'chain': rows, 'truncated': truncated, 'branches': branches, 'notice': notice}

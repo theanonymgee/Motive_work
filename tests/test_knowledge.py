@@ -5,8 +5,8 @@ the import cycle with ``knowledge_query``.
 Every write in these tests goes through ``KB.write``, which checks the append-only rule around it (design
 M4 §13.4): no row of the knowledge tables disappears, row counts only grow, a row's content never changes
 (only the transitions the triggers allow: close once, conflict mark/clear, a link resolved once, aliases
-added and a first note), a refused write leaves every row as it was, and every stored evidence quote is
-the stored unit text at its locator. Synthetic text only."""
+added and a first note), a refused write leaves every row as it was, and every evidence quote the write
+stored is the stored unit text at its locator. Synthetic text only."""
 import hashlib
 import json
 import os
@@ -134,10 +134,13 @@ def check_append_only(db, before: dict, after: dict) -> None:
                     assert new == old
 
 
-def check_evidence(db) -> None:
-    """Every evidence quote is the stored unit text at its locator; an evidence row has one or more, a note none."""
-    for assertion_id, version_id, locator_json, quote, quote_sha in db.execute(
-            'SELECT assertion_id, version_id, locator_json, quote, quote_sha256 FROM evidence'):
+def check_evidence(db, old_ids=()) -> None:
+    """Every evidence quote stored after ``old_ids`` is the stored unit text at its locator (older rows may
+    differ after ``scan --reparse``); an evidence row has one or more, a note none."""
+    for evidence_id, assertion_id, version_id, locator_json, quote, quote_sha in db.execute(
+            'SELECT id, assertion_id, version_id, locator_json, quote, quote_sha256 FROM evidence'):
+        if evidence_id in old_ids:
+            continue
         obj = json.loads(locator_json)
         text = db.execute('SELECT text FROM units WHERE version_id=? AND locator_json=?',
                           (version_id, parsers.unit_json(obj['unit']))).fetchone()[0]
@@ -171,7 +174,7 @@ class KB:
             assert not self.db.in_transaction
             raise
         check_append_only(self.db, before, snapshot(self.db))
-        check_evidence(self.db)
+        check_evidence(self.db, set(before['evidence']))
         return out
 
     def entity(self, name='합성 과제 31', kind='project', **options) -> int:
@@ -667,3 +670,125 @@ def test_errors_and_events_carry_no_text(kb):
     for row in kb.db.execute('SELECT kind, related_id, recorded_by, call_id FROM assertion_events'):
         assert SENTINEL not in json.dumps(row, ensure_ascii=False)
     assert kb.db.execute('SELECT reason FROM assertion_events WHERE kind=?', ('retracted',)).fetchone()[0] == text
+
+
+# ---- review M4 v1: M1 (reparse in place), M2 (history graph), L3, L8 ----------------------------------
+
+QUOTE = '계약 상태는 검토 중'
+
+
+def reparse(kb, monkeypatch, change) -> None:
+    """A new txt parser version whose output changes line 1 by ``change``, then ``scan --reparse``: the
+    units of the same version are refilled in place (the reviewer's reproduction, ``collect.record``)."""
+    import dataclasses
+    from workmcp.parsers import text as text_parser
+    real = text_parser.parse
+
+    def parse(data, limits, budget):
+        units, encoding = real(data, limits, budget)
+        return [dataclasses.replace(u, text=change(u.text)) if u.unit.get('line') == 1 else u for u in units], encoding
+    monkeypatch.setattr(text_parser, 'parse', parse)
+    monkeypatch.setattr(text_parser, 'VERSION', 'text-reparse-test')
+    versions = kb.count('versions')
+    assert scan(kb.db, kb.root, reparse=True)['total']['reparsed'] == 2
+    assert kb.count('versions') == versions                   # same versions, units refilled
+
+
+def test_reparse_in_place_shows_the_source_as_changed_with_a_requote(kb, monkeypatch):
+    entity = kb.entity()
+    fact = kb.fact(entity, '검토 중', sources=[{'locator': kb.loc('notes.txt', 1), 'quote': QUOTE}])['assertion']
+    assert fact['evidence'][0]['source_state'] == 'current'
+    reparse(kb, monkeypatch, lambda text: '재파싱된 ' + text)
+    row = knowledge_query.assertion_row(kb.db, fact['id'], with_evidence=True)
+    assert row['evidence'][0]['source_state'] == row['source_state'] == 'changed'   # same version, other text
+    detail = knowledge_query.entity_detail(kb.db, entity, as_of_valid=None, as_of_recorded=None, include_closed=False,
+                                           source_kind='all', limit=10)
+    [evidence] = detail['facts'][0]['evidence']
+    moved = len('재파싱된 ')
+    assert evidence['source_state'] == 'changed' and evidence['requote']['found'] is True
+    assert evidence['requote']['locator']['chars'] == [c + moved for c in fact['evidence'][0]['locator']['chars']]
+    assert binding.validate_locator(kb.db, evidence['requote']['locator'])['text'] == QUOTE
+    assert knowledge_query.SOURCE_NOTICE.format(1) in detail['notice']
+    history = knowledge_query.history(kb.db, fact['id'])
+    assert history['chain'][0]['evidence'][0]['requote']['found'] is True
+    listed = knowledge_query.list_assertions(kb.db, {'entity_id': entity}, 10, 0)
+    assert listed['items'][0]['source_state'] == 'changed'
+
+
+def test_cut_supersede_rebinds_a_reparsed_source_found_once(kb, monkeypatch):
+    entity = kb.entity()
+    old = kb.fact(entity, '검토 중', valid_from='2026-10-01',
+                  sources=[{'locator': kb.loc('notes.txt', 1), 'quote': QUOTE}])['assertion']
+    reparse(kb, monkeypatch, lambda text: '재파싱된 ' + text)
+    out = kb.supersede(old['id'], value='승인', old_valid_to='2026-10-20')   # the ledger re-checks the copy
+    [evidence] = out['cut']['evidence']
+    assert evidence['quote'] == QUOTE and evidence['source_state'] == 'current'
+    assert evidence['locator']['chars'] == [c + len('재파싱된 ') for c in old['evidence'][0]['locator']['chars']]
+    assert knowledge.REBOUND_NOTICE.format(1) in out['notice']
+
+
+@pytest.mark.parametrize('change', [lambda text: '완전히 다른 합성 문장', lambda text: f'{QUOTE} {QUOTE}'],
+                         ids=['gone', 'twice'])
+def test_cut_supersede_of_a_source_not_found_once_is_evidence_stale(kb, monkeypatch, change):
+    entity = kb.entity()
+    old = kb.fact(entity, '검토 중', valid_from='2026-10-01',
+                  sources=[{'locator': kb.loc('notes.txt', 1), 'quote': QUOTE}])['assertion']
+    reparse(kb, monkeypatch, change)
+    error = refused(kb, 'evidence_stale', knowledge.supersede, old['id'], reason='합성', recorded_by=BY, call_id='c',
+                    my_note=True, value='승인', old_valid_to='2026-10-20')
+    assert knowledge.STALE_HINT in error.message and QUOTE not in error.message
+    assert kb.row(old['id'])['recorded_to'] is None           # nothing written
+    plain = kb.supersede(old['id'], value='승인')               # without a cut nothing is copied
+    assert plain['new']['supersedes_id'] == old['id']
+
+
+def test_superseding_the_open_cut_row_again_branches_the_history(kb):
+    entity = kb.entity()
+    old = kb.fact(entity, '검토 중', valid_from='2026-10-01')['assertion']
+    first = kb.supersede(old['id'], value='승인', old_valid_to='2026-10-20')
+    cut, new = first['cut']['id'], first['new']['id']
+    again = kb.supersede(cut, reason='옛 기간 교정', value='보류')    # the earlier period corrected
+    fixed = again['new']['id']
+    assert again['new']['supersedes_id'] == cut and again['new']['valid_to'] == '2026-10-20'
+    for start in (old['id'], cut, new, fixed):
+        history = knowledge_query.history(kb.db, start)
+        assert [row['id'] for row in history['chain']] == [old['id'], cut, new, fixed]
+        assert history['branches'] == [{'id': cut, 'children': [new, fixed]}]
+        assert history['notice'][0] == knowledge_query.HISTORY_BRANCH_NOTICE.format(cut)
+    rows = {row['id']: row for row in knowledge_query.history(kb.db, new)['chain']}
+    assert {i: (r['status'], r['superseded_by_id'], r['continued_by_ids']) for i, r in rows.items()} == {
+        old['id']: ('superseded', new, [cut]), cut: ('superseded', fixed, [new]), new: ('active', None, []),
+        fixed: ('active', None, [])}
+    assert kb.events(cut)[-1][:3] == ('superseded', '옛 기간 교정', fixed)
+    values = lambda day: [(r['id'], r['data']['value']) for r in knowledge_query.list_assertions(  # noqa: E731
+        kb.db, {'entity_id': entity, 'as_of_valid': day}, 10, 0)['items']]
+    assert values('2026-10-10') == [(fixed, '보류')] and values('2026-10-25') == [(new, '승인')]
+
+
+def test_conflict_lists_are_capped_with_a_count_of_the_rest(kb):
+    entity = kb.entity()
+    first = kb.fact(entity, '값 0')['assertion']
+    for n in range(1, knowledge_query.CONFLICTS_MAX + 1):
+        kb.fact(entity, f'값 {n}')
+    out = kb.fact(entity, '값 마지막')
+    limit = knowledge_query.CONFLICTS_MAX
+    assert (len(out['conflicts']), out['conflicts_more']) == (limit, 1)
+    assert (len(out['assertion']['conflicts']), out['assertion']['conflicts_more']) == (limit, 1)
+    assert any('외 1건' in line for line in out['notice'])
+    row = knowledge_query.assertion_row(kb.db, first['id'], with_evidence=False)
+    assert (len(row['conflicts']), row['conflicts_more']) == (limit, 1)
+
+
+def test_a_failed_answer_after_the_commit_names_the_stored_ids(kb, monkeypatch):
+    entity = kb.entity()
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('합성 고장')
+    monkeypatch.setattr(knowledge_query, 'assertion_row', broken)
+    with pytest.raises(knowledge.KnowledgeError) as caught:
+        knowledge.record(kb.db, 'fact', recorded_by=BY, call_id='c', entity_id=entity, predicate='p', value='v',
+                         my_note=True)
+    stored = kb.db.execute('SELECT MAX(id) FROM assertions').fetchone()[0]
+    assert caught.value.code == 'internal_error' and f'stored (id {stored})' in caught.value.message
+    assert 'RuntimeError' in caught.value.message and '합성 고장' not in caught.value.message
+    assert 'do not repeat' in caught.value.message and not kb.db.in_transaction

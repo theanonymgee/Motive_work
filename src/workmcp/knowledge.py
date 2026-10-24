@@ -74,11 +74,17 @@ EVIDENCE_LABEL = '근거 {}건'
 # Error codes this module raises (design M4 §6.1); all are in tools.ERROR_CODES, only store_busy retries.
 ERROR_CODES = ('argument_invalid', 'evidence_required', 'evidence_quote_not_found', 'evidence_quote_ambiguous',
                'chunk_not_found', 'locator_invalid', 'not_found', 'entity_not_found', 'assertion_not_found',
-               'already_closed', 'kind_mismatch', 'store_busy')
-
+               'already_closed', 'kind_mismatch', 'store_busy',
+               'evidence_stale',      # review M4 v1 M1: a cut row's copied source no longer matches its unit
+               'internal_error')      # review L8: stored, but the answer could not be built (ids in the message)
 BUSY_MESSAGE = 'scan 또는 index가 저장소를 쓰는 중입니다; 잠시 뒤 다시 부르세요(아무것도 기록하지 않음)'
 CHUNK_GONE_HINT = 'scan/index가 청크를 바꿨을 수 있습니다 — 다시 검색하거나 hit의 locator로 주세요'
 QUOTE_HINT = 'search snippet이나 get_snippet text를 그대로, 단위(줄·문단·셀) 하나 안에서 인용하세요'
+STALE_HINT = ('quote it again with sources: supersede without old_valid_to, then record the earlier period anew '
+              '(the file was parsed again)')
+STORED_FAILED = ('stored (id {}) but the answer could not be built ({}); do not repeat the call, read it back '
+                 'with get_entity or get_history')
+REBOUND_NOTICE = '중간 행의 근거 {}건은 원문 재파싱으로 위치가 바뀌어 같은 인용을 새 위치로 다시 결속했습니다'
 
 OLD_SOURCE_NOTICE = '출처 {}건이 옛 버전 또는 삭제 문서의 것입니다(evidence[].source_state 참고)'
 FLEXIBLE_NOTICE = '인용 {}건은 원문의 공백에 맞춰 저장됐습니다(evidence[].quote가 저장된 원문)'
@@ -455,20 +461,29 @@ def bind_sources(db, sources: Sequence[Mapping]) -> list[Bound]:
     return bound
 
 
-def _copy_evidence(db, source_id: int) -> list[Bound]:
-    """The evidence of ``source_id`` re-checked against its stored unit (the cut row of supersede)."""
-    out = []
-    for version_id, chunk_id, locator_json, quote in db.execute(
-            'SELECT version_id, chunk_id, locator_json, quote FROM evidence WHERE assertion_id=? ORDER BY id',
+def _copy_evidence(db, source_id: int) -> tuple[list[Bound], int]:
+    """``(bound, rebound)``: the evidence of ``source_id`` re-checked against its stored unit (the cut row
+    of supersede). A source whose unit no longer gives the quote at its locator (``scan --reparse`` refilled
+    that version, review M4 v1 M1) is bound again when the quote occurs exactly once in the unit now
+    (``rebound`` counts them); otherwise ``evidence_stale`` and nothing is written."""
+    out, rebound = [], 0
+    for evidence_id, version_id, chunk_id, locator_json, quote in db.execute(
+            'SELECT id, version_id, chunk_id, locator_json, quote FROM evidence WHERE assertion_id=? ORDER BY id',
             (source_id,)).fetchall():
         obj = json.loads(locator_json)
-        unit = db.execute('SELECT text FROM units WHERE version_id=? AND locator_json=?',
-                          (version_id, parsers.unit_json(obj['unit']))).fetchone()
-        if unit is None or locator.check_text(obj, unit[0]) != quote:
-            raise KnowledgeError('not_found', f'evidence of assertion {source_id} no longer matches its stored unit')
-        current = _version_facts(db, version_id)[3]
+        doc, path, sha256, current = _version_facts(db, version_id)
+        if not knowledge_query.still_matches(db, version_id, obj, quote):
+            unit = db.execute('SELECT text FROM units WHERE version_id=? AND locator_json=?',
+                              (version_id, parsers.unit_json(obj['unit']))).fetchone()
+            start = unit[0].find(quote) if unit else -1
+            if start < 0 or unit[0].find(quote, start + 1) >= 0:
+                raise KnowledgeError('evidence_stale', f'evidence {evidence_id} of assertion {source_id} no longer '
+                                                       f"matches its stored unit ({locator.unit_label(obj['unit'])}); "
+                                                       f'{STALE_HINT}')
+            obj = locator.make(doc, path, sha256, obj['unit'], unit[0], [start, start + len(quote)])
+            rebound += 1
         out.append(Bound(version_id, chunk_id, obj, quote, _sha(quote), current, False))
-    return out
+    return out, rebound
 
 
 # ---- rows, conflicts, events (design M4 §4) -----------------------------------------------------------
@@ -556,13 +571,35 @@ def _evidence_notices(bound: Sequence[Bound]) -> list[str]:
     return notice
 
 
+def _ids_text(ids: Sequence[int]) -> str:
+    limit = knowledge_query.CONFLICTS_MAX
+    more = f' 외 {len(ids) - limit}건' if len(ids) > limit else ''
+    return ', '.join(map(str, ids[:limit])) + more
+
+
 def _found_notices(conflicts: Sequence[Mapping], duplicates: Sequence[int]) -> list[str]:
     notice = []
     if duplicates:
-        notice.append(DUPLICATE_NOTICE.format(', '.join(map(str, duplicates))))
+        notice.append(DUPLICATE_NOTICE.format(_ids_text(list(duplicates))))
     if conflicts:
-        notice.append(CONFLICT_NOTICE.format(', '.join(str(c['id']) for c in conflicts)))
+        notice.append(CONFLICT_NOTICE.format(_ids_text([c['id'] for c in conflicts])))
     return notice
+
+
+def _conflict_list(conflicts: Sequence[Mapping]) -> dict:
+    """``conflicts`` (at most ``knowledge_query.CONFLICTS_MAX``) and ``conflicts_more`` of a write answer."""
+    limit = knowledge_query.CONFLICTS_MAX
+    return {'conflicts': list(conflicts[:limit]), 'conflicts_more': max(0, len(conflicts) - limit)}
+
+
+def _answer(stored: Sequence[int], build: Callable[[], dict]) -> dict:
+    """The answer of a committed write; a failure while building it is ``internal_error`` naming the stored
+    ids, so the client reads them back instead of writing again (review M4 v1 L8)."""
+    try:
+        return build()
+    except Exception as exc:  # noqa: BLE001 - the write is committed; say so, with the class name only
+        raise KnowledgeError('internal_error', STORED_FAILED.format(', '.join(map(str, stored)),
+                                                                  type(exc).__name__)) from exc
 
 
 def _row(db, assertion_id: int, with_evidence: bool = True) -> dict:
@@ -612,8 +649,8 @@ def record_entity(db, *, kind: str, name: str, aliases: Sequence[str] | None = N
 
     entity_id, created, added, alias_of = _write(db, work)
     notice = [ALIAS_OF_NOTICE.format(', '.join(str(a['id']) for a in alias_of))] if alias_of else []
-    return {'entity': knowledge_query.entity_row(db, entity_id), 'created': created, 'added_aliases': added,
-            'alias_of': alias_of, 'notice': notice}
+    return _answer([entity_id], lambda: {'entity': knowledge_query.entity_row(db, entity_id), 'created': created,
+                                         'added_aliases': added, 'alias_of': alias_of, 'notice': notice})
 
 
 def record(db, kind: str, *, recorded_by: str, call_id: str | None,
@@ -640,8 +677,9 @@ def record(db, kind: str, *, recorded_by: str, call_id: str | None,
         return new_id, bound, conflicts, duplicates
 
     new_id, bound, conflicts, duplicates = _write(db, work)
-    return {'assertion': _row(db, new_id), 'conflicts': conflicts, 'duplicates': duplicates,
-            'notice': _evidence_notices(bound) + _found_notices(conflicts, duplicates)}
+    return _answer([new_id], lambda: {'assertion': _row(db, new_id), **_conflict_list(conflicts),
+                                      'duplicates': duplicates,
+                                      'notice': _evidence_notices(bound) + _found_notices(conflicts, duplicates)})
 
 
 CONTENT_FIELDS = {'fact': ('entity_id', 'predicate', 'value', 'unit', 'object_entity_id')}  # remake the statement
@@ -707,19 +745,23 @@ def supersede(db, assertion_id: int, *, reason: str, recorded_by: str, call_id: 
                 duplicates.extend(d for d in same if d not in duplicates)
             return row_id
 
-        cut_id = None if cut is None else add(cut, old['statement'], assertion_id, old['source_kind'],
-                                              _copy_evidence(db, assertion_id))
+        copied, rebound = ([], 0) if cut is None else _copy_evidence(db, assertion_id)
+        cut_id = None if cut is None else add(cut, old['statement'], assertion_id, old['source_kind'], copied)
         parent = cut_id or assertion_id
         new_id = add(spec, _statement(db, spec), parent, 'evidence' if bound else 'my_note', bound)
         _event(db, assertion_id, now, 'superseded', reason=reason, related_id=new_id,
                recorded_by=recorded_by, call_id=call_id)
         cleared = _resolve(db, assertion_id, new_id, now, recorded_by, call_id)
-        return cut_id, new_id, bound, conflicts, duplicates, cleared
+        return cut_id, new_id, bound, conflicts, duplicates, cleared, rebound
 
-    cut_id, new_id, bound, conflicts, duplicates, cleared = _write(db, work)
-    return {'old': _row(db, assertion_id, with_evidence=False), 'cut': _row(db, cut_id) if cut_id else None,
-            'new': _row(db, new_id), 'conflicts': conflicts, 'duplicates': duplicates, 'cleared_conflicts': cleared,
-            'notice': _evidence_notices(bound) + _found_notices(conflicts, duplicates)}
+    cut_id, new_id, bound, conflicts, duplicates, cleared, rebound = _write(db, work)
+    notice = _evidence_notices(bound) + _found_notices(conflicts, duplicates)
+    if rebound:
+        notice.insert(0, REBOUND_NOTICE.format(rebound))
+    return _answer([i for i in (cut_id, new_id) if i], lambda: {
+        'old': _row(db, assertion_id, with_evidence=False), 'cut': _row(db, cut_id) if cut_id else None,
+        'new': _row(db, new_id), **_conflict_list(conflicts), 'duplicates': duplicates, 'cleared_conflicts': cleared,
+        'notice': notice})
 
 
 def retract(db, assertion_id: int, *, reason: str, recorded_by: str,
@@ -736,4 +778,5 @@ def retract(db, assertion_id: int, *, reason: str, recorded_by: str,
         return _resolve(db, assertion_id, assertion_id, now, recorded_by, call_id)
 
     cleared = _write(db, work)
-    return {'assertion': _row(db, assertion_id, with_evidence=False), 'cleared_conflicts': cleared, 'notice': []}
+    return _answer([assertion_id], lambda: {'assertion': _row(db, assertion_id, with_evidence=False),
+                                            'cleared_conflicts': cleared, 'notice': []})

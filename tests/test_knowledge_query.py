@@ -56,10 +56,10 @@ def event(db, assertion, kind, at, related=None, reason=None):
                'VALUES (?, ?, ?, ?, ?, ?, ?)', (assertion, at, kind, reason, related, BY, 'call-1'))
 
 
-def close(db, assertion, status, at, reason='합성 사유'):
+def close(db, assertion, status, at, reason='합성 사유', related=None):
     db.execute('UPDATE assertions SET status=?, recorded_to=?, change_reason=? WHERE id=?',
                (status, at, reason, assertion))
-    event(db, assertion, 'retracted' if status == 'withdrawn' else 'superseded', at, reason=reason)
+    event(db, assertion, 'retracted' if status == 'withdrawn' else 'superseded', at, related=related, reason=reason)
 
 
 def link(db, from_id, to_id, relation, at):
@@ -84,7 +84,7 @@ def resolve(db, link_id, at, by_id, clear=()):
 def supersede(db, old, new_kwargs, at, reason='합성 교정'):
     """New row superseding ``old`` (same time), old closed, link and events: as ``knowledge.supersede``."""
     new = add(db, supersedes=old, at=at, **new_kwargs)
-    close(db, old, 'superseded', at, reason)
+    close(db, old, 'superseded', at, reason, related=new)
     link(db, new, old, 'supersedes', at)
     event(db, new, 'recorded', at, related=old)
     return new
@@ -370,8 +370,8 @@ def cut_chain(db):
     a = add(db, entity=entity, predicate='금액', value='옛 값', at=T1, valid=('2026-09-01', None))
     c = add(db, entity=entity, predicate='금액', value='옛 값', at=T3, valid=('2026-09-01', '2026-10-20'),
             supersedes=a)
-    close(db, a, 'superseded', T3)
     n = add(db, entity=entity, predicate='금액', value='새 값', at=T3, valid=('2026-10-20', None), supersedes=c)
+    close(db, a, 'superseded', T3, related=n)              # the old row's event names N (knowledge.supersede)
     link(db, c, a, 'supersedes', T3)
     link(db, n, c, 'supersedes', T3)
     for row, related in ((c, a), (n, c)):
@@ -675,7 +675,10 @@ def test_history_chain_root_to_latest_with_events_links_and_evidence(db):
     chain = kq.history(db, n)['chain']
     assert all(set(row) == kq.ASSERTION_KEYS | kq.HISTORY_ROW_EXTRA_KEYS for row in chain)
     assert [row['status'] for row in chain] == ['superseded', 'active', 'active']
-    assert [row['superseded_by_id'] for row in chain] == [c, n, None]
+    # the row that closed each one (review M4 v1 M2); the open cut row C is continued by N
+    assert [row['superseded_by_id'] for row in chain] == [n, None, None]
+    assert [row['continued_by_ids'] for row in chain] == [[c], [n], []]
+    assert kq.history(db, n)['branches'] == []
     assert [[e['kind'] for e in row['events']] for row in chain] == [
         ['superseded'], ['recorded'], ['recorded', 'conflict_marked', 'conflict_cleared']]
     assert all(set(e) == kq.EVENT_KEYS for row in chain for e in row['events'])

@@ -256,6 +256,8 @@ def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -
         envelope = tools.fit(envelope, tools.SHRINK[tool], state.budget)
         _annotate_engine(envelope, state.engine, loads_before)
     except knowledge.KnowledgeError as exc:  # argument names, numbers and labels only, never text
+        if exc.code == 'internal_error':     # stored, the answer failed (review M4 v1 L8): traceback to stderr
+            LOG.exception('tool %s stored its rows but its answer failed', tool)
         envelope = tools.error(exc.code, exc.message, retryable=exc.retryable)
     except store.Busy:  # a writer that did not turn the lock wait into its KnowledgeError: nothing written
         envelope = tools.error('store_busy', 'the store is busy; try again', retryable=True)

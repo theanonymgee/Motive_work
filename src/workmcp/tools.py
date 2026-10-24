@@ -54,7 +54,8 @@ ERROR_CODES = (*searching.ERROR_CODES, 'argument_invalid', 'locator_invalid', 'n
                'response_too_large', 'internal_error',
                # M4 (design M4 §6.1): the knowledge tools
                'evidence_required', 'evidence_quote_not_found', 'evidence_quote_ambiguous', 'chunk_not_found',
-               'entity_not_found', 'assertion_not_found', 'already_closed', 'kind_mismatch')
+               'entity_not_found', 'assertion_not_found', 'already_closed', 'kind_mismatch',
+               'evidence_stale')  # review M4 v1 M1
 NOT_IMPLEMENTED = 'not_implemented'  # stage 0 only (M4: the ten knowledge tools); not one of ERROR_CODES
 
 # Result shapes (design M3 §2). The search tool's ``result`` is ``searching.RESULT_KEYS`` with
@@ -89,8 +90,8 @@ CONFLICT_KEYS = knowledge_query.CONFLICT_KEYS
 ENTITY_KEYS = knowledge_query.ENTITY_KEYS
 ENTITY_COUNT_KEYS = knowledge_query.ENTITY_COUNT_KEYS
 RECORD_ENTITY_RESULT_KEYS = frozenset({'entity', 'created', 'added_aliases', 'alias_of'})
-RECORD_RESULT_KEYS = frozenset({'assertion', 'conflicts', 'duplicates'})      # record_fact/decision/task
-SUPERSEDE_RESULT_KEYS = frozenset({'old', 'cut', 'new', 'conflicts', 'duplicates', 'cleared_conflicts'})
+RECORD_RESULT_KEYS = frozenset({'assertion', 'conflicts', 'conflicts_more', 'duplicates'})  # record_fact/decision/task
+SUPERSEDE_RESULT_KEYS = frozenset({'old', 'cut', 'new', 'conflicts', 'conflicts_more', 'duplicates', 'cleared_conflicts'})
 RETRACT_RESULT_KEYS = frozenset({'assertion', 'cleared_conflicts'})
 FIND_RESULT_KEYS = knowledge_query.FIND_RESULT_KEYS
 ENTITY_RESULT_KEYS = knowledge_query.ENTITY_RESULT_KEYS
@@ -258,9 +259,24 @@ def _shrink_rows(key: str) -> Callable[[dict], bool]:
         result[key].pop()
         result['limit'] = len(result[key])
         result['has_more'] = True
-        _set_notice(envelope, SHRINK_ROWS_NOTICE, result['limit'])
+        if result[key]:
+            _set_notice(envelope, SHRINK_ROWS_NOTICE, result['limit'])
+        else:
+            _emptied(envelope, SHRINK_ROWS_NOTICE)
         return True
     return shrink
+
+
+EMPTIED_NOTICE = ('응답 크기 상한 때문에 결과가 비었습니다(기록이 없는 것이 아님) — limit를 줄이거나 '
+                  'response_max_chars를 늘리세요')
+
+
+def _emptied(envelope: dict, *templates: str) -> None:
+    """The budget removed every row (review M4 v1 L3): say so instead of a notice that suggests paging."""
+    heads = [template.split('{}', 1)[0] for template in templates]
+    envelope['notice'] = [line for line in envelope['notice'] if not any(line.startswith(h) for h in heads)]
+    if EMPTIED_NOTICE not in envelope['notice']:
+        envelope['notice'].append(EMPTIED_NOTICE)
 
 
 # Per tool: drop one unit from the end (a hit, a context unit, a row) or cut a piece; False when
@@ -315,6 +331,8 @@ def shrink_entity(envelope: dict) -> bool:
             result[key].pop()
             result['has_more'][key] = True
             _set_notice(envelope, SHRINK_ENTITY_NOTICE, _notice_count(envelope, SHRINK_ENTITY_NOTICE) + 1)
+            if not any(result.get(name) for name in ENTITY_SHRINK_ORDER):
+                _emptied(envelope)
             return True
     return False
 
@@ -330,6 +348,8 @@ def shrink_history(envelope: dict) -> bool:
     result['chain'].pop(0)
     result['truncated'] = True
     _set_notice(envelope, SHRINK_HISTORY_NOTICE, _notice_count(envelope, SHRINK_HISTORY_NOTICE) + 1)
+    if not result['chain']:
+        _emptied(envelope, SHRINK_HISTORY_NOTICE)
     return True
 
 
