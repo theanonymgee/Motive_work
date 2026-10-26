@@ -41,13 +41,14 @@ WIRE_KEYS = {
     'units': frozenset({'local_version_id', 'units_sha256', 'part', 'parts', 'units'}),
     'vectors': frozenset({'model_key', 'dims', 'items'}),
     'events': frozenset({'local_event_id', 'local_document_id', 'local_version_id', 'kind', 'at'}),
-    'end': frozenset({'counts', 'bytes_sent'}),
+    'end': frozenset({'counts', 'bytes_sent', 'complete'}),
 }
 NESTED_KEYS = {
     ('begin', 'roots'): frozenset({'local_root_id', 'path', 'enabled'}),
     ('documents', 'versions'): frozenset({'local_version_id', 'seq', 'sha256', 'size', 'mtime_ns', 'observed_at',
                                           'superseded_at', 'parser', 'parser_version', 'encoding', 'parse_status',
-                                          'parse_error', 'unit_count', 'text_chars', 'units_sha256'}),
+                                          'parse_error', 'unit_count', 'text_chars', 'units_sha256',
+                                          'unit_chars_max'}),
     ('units', 'units'): frozenset({'ordinal', 'kind', 'locator_json', 'text', 'text_sha256'}),
     ('vectors', 'items'): frozenset({'text_sha256', 'vector_b64'}),
 }
@@ -60,13 +61,14 @@ UNITS_PER_BATCH = 2_000
 UNIT_CHARS_PER_BATCH = 2 * 2**20     # unit text characters in one units part
 VECTORS_PER_BATCH = 1_024
 EVENTS_PER_BATCH = 5_000
-MAX_PARTS = 128                      # one version: 200,000 units / 2,000 per part = 100, 50 M chars / 2 Mi = 24
+MAX_PARTS = 256                      # one version: 200,000 units / 2,000 = 100; 50 M chars of long units / 256 Ki = 191
 # The largest version the server takes (the collector's default parsers.Limits; a test keeps them equal): a
 # document with a larger version is refused alone (``version_too_large``).
 VERSION_MAX_UNITS = 200_000
 VERSION_MAX_CHARS = 50_000_000
+UNIT_MAX_CHARS = 8 * 2**20          # one unit's text (parsers.Limits.max_unit_chars; review v2 N-2)
 INT_MAX = 2**63 - 1                  # every integer on the wire fits SQLite's INTEGER
-UNIT_PIECE_CHARS = 2**19             # a longer unit text travels as pieces of at most this many characters
+UNIT_PIECE_CHARS = 2**18             # a longer unit text travels as pieces of at most this many characters
 ENVELOPE_RESERVE = 2**16             # bytes kept free in a batch for the envelope and the item keys
 STATE_PAGE_DOCUMENTS = 500
 STATE_PAGE_VECTORS = 5_000
@@ -95,7 +97,7 @@ RESULT_KEYS = {
     'units': ('versions', 'vectors_missing'),
     'vectors': ('stored', 'ignored', 'invalid'),
     'events': ('stored', 'ignored'),
-    'end': ('documents_sha256', 'vectors_sha256', 'vectors_missing_total'),
+    'end': ('documents_sha256', 'vectors_sha256', 'vectors_missing_total', 'swept'),
 }
 UNITS_PARTIAL_KEYS = ('local_version_id', 'received', 'of')
 UNITS_VERSION_KEYS = ('local_version_id', 'version_id', 'units', 'chunks')   # units result: versions[]

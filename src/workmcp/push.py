@@ -42,7 +42,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import chunks, config, paths, store, sync
@@ -51,6 +51,7 @@ LOG = logging.getLogger('workmcp.push')
 LOG_FORMAT = '%(asctime)s | %(message)s'
 EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_LOCKED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_TLS = 0, 1, 2, 3, 4, 6, 7
 PUSH_LOCK = 'push.lock'                    # one push at a time per data home (store.acquire_lock)
+PUSH_LOCK_STALE = timedelta(hours=6)       # a lock left by a killed push stops blocking after this long
 CERTIFICATE_ERRORS = ('SSLCertVerificationError',)   # by class name: this module does not import ssl
 RETRY_DELAYS = (1, 2, 4, 8, 16)            # seconds before each resend of the same batch
 REQUEST_TIMEOUT_SECONDS = 300
@@ -59,7 +60,7 @@ CLIENT_VERSION = '0.0.1'
 # execute() result: what left this PC (design §3.6); counts, sizes, hashes and paths only.
 REPORT_KEYS = ('exit_code', 'push_id', 'url', 'collector', 'started_at', 'up_to_date', 'dry_run', 'state', 'sent',
                'batches', 'bytes_sent', 'state_requests', 'refused', 'retries', 'elapsed', 'log', 'server',
-               'converged', 'error')
+               'converged', 'error', 'warning')
 STATE_COUNT_KEYS = ('documents_changed', 'added', 'changed', 'deleted', 'restored', 'reparsed', 'vectors_missing')
 SENT_KEYS = ('documents', 'versions', 'units', 'chars', 'vectors', 'vector_bytes', 'events', 'copied_versions',
              'forgotten')
@@ -245,8 +246,10 @@ def document_item(db, document_id: int) -> tuple[dict, str]:
         version = dict(zip(_VERSION_COLUMNS, values))
         local = version.pop('id')
         has_units = version['parse_status'] == 'ok' and version['unit_count']
+        longest = db.execute('SELECT MAX(LENGTH(text)) FROM units WHERE version_id = ?', (local,)).fetchone()[0]
         versions.append({'local_version_id': local, **version,
-                         'units_sha256': sync.version_units_sha256(db, local) if has_units else None})
+                         'units_sha256': sync.version_units_sha256(db, local) if has_units else None,
+                         'unit_chars_max': longest})
     item = {'local_document_id': row['id'], 'local_root_id': row['root_id'], 'path': row['path'],
             'path_key': row['path_key'], 'ext': row['ext'], 'status': row['status'], 'skip_reason': row['skip_reason'],
             'first_seen_at': row['first_seen_at'], 'last_seen_at': row['last_seen_at'],
@@ -256,14 +259,16 @@ def document_item(db, document_id: int) -> tuple[dict, str]:
 
 def unit_parts(db, version_id: int) -> list[list[dict]]:
     """The wire units of one version cut into parts that each fit one batch (``UNITS_PER_BATCH`` entries,
-    ``UNIT_CHARS_PER_BATCH`` characters, ``BATCH_MAX_BYTES`` less the envelope reserve)."""
+    ``UNIT_CHARS_PER_BATCH`` characters, ``BATCH_MAX_BYTES`` less the envelope reserve); a part ends after each
+    piece of a long unit that continues, so the server applies a long unit one piece at a time."""
     budget = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE
     parts, current, chars, size = [], [], 0, 0
     for ordinal, kind, locator_json, text, text_sha256 in db.execute(
             'SELECT ordinal, kind, locator_json, text, text_sha256 FROM units WHERE version_id = ? ORDER BY ordinal',
             (version_id,)):
         unit = {'ordinal': ordinal, 'kind': kind, 'locator_json': locator_json, 'text': text, 'text_sha256': text_sha256}
-        for piece in sync.unit_pieces(unit, budget // 2):
+        pieces = sync.unit_pieces(unit, budget // 2)
+        for number, piece in enumerate(pieces, start=1):
             piece_size, piece_chars = sync.canonical_size(piece) + 1, len(piece['text'])
             if current and (len(current) >= sync.UNITS_PER_BATCH or chars + piece_chars > sync.UNIT_CHARS_PER_BATCH
                             or size + piece_size > budget):
@@ -272,6 +277,9 @@ def unit_parts(db, version_id: int) -> list[list[dict]]:
             current.append(piece)
             chars += piece_chars
             size += piece_size
+            if number < len(pieces):        # a unit that goes on: one of its pieces per part (a short server step)
+                parts.append(current)
+                current, chars, size = [], 0, 0
     if current:
         parts.append(current)
     if len(parts) > sync.MAX_PARTS:
@@ -345,12 +353,22 @@ def execute(home: Path, settings: config.Config, token: str, options: Options, *
     report['dry_run'] = options.dry_run
     paths.ensure_home(home)
     try:
-        lock, _ = store.acquire_lock(home, PUSH_LOCK)
+        lock, report['warning'] = store.acquire_lock(home, PUSH_LOCK, stale_after=PUSH_LOCK_STALE)
     except store.Locked as exc:
         report.update(exit_code=EXIT_LOCKED, error=str(exc), elapsed=round(time.monotonic() - begin, 3))
         return report
+    try:
+        return _locked_run(home, url, token, options, report, begin, transport, sleep)
+    finally:
+        store.release_lock(lock)                   # whatever happened after the lock was taken (review v2 L-d)
+
+
+def _locked_run(home: Path, url: str, token: str, options: Options, report: dict, begin: float,
+                transport: Transport | None, sleep: Callable[[float], None]) -> dict:
     logger, handler, log_file = _file_logger(home)
     report['log'] = str(log_file)
+    if report['warning']:
+        logger.info(report['warning'])
     run = _Run(url, transport or http_transport(token), sleep, logger, report,
                budget=None if options.max_mb is None else options.max_mb * 2**20)
     db = None
@@ -375,7 +393,6 @@ def execute(home: Path, settings: config.Config, token: str, options: Options, *
                     f"bytes {report['bytes_sent']}")
         logger.removeHandler(handler)
         handler.close()
-        store.release_lock(lock)
     if report['exit_code'] == EXIT_OK and report['refused']:
         report['exit_code'] = EXIT_FAILED
     return report
@@ -463,9 +480,11 @@ def _push(db, run: _Run, options: Options) -> None:
                 report['sent']['copied_versions'] += 1
                 logger.info(f"copied | {path} | {version['sha256'][:12]} | units {version['unit_count']} "
                             '| on the server, nothing sent')
-    # documents the server maps to local ids this store no longer has (a rebuilt or restored store)
+    # documents the server maps to local ids this store no longer has (a rebuilt or restored store); only after
+    # every changed document went out (review v2 L-a): a cut run would forget files it has not sent yet
+    complete = run.note is None and not run.over_budget()
     local_ids = {row[0] for row in db.execute('SELECT id FROM documents')}
-    stale = [{'local_document_id': local} for local in sorted(set(remote) - local_ids)]
+    stale = [{'local_document_id': local} for local in sorted(set(remote) - local_ids)] if complete else []
     for batch in _batches(stale, count=sync.EVENTS_PER_BATCH):
         report['sent']['forgotten'] += run.post('forget', batch)['forgotten']
     if stale:
@@ -502,7 +521,10 @@ def _push(db, run: _Run, options: Options) -> None:
         run.post('events', batch)
         report['sent']['events'] += len(batch)
 
-    final = run.post('end', [{'counts': dict(report['sent']), 'bytes_sent': report['bytes_sent']}])
+    complete = complete and not run.over_budget()   # the server sweeps what this store does not have
+    final = run.post('end', [{'counts': dict(report['sent']), 'bytes_sent': report['bytes_sent'],
+                              'complete': complete}])
+    report['sent']['forgotten'] += final.get('swept', 0)
     report['server'] = {'documents_sha256': final['documents_sha256'], 'vectors_sha256': final['vectors_sha256'],
                         'vectors_missing': final['vectors_missing_total']}
     report['converged'] = all(final[key] == mine[key] for key in sync.SUMMARY_KEYS)
@@ -544,8 +566,8 @@ def _send_units(db, run: _Run, need: list[int], versions_by_local: dict) -> None
             item_size = sync.canonical_size(item) + 1
             part_chars = sum(len(unit['text']) for unit in part)
             if batch and (entries + len(part) > sync.UNITS_PER_BATCH or chars + part_chars > sync.UNIT_CHARS_PER_BATCH
-                          or size + item_size > budget):
-                flush()
+                          or size + item_size > budget or len(parts) > 1):
+                flush()                     # each part of a split version is a batch of its own (a short step)
             batch.append(item)
             entries += len(part)
             units += len({unit['ordinal'] for unit in part}
@@ -568,7 +590,8 @@ def report_lines(report: dict) -> list[str]:
     who = f"to {report['url']}" + (f" as {report['collector']}" if report['collector'] else '')
     head = f"push #{report['push_id']} {who}" if report['push_id'] is not None else f'push {who}'
     if report['up_to_date']:
-        return [f"{head}  up to date (batches 0, bytes sent 0, state requests {report['state_requests']})"]
+        return [f"{head}  up to date (batches 0, bytes sent 0, state requests {report['state_requests']})",
+                *([f"  {report['warning']}"] if report.get('warning') else [])]
     lines = [f"{head}  started {report['started_at']}" + ('  (dry run: nothing sent)' if report['dry_run'] else '')]
     c, s = report['state'], report['sent']
     lines.append(f"  state: documents changed {c['documents_changed']} (added {c['added']} changed {c['changed']} "
@@ -589,6 +612,8 @@ def report_lines(report: dict) -> list[str]:
                      + ('' if report['converged'] else '  (not yet the same as this collector)'))
     if report['error']:
         lines.append(f"  error: {report['error']}")
+    if report.get('warning'):
+        lines.append(f"  {report['warning']}")
     return lines
 
 

@@ -540,9 +540,10 @@ def _lock_started(path: Path) -> datetime | None:
         return None
 
 
-def acquire_lock(home: Path, name: str, at: datetime | None = None) -> tuple[Path, str | None]:
-    """Create ``<home>/<name>`` exclusively; ``(path, warning)``. A lock older than 24 hours is
-    removed with a warning; a newer one raises ``Locked`` (``ScanLocked`` for ``scan.lock``). The
+def acquire_lock(home: Path, name: str, at: datetime | None = None, *,
+                 stale_after: timedelta = STALE_LOCK_AGE) -> tuple[Path, str | None]:
+    """Create ``<home>/<name>`` exclusively; ``(path, warning)``. A lock older than ``stale_after`` (24 hours
+    unless the caller says otherwise; ``push`` uses ``push.PUSH_LOCK_STALE``) is removed with a warning; a newer one raises ``Locked`` (``ScanLocked`` for ``scan.lock``). The
     process id is recorded but never probed (on Windows ``os.kill(pid, 0)`` terminates the
     process). ``scan`` holds ``scan.lock`` and ``index`` holds ``index.lock`` (design M2 §4.6)."""
     path = lock_path(home, name)
@@ -555,10 +556,11 @@ def acquire_lock(home: Path, name: str, at: datetime | None = None) -> tuple[Pat
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             started = _lock_started(path)
-            if attempt == 1 and started is not None and at - started > STALE_LOCK_AGE:
+            if attempt == 1 and started is not None and at - started > stale_after:
                 info = path.read_text(encoding='utf-8', errors='replace')[:200]
                 os.remove(path)
-                warning = f'warning: removed a stale {what} lock older than 24 hours ({info.strip()})'
+                hours = stale_after.total_seconds() / 3600
+                warning = f'warning: removed a stale {what} lock older than {hours:g} hours ({info.strip()})'
                 continue
             try:
                 info = json.loads(path.read_text(encoding='utf-8'))

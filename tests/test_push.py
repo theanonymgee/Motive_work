@@ -728,6 +728,122 @@ def test_one_push_per_data_home_and_tls_failures_are_not_retried(pair, monkeypat
         push.EXIT_UNREACHABLE
 
 
+# ---- review v2: what a rebuilt store no longer has is swept at a complete end (N-1, L-a, L-e), L-d --------
+
+def active_keys(db) -> set[str]:
+    return {row[0] for row in db.execute("SELECT path_key FROM documents WHERE status = 'active'")}
+
+
+def four_files(src: Path) -> None:
+    for name in 'abcd':
+        (src/f'{name}.txt').write_text(f'{name} 합성 고유어{name * 3}\n' + '\n'.join(LINES_KO), encoding='utf-8')
+
+
+def test_a_file_deleted_before_a_rebuild_whose_id_is_reused_is_swept(tmp_path):
+    """Review v2 N-1 (probe R1): a.txt (id 1) is deleted, the store is rebuilt without a scan in between, and
+    b, c, d now have ids 1..3. The complete push's end marks a.txt deleted: the server serves what the
+    collector has, with a ``deleted`` event, and the next push sends nothing."""
+    server = Server(tmp_path)
+    collector = server.collector('합성-재생성')
+    col = Collector(tmp_path)
+    four_files(col.src)
+    col.collect()
+    fresh = None
+    try:
+        assert col.push(server, collector)['converged']
+        (col.src/'a.txt').unlink()
+        fresh = Collector(tmp_path, 'rebuilt', src=col.src)
+        fresh.collect()
+        assert sorted(fresh.db.execute('SELECT id FROM documents')) == [(1,), (2,), (3,)]
+        report = converges(fresh, server, collector)
+        assert report['sent']['forgotten'] == 1                   # swept by the server's end
+        assert active_keys(server.db) == active_keys(fresh.db)
+        events = store.document_events_query(server.db, {'kinds': ['deleted']}, 10, 0)[0]
+        assert [event['doc']['path'].endswith('a.txt') for event in events] == [True]
+        hits = search_module.Engine(server.home).search('고유어aaa', mode='lexical')['hits']
+        assert hits == []
+    finally:
+        col.close()
+        if fresh:
+            fresh.close()
+        server.close()
+
+
+def test_a_cut_push_neither_forgets_nor_sweeps(tmp_path):
+    """Review v2 L-a (probe R2): after a rebuild a ``--limit-docs`` run sends some documents only; it forgets
+    and sweeps nothing (no file still on disk is shown deleted); the next full run converges."""
+    server = Server(tmp_path)
+    collector = server.collector('합성-잘림')
+    col = Collector(tmp_path)
+    four_files(col.src)
+    col.collect()
+    fresh = None
+    try:
+        assert col.push(server, collector)['converged']
+        (col.src/'a.txt').unlink()
+        col.collect()
+        assert col.push(server, collector)['converged']           # a.txt deleted on the server, by the collector
+        before = {row[0] for row in server.db.execute("SELECT path_key FROM documents WHERE status = 'deleted'")}
+        fresh = Collector(tmp_path, 'rebuilt', src=col.src)
+        fresh.collect()
+        cut = fresh.push(server, collector, limit_docs=1)
+        assert cut['exit_code'] == 0 and cut['sent']['forgotten'] == 0 and not cut['converged']
+        assert {row[0] for row in server.db.execute("SELECT path_key FROM documents WHERE status = 'deleted'")} == before
+        assert store.document_events_query(server.db, {'kinds': ['deleted']}, 10, 0)[1] == 1
+        converges(fresh, server, collector)
+        assert active_keys(server.db) == active_keys(fresh.db)
+    finally:
+        col.close()
+        if fresh:
+            fresh.close()
+        server.close()
+
+
+def test_a_successor_sweeps_the_retired_collectors_files_it_does_not_have(tmp_path):
+    """Review v2 L-e: after ``collectors retire`` the successor takes the root over; a file only the retired
+    collector had (deleted meanwhile) is swept at the successor's complete end."""
+    from workmcp import remote
+    server = Server(tmp_path)
+    first, successor = server.collector('합성-전임'), server.collector('합성-후임')
+    col = Collector(tmp_path)
+    four_files(col.src)
+    col.collect()
+    fresh = None
+    try:
+        assert col.push(server, first)['converged']
+        remote.retire_collector(server.db, first['name'])
+        (col.src/'b.txt').unlink()
+        fresh = Collector(tmp_path, 'successor', src=col.src)
+        fresh.collect()
+        converges(fresh, server, successor)
+        assert active_keys(server.db) == active_keys(fresh.db)
+        assert server.db.execute("SELECT status FROM documents WHERE path_key LIKE '%b.txt'").fetchone() == ('deleted',)
+    finally:
+        col.close()
+        if fresh:
+            fresh.close()
+        server.close()
+
+
+def test_the_push_lock_is_released_after_any_failure_and_a_stale_one_is_replaced(pair, monkeypatch):
+    """Review v2 L-d."""
+    col, server, collector = pair
+    lock_file = col.home/push.PUSH_LOCK
+
+    def broken(home):
+        raise OSError('synthetic: the log folder is not writable')
+    monkeypatch.setattr(push, '_file_logger', broken)
+    with pytest.raises(OSError):
+        col.push(server, collector)
+    assert not lock_file.exists()
+    monkeypatch.undo()
+    old = store.now()
+    lock_file.write_text(json.dumps({'pid': 1, 'started_at': '2026-01-01T00:00:00+09:00'}), encoding='utf-8')
+    report = col.push(server, collector)
+    assert report['exit_code'] == 0 and 'removed a stale push lock older than 6 hours' in report['warning']
+    assert report['warning'] in '\n'.join(push.report_lines(report)) and not lock_file.exists() and old
+
+
 # ---- a large version is applied part by part (review M5 remote v1 M-2) ---------------------------------------
 
 def big_text(chars: int) -> str:
@@ -918,3 +1034,42 @@ def test_push_mode_reaches_only_the_configured_server(tmp_path):
     finally:
         col.db.close()
         check.close()
+
+
+def test_a_long_unit_is_applied_one_piece_at_a_time(tmp_path):
+    """Review v2 N-2: one line of 3 M characters (one unit) goes one piece per batch; the server stores the
+    unit once when it ends, chunks it as it grows (the same chunks as the collector's index), and no single
+    application holds the whole unit in Python (tracemalloc over ``receive.apply``)."""
+    import tracemalloc
+    server = Server(tmp_path)
+    collector = server.collector('합성-긴줄')
+    col = Collector(tmp_path)
+    (col.src/'line.txt').write_text(('합성 긴 한 줄 문장입니다. ' * 200_001)[:3_000_000], encoding='utf-8')
+    col.collect()
+    count, length = col.db.execute('SELECT COUNT(*), MAX(LENGTH(text)) FROM units').fetchone()
+    assert count == 1 and length > 2_999_000
+    peaks, real_apply = [], receive.apply
+
+    def measured(db, owner, body, **kwargs):
+        tracemalloc.start()
+        try:
+            return real_apply(db, owner, body, **kwargs)
+        finally:
+            peaks.append((body['kind'], tracemalloc.get_traced_memory()[1]))
+            tracemalloc.stop()
+    receive.apply = measured
+    try:
+        report = col.push(server, collector)
+    finally:
+        receive.apply = real_apply
+    try:
+        assert report['exit_code'] == 0 and report['converged'], report
+        units_batches = [body for body in server.bodies if body['kind'] == 'units']
+        assert len(units_batches) == -(-length // sync.UNIT_PIECE_CHARS)
+        assert all(len(body['items']) == 1 and len(body['items'][0]['units']) == 1 for body in units_batches)
+        assert max(peak for kind, peak in peaks if kind == 'units') < 16 * 2**20      # the unit is 3 M chars
+        mirrored(col, server, collector)
+        assert binding.verify(server.db, stored_only=True)['ok']
+    finally:
+        col.close()
+        server.close()

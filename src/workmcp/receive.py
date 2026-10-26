@@ -30,6 +30,13 @@ is kept between parts. The whole-version checks (count, characters, ``units_sha2
 the stored rows without loading the text; a version that fails them, or that a push leaves unfinished (``end``,
 the next ``begin``), loses its partial units and chunks.
 
+Review v2: a push that sent every changed document says so at ``end`` (``complete``); the server then marks
+deleted every active document under that push's roots that the collector does not map (N-1: a file deleted
+before its store was rebuilt, whose old id another file now has; L-e: a retired collector's file the successor
+does not have). A cut push (``--limit-docs``, ``--max-mb``) sweeps and forgets nothing (L-a). A unit is at most
+``sync.UNIT_MAX_CHARS`` (the collector's ``max_unit_chars``); a long one arrives one piece per batch, is chunked
+as it grows (``long_unit_pieces``), hashed piece by piece and stored once, by SQLite, when it ends (N-2).
+
 Push-run working state (the model key, the collector's roots of the running push) lives in ``pushes.note`` as JSON.
 """
 from __future__ import annotations
@@ -461,6 +468,8 @@ def _version_fields(version, where: str) -> dict:
     fields['parse_status'] = version['parse_status']
     for column in ('unit_count', 'text_chars'):
         fields[column] = None if version[column] is None else _int(version[column], f'{where}.{column}')
+    longest = version.get('unit_chars_max')                       # the longest unit (review v2 N-2)
+    fields['unit_chars_max'] = None if longest is None else _int(longest, f'{where}.unit_chars_max')
     return fields
 
 
@@ -519,9 +528,16 @@ def _copy_source(db, version_id: int, fields: dict) -> int | None:
             "SELECT v.id FROM versions v WHERE v.sha256 = ? AND v.parser_version IS ? AND v.parse_status = 'ok' "
             'AND v.id <> ? AND EXISTS(SELECT 1 FROM units u WHERE u.version_id = v.id) ORDER BY v.id DESC LIMIT ?',
             (fields['sha256'], fields['parser_version'], version_id, COPY_CANDIDATES)).fetchall():
-        if sync.version_units_sha256(db, candidate) == fields['units_sha256']:
+        if _counts_match(db, candidate, fields) and sync.version_units_sha256(db, candidate) == fields['units_sha256']:
             return candidate
     return None
+
+
+def _counts_match(db, version_id: int, fields: dict) -> bool:
+    """The stored units of ``version_id`` are as many and as long as the version says (review v2 L-f)."""
+    count, chars = db.execute('SELECT COUNT(*), COALESCE(SUM(LENGTH(text)), 0) FROM units WHERE version_id = ?',
+                              (version_id,)).fetchone()
+    return count == fields['unit_count'] and chars == (fields['text_chars'] or 0)
 
 
 def _units_state(db, collector_id: int, version_id: int, fields: dict) -> str:
@@ -535,7 +551,8 @@ def _units_state(db, collector_id: int, version_id: int, fields: dict) -> str:
                    (collector_id, version_id))
         return 'none'
     wanted = fields['units_sha256']
-    if holds and wanted is not None and sync.version_units_sha256(db, version_id) == wanted:
+    if holds and wanted is not None and _counts_match(db, version_id, fields) and \
+            sync.version_units_sha256(db, version_id) == wanted:
         state_ = 'have'
     elif wanted is not None and (source := _copy_source(db, version_id, fields)) is not None:
         if holds:
@@ -579,8 +596,11 @@ def _document_refusal(db, collector: dict, push: dict, item: dict, wanted: list[
     path_key = item['path_key']
     if root_key is None or not sync.windows_normcase(path_key).startswith(root_key.rstrip('\\') + '\\'):
         return 'path_outside_root', None
+    # the display path is the same file as the key (review v2 L-b): no other collector's path as a label
+    if sync.windows_normcase(item['path']).casefold() != sync.windows_normcase(path_key).casefold():
+        return 'path_outside_root', None
     if any((fields['unit_count'] or 0) > sync.VERSION_MAX_UNITS or (fields['text_chars'] or 0) > sync.VERSION_MAX_CHARS
-           for fields in wanted):
+           or (fields['unit_chars_max'] or 0) > sync.UNIT_MAX_CHARS for fields in wanted):
         return 'version_too_large', None
     found = db.execute('SELECT d.id, r.collector_id, c.retired_at FROM documents d JOIN source_roots r ON '
                        'r.id = d.root_id LEFT JOIN collectors c ON c.id = r.collector_id WHERE d.path_key = ?',
@@ -747,13 +767,113 @@ def _discard_version(push_id: int, local: int, version_id: int):
     return cleanup
 
 
+LONG_MARGIN = 3 * chunks.CHUNK_MAX     # atoms ending this close to the end of the text so far wait for more text
+
+
+def long_unit_pieces(stream_state: dict, long: dict, ordinal: int, text: str, final: bool) -> list[chunks.ChunkSpec]:
+    """The chunks of a long unit (``len > CHUNK_MAX``) that arrives in pieces, exactly as
+    ``chunks.split_large_unit`` makes them over the whole text (review v2 N-2).
+
+    ``split_large_unit`` is one forward pass over sentence atoms (``chunks._atoms``) with a small state (the
+    current piece's start and its last atom). Here that pass runs over the text kept since a restart point plus
+    ``text``, consumes only atoms that more text cannot change (ending more than ``LONG_MARGIN`` characters
+    before the end, unless ``final``), and keeps its state in ``long`` (JSON: ``base``, ``buffer``,
+    ``piece_start``, ``last``; offsets in the whole unit). The kept text restarts at the current piece's start
+    when that is a word start: atoms of the text from such a point are the whole text's atoms from there."""
+    base, buffer = long['base'], long['buffer'] + text
+    piece_start, last = long.get('piece_start'), long.get('last')
+    out = []
+
+    def emit(start: int, end: int) -> None:
+        out.append(chunks.ChunkSpec(stream_state['next'], ordinal, ordinal, start, end, buffer[start - base:end - base]))
+        stream_state['next'] += 1
+
+    for rel_start, rel_end in chunks._atoms(buffer):
+        start, end = base + rel_start, base + rel_end
+        if last is not None and end <= last[1]:
+            continue                                # consumed before the restart point
+        if not final and rel_end > len(buffer) - LONG_MARGIN:
+            break                                   # may still change with more text
+        if piece_start is None:
+            piece_start, last = start, [start, end]
+            continue
+        if end - piece_start <= chunks.CHUNK_TARGET:
+            last = [start, end]
+            continue
+        emit(piece_start, last[1])
+        last_start, last_end = last
+        overlap = (last_start > piece_start and last_end - last_start <= chunks.CHUNK_OVERLAP
+                   and end - last_start <= chunks.CHUNK_MAX)
+        piece_start = last_start if overlap else start
+        last = [start, end]
+    if final:
+        if piece_start is not None:
+            emit(piece_start, last[1])
+        long.update(base=base + len(buffer), buffer='', piece_start=None, last=None)
+        return out
+    cut = (piece_start - base) if piece_start is not None else 0
+    if cut and not chunks._is_word_start(buffer, cut):
+        cut = 0                                     # not a safe restart: keep the text from the old one
+    long.update(base=base + cut, buffer=buffer[cut:], piece_start=piece_start, last=last)
+    return out
+
+
+def _insert_joined_unit(db, push_id: int, local: int, version_id: int, pending: dict) -> None:
+    """The unit whose pieces wait in ``push_parts``, stored once when it ends: SQLite joins the pieces (in part
+    order) so the whole text is never a Python string, and writes the row once (not once per piece)."""
+    if tuple(int(n) for n in db.execute('SELECT sqlite_version()').fetchone()[0].split('.')[:2]) >= (3, 44):
+        db.execute("INSERT INTO units(version_id, ordinal, kind, locator_json, text, text_sha256) "
+                   "SELECT ?, ?, ?, ?, group_concat(json_extract(body_json, '$.text'), '' ORDER BY part), ? "
+                   "FROM push_parts WHERE push_id = ? AND local_version_id = ? AND part > ?",
+                   (version_id, pending['ordinal'], pending['kind'], pending['locator_json'], pending['text_sha256'],
+                    push_id, local, PROGRESS_PART))
+    else:                                           # an older SQLite: join here
+        db.execute('INSERT INTO units(version_id, ordinal, kind, locator_json, text, text_sha256) VALUES(?,?,?,?,?,?)',
+                   (version_id, pending['ordinal'], pending['kind'], pending['locator_json'],
+                    ''.join(_piece_texts(db, push_id, local)), pending['text_sha256']))
+
+
+def _piece_texts(db, push_id: int, local: int):
+    for (text,) in db.execute("SELECT json_extract(body_json, '$.text') FROM push_parts WHERE push_id = ? AND "
+                              'local_version_id = ? AND part > ? ORDER BY part', (push_id, local, PROGRESS_PART)):
+        yield text
+
+
 def _apply_part(db, push: dict, local: int, version_id: int, fields: dict, progress: dict, rows: list[dict],
                 part: int, last: bool, at: str) -> None:
-    """Insert the complete units of one part (a unit that may continue in the next part waits in ``push_parts``
-    as text pieces) and the chunks they complete; checks each unit's ordinal, hash and the version's limits."""
+    """Insert the complete units of one part and the chunks they complete (one short transaction per part).
+
+    A unit that may continue in the next part is stored at once and grows in place (``text || piece``); its
+    pieces also wait in ``push_parts`` so that its hash is checked piece by piece when it ends, and a long one
+    is chunked as it grows (``long_unit_pieces``): no part ever holds a whole long unit in memory (review v2
+    N-2). Checks each unit's ordinal, length (``sync.UNIT_MAX_CHARS``), hash and the version's limits."""
     cleanup = _discard_version(push['id'], local, version_id)
     joined = sync.join_pieces(rows)
-    pending, finished = progress['pending'], []
+    stream = ChunkStream(progress['chunks']) if progress['chunks'] is not None else None
+    specs: list[chunks.ChunkSpec] = []
+
+    def store_piece(text: str) -> None:
+        db.execute('INSERT INTO push_parts(push_id, local_version_id, part, parts, body_json, received_at) '
+                   'VALUES(?,?,?,?,?,?)', (push['id'], local, part, progress['parts'],
+                                           json.dumps({'text': text}, ensure_ascii=False), at))
+
+    def grow(pending: dict, text: str) -> None:
+        progress['pending_chars'] += len(text)
+        if progress['pending_chars'] > sync.UNIT_MAX_CHARS:
+            raise _Discard('version_too_large', f'unit {pending["ordinal"]} is longer than the server takes', cleanup)
+        if stream is not None and text:
+            long = progress.get('long')
+            if long is None and progress['pending_chars'] > chunks.CHUNK_MAX:
+                so_far = ''.join(_piece_texts(db, push['id'], local))   # at most CHUNK_MAX characters so far
+                specs.extend(stream._flush())               # as ChunkStream.feed does for a unit over CHUNK_MAX
+                stream.state['current'] = []
+                long = progress['long'] = {'base': 0, 'buffer': so_far, 'piece_start': None, 'last': None}
+            if long is not None:
+                specs.extend(long_unit_pieces(stream.state, long, pending['ordinal'], text, final=False))
+        if text:
+            store_piece(text)
+
+    pending = progress['pending']
     if pending is not None:
         head = None
         if joined and joined[0]['ordinal'] == pending['ordinal']:
@@ -761,28 +881,35 @@ def _apply_part(db, push: dict, local: int, version_id: int, fields: dict, progr
             if (head['kind'], head['locator_json'], head['text_sha256']) != \
                     (pending['kind'], pending['locator_json'], pending['text_sha256']):
                 raise _Discard('bad_units_hash', f'pieces of unit {head["ordinal"]} disagree', cleanup)
-        if joined or last:                          # the waiting unit ends here
-            text = ''.join(row[0] for row in db.execute(
-                'SELECT json_extract(body_json, \'$.text\') FROM push_parts WHERE push_id = ? AND local_version_id = ? '
-                'AND part > ? ORDER BY part', (push['id'], local, PROGRESS_PART))) + (head['text'] if head else '')
+            grow(pending, head['text'])
+        if joined or last:                          # the waiting unit ends here: hash it piece by piece
+            digest = hashlib.sha256()
+            for text in _piece_texts(db, push['id'], local):
+                digest.update(text.encode('utf-8'))
+            if digest.hexdigest() != pending['text_sha256']:
+                raise _Discard('bad_units_hash', f'unit {pending["ordinal"]}: text_sha256 is not the hash of its text',
+                               cleanup)
+            _insert_joined_unit(db, push['id'], local, version_id, pending)
             db.execute('DELETE FROM push_parts WHERE push_id = ? AND local_version_id = ? AND part > ?',
                        (push['id'], local, PROGRESS_PART))
-            finished.append({**pending, 'text': text})
-            progress['pending'] = None
-        elif head is not None:                      # this whole part continues it
-            db.execute('INSERT INTO push_parts(push_id, local_version_id, part, parts, body_json, received_at) '
-                       'VALUES(?,?,?,?,?,?)', (push['id'], local, part, progress['parts'],
-                                               json.dumps({'text': head['text']}, ensure_ascii=False), at))
-    if joined and not last:                         # the part's last unit may continue in the next part
-        tail = joined.pop()
-        progress['pending'] = {key: tail[key] for key in ('ordinal', 'kind', 'locator_json', 'text_sha256')}
-        db.execute('INSERT INTO push_parts(push_id, local_version_id, part, parts, body_json, received_at) '
-                   'VALUES(?,?,?,?,?,?)', (push['id'], local, part, progress['parts'],
-                                           json.dumps({'text': tail['text']}, ensure_ascii=False), at))
-    finished += joined
-    stream = ChunkStream(progress['chunks']) if progress['chunks'] is not None else None
-    specs, rows_out = [], []
-    for unit in finished:
+            if stream is not None:
+                unit = json.loads(pending['locator_json'])
+                if progress.get('long') is not None:
+                    specs += long_unit_pieces(stream.state, progress['long'], pending['ordinal'], '', final=True)
+                    stream.state['key'] = list(chunks.group_key(unit))
+                else:                               # it stayed short: chunk it as any other unit
+                    text = db.execute('SELECT text FROM units WHERE version_id = ? AND ordinal = ?',
+                                      (version_id, pending['ordinal'])).fetchone()[0]
+                    specs += stream.feed(pending['ordinal'], unit, text)
+            progress['next_ordinal'] += 1
+            progress['units'] += 1
+            progress['chars'] += progress['pending_chars']
+            progress.update(pending=None, pending_chars=0, long=None)
+    tail = joined.pop() if joined and not last else None   # the part's last unit may continue in the next part
+    rows_out = []
+    for unit in joined:
+        if len(unit['text']) > sync.UNIT_MAX_CHARS:
+            raise _Discard('version_too_large', f'unit {unit["ordinal"]} is longer than the server takes', cleanup)
         if unit['ordinal'] != progress['next_ordinal']:
             raise _Discard('bad_units_hash', f'unit {unit["ordinal"]} where {progress["next_ordinal"]} was due', cleanup)
         if hashlib.sha256(unit['text'].encode('utf-8')).hexdigest() != unit['text_sha256']:
@@ -794,11 +921,18 @@ def _apply_part(db, push: dict, local: int, version_id: int, fields: dict, progr
                          unit['text_sha256']))
         if stream is not None:
             specs += stream.feed(unit['ordinal'], json.loads(unit['locator_json']), unit['text'])
-    if progress['units'] > (fields['unit_count'] or 0) or progress['chars'] > (fields['text_chars'] or 0):
-        raise _Discard('bad_units_hash', 'more units or characters than the version has', cleanup)
     if rows_out:
         db.executemany('INSERT INTO units(version_id, ordinal, kind, locator_json, text, text_sha256) '
                        'VALUES(?,?,?,?,?,?)', rows_out)
+    if tail is not None:
+        if tail['ordinal'] != progress['next_ordinal']:
+            raise _Discard('bad_units_hash', f'unit {tail["ordinal"]} where {progress["next_ordinal"]} was due', cleanup)
+        progress['pending'] = {key: tail[key] for key in ('ordinal', 'kind', 'locator_json', 'text_sha256')}
+        progress.update(pending_chars=0, long=None)
+        grow(progress['pending'], tail['text'])
+    if progress['units'] + (progress['pending'] is not None) > (fields['unit_count'] or 0) or \
+            progress['chars'] + progress.get('pending_chars', 0) > (fields['text_chars'] or 0):
+        raise _Discard('bad_units_hash', 'more units or characters than the version has', cleanup)
     if stream is not None:
         if last:
             specs += stream.finish()
@@ -849,7 +983,8 @@ def _units(db, collector: dict, push: dict, items: list, at: str) -> dict:
             eligible = db.execute(f'SELECT 1 FROM {store.eligible_versions_sql()} AND v.id = ?',
                                   (version_id,)).fetchone() is not None
             progress = {'part': 0, 'parts': parts, 'units_sha256': units_sha256, 'next_ordinal': 1, 'units': 0,
-                        'chars': 0, 'pending': None, 'chunks': ChunkStream().state if eligible else None}
+                        'chars': 0, 'pending': None, 'pending_chars': 0, 'long': None,
+                        'chunks': ChunkStream().state if eligible else None}
         elif progress is None or (progress['part'], progress['parts'], progress['units_sha256']) != \
                 (part - 1, parts, units_sha256):
             raise sync.SyncError('bad_batch', f'version {local}: part {part} of {parts} out of order')
@@ -961,6 +1096,7 @@ def _end(db, collector: dict, push: dict, items: list, at: str) -> dict:
     _need(item, ('counts', 'bytes_sent'), 'end item')
     _int(item['bytes_sent'], 'end bytes_sent')
     _discard_parts(db, push['id'])                  # a split version this push never finished
+    swept = _sweep(db, collector, push, at) if item.get('complete') is True else 0
     totals = dict.fromkeys(('added', 'changed', 'restored', 'deleted', 'reparsed'), 0)
     totals.update(db.execute('SELECT kind, COUNT(*) FROM document_events WHERE scan_id = ? GROUP BY kind',
                              (push['scan_id'],)).fetchall())
@@ -975,7 +1111,27 @@ def _end(db, collector: dict, push: dict, items: list, at: str) -> dict:
         store.meta_set(db, 'fts_synced_at', at)
     store.bump_data_generation(db)
     hashes, missing = sync.summary_and_missing(db, push['model_key'], collector_id=collector['id'])
-    return {**hashes, 'vectors_missing_total': missing}
+    return {**hashes, 'vectors_missing_total': missing, 'swept': swept}
+
+
+def _sweep(db, collector: dict, push: dict, at: str) -> int:
+    """After a push that sent every changed document (``end`` with ``complete``): an active document under a
+    root of this push that this collector does not map (a file deleted before its store was rebuilt, whose old
+    local id another file now has; or a retired collector's file the successor does not have) is the
+    collector's no longer: ``deleted`` with a ``deleted`` event, its rows kept (review v2 N-1, L-e)."""
+    roots = sorted(set(push['roots'].values()))
+    if not roots:
+        return 0
+    rows = db.execute(
+        f"SELECT d.id FROM documents d JOIN source_roots r ON r.id = d.root_id WHERE r.collector_id = ? "
+        f"AND d.root_id IN ({','.join('?' * len(roots))}) AND d.status = 'active' AND NOT EXISTS("
+        "SELECT 1 FROM collector_documents m WHERE m.document_id = d.id AND m.collector_id = ?) ORDER BY d.id",
+        (collector['id'], *roots, collector['id'])).fetchall()
+    for (doc_id,) in rows:
+        db.execute("UPDATE documents SET status = 'deleted', deleted_at = ? WHERE id = ?", (at, doc_id))
+        store.add_document_event(db, push['scan_id'], doc_id, None, 'deleted', at)
+        refresh_chunks(db, doc_id)
+    return len(rows)
 
 
 HANDLERS = {'documents': _documents, 'forget': _forget, 'units': _units, 'vectors': _vectors, 'events': _events,

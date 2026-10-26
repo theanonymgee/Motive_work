@@ -259,6 +259,7 @@ def test_documents_outside_their_root_or_over_the_size_limit_are_refused_alone(s
     assert sync.VERSION_MAX_CHARS == parsers.Limits().max_text_chars
     assert sync.MAX_PARTS >= -(-sync.VERSION_MAX_UNITS // sync.UNITS_PER_BATCH)
     assert sync.MAX_PARTS >= -(-sync.VERSION_MAX_CHARS // sync.UNIT_CHARS_PER_BATCH)
+    assert sync.MAX_PARTS >= -(-sync.VERSION_MAX_CHARS // sync.UNIT_PIECE_CHARS)      # long units, a piece a part
 
 
 @pytest.mark.parametrize('change', [
@@ -436,3 +437,108 @@ def test_chunk_stream_resumed_between_parts_equals_build_chunks(tmp_path):
                 assert out == expected, (version_id, every)
     finally:
         col.close()
+
+
+# ---- review v2: unit length limit (N-2), display path (L-b), counts of a held unit set (L-f) -------------
+
+def test_a_unit_over_the_server_limit_is_refused(server, monkeypatch):
+    assert sync.UNIT_MAX_CHARS == parsers.Limits().max_unit_chars
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    long_version = version(local=61, unit_chars_max=sync.UNIT_MAX_CHARS + 1)
+    result = ok(server, collector, 'documents', [document(local=6, path='C:\\synthetic\\long.txt',
+                                                          versions=[long_version])], push_id)
+    assert result['refused'] == [{'local_document_id': 6, 'code': 'version_too_large'}]
+    # without the declared length, the parts enforce it: a unit that grows past the limit removes the version
+    monkeypatch.setattr(sync, 'UNIT_MAX_CHARS', 30)
+    text = '가' * 50
+    pieces = [{'ordinal': 1, 'kind': 'line', 'locator_json': parsers.unit_json({'kind': 'line', 'line': 1}),
+               'text': text[at:at + 20], 'text_sha256': sha(text)} for at in range(0, 50, 20)]
+    units = [{'ordinal': 1, 'kind': 'line', 'locator_json': pieces[0]['locator_json'], 'text': text,
+              'text_sha256': sha(text)}]
+    item = document(local=7, path='C:\\synthetic\\grow.txt', versions=[version(local=71, units=units)])
+    ok(server, collector, 'documents', [item], push_id)
+    hash_ = sync.units_sha256(units)
+    first = {'local_version_id': 71, 'units_sha256': hash_, 'part': 1, 'parts': 3, 'units': [pieces[0]]}
+    assert ok(server, collector, 'units', [first], push_id)['versions'][0]['received'] == 1
+    second = {**first, 'part': 2, 'units': [pieces[1]]}
+    answer = receive.apply(server.db, collector, body(collector, 'units', [second], push_id), raw_bytes=1)
+    assert answer['error']['code'] == 'version_too_large'
+    assert server.db.execute('SELECT COUNT(*) FROM push_parts').fetchone()[0] == 0          # cleared
+    assert server.db.execute("SELECT COUNT(*) FROM units u JOIN versions v ON v.id = u.version_id "
+                             "JOIN documents d ON d.id = v.document_id WHERE d.path_key LIKE '%grow.txt'").fetchone()[0] == 0
+
+
+def test_the_display_path_must_be_the_files_own(server):
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    forged = document(local=8, path='C:\\synthetic\\b.txt')
+    forged['path'] = 'C:\\Other\\label.txt'                       # another file's path as the label
+    spelled = document(local=9, path='C:/Synthetic/A.TXT')
+    spelled['path_key'] = 'c:\\synthetic\\a.txt'                  # the collector's key of that spelling
+    result = ok(server, collector, 'documents', [forged, spelled], push_id)
+    assert result['refused'] == [{'local_document_id': 8, 'code': 'path_outside_root'}]
+    assert set(result['documents']) == {'9'}                         # case and slashes are the same file
+
+
+def test_a_held_unit_set_counts_only_with_its_own_counts(server):
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    ok(server, collector, 'documents', [document()], push_id)
+    ok(server, collector, 'units', [units_item()], push_id)
+    again = ok(server, collector, 'documents', [document(last_seen_at=store.now())], push_id)   # not a replay
+    assert again['versions']['11']['units'] == 'have'
+    wrong = document(versions=[version(unit_count=len(UNITS) + 1)])  # same hash, another count
+    assert ok(server, collector, 'documents', [wrong], push_id)['versions']['11']['units'] == 'need'
+    wrong_chars = document(versions=[version(text_chars=1)])
+    assert ok(server, collector, 'documents', [wrong_chars], push_id)['versions']['11']['units'] == 'need'
+
+
+def long_texts():
+    import random
+    rng = random.Random(7)
+    words = ['합성', '문장', 'synthetic', 'line', '끝.', 'end.)', '"인용."', '…', '가나다라마바사아자차카타파하' * 9, 'x' * 300,
+             '물음?', '줄\n바꿈', 'zero​width', '느낌표!」']
+    yield ' '.join(rng.choice(words) for _ in range(6000))                       # mixed sentences
+    yield ('합성 긴 한 줄 문장입니다. ' * 3000)                                       # many short sentences
+    yield ' '.join('단어' for _ in range(20000))                                    # one sentence, hard cuts at words
+    yield 'y' * 40_000                                                              # no word starts at all
+    yield ('끝.) 다음' + ' 이어짐' * 400 + '\n') * 30                                  # closers and line breaks
+
+
+@pytest.mark.parametrize('number', range(5))
+@pytest.mark.parametrize('piece', [900, 4096, 50_000])
+def test_a_long_unit_chunked_piece_by_piece_equals_split_large_unit(number, piece):
+    """Review v2 N-2: a long unit chunked as its pieces arrive gives exactly ``chunks.split_large_unit`` of the
+    whole text (and keeps only a small buffer between pieces)."""
+    text = list(long_texts())[number]
+    expected = chunks.split_large_unit(4, text, 7)
+    state, long, out, buffers = {'next': 7}, {'base': 0, 'buffer': '', 'piece_start': None, 'last': None}, [], []
+    for at in range(0, len(text), piece):
+        out += receive.long_unit_pieces(state, long, 4, text[at:at + piece], final=False)
+        long = json.loads(json.dumps(long))
+        buffers.append(len(long['buffer']))
+    out += receive.long_unit_pieces(state, long, 4, '', final=True)
+    assert out == expected and state['next'] == 7 + len(expected)
+    if number in (0, 1, 2, 4):
+        assert max(buffers) < piece + 5 * chunks.CHUNK_MAX                  # nothing like the whole unit
+
+
+@pytest.mark.parametrize('seed', range(40))
+def test_long_unit_streaming_on_random_texts(seed):
+    import random
+    rng = random.Random(seed)
+    alphabet = ['가', '나', 'a', 'b', ' ', ' ', '.', ')', '"', '?', '\n', '​', '。', '…', '」']
+    weights = [9, 9, 9, 9, rng.choice([1, 6, 20]), 2, rng.choice([0, 1, 3]), 1, 1, 1, rng.choice([0, 1]), 1, 1, 1, 1]
+    text = ''.join(rng.choices(alphabet, weights, k=rng.randrange(1_000, 30_000)))
+    if len(text) <= chunks.CHUNK_MAX:
+        text += '가' * chunks.CHUNK_MAX
+    expected = chunks.split_large_unit(1, text, 1)
+    state, long, out, at = {'next': 1}, {'base': 0, 'buffer': '', 'piece_start': None, 'last': None}, [], 0
+    while at < len(text):
+        size = rng.randrange(1, 4_000)
+        out += receive.long_unit_pieces(state, long, 1, text[at:at + size], final=False)
+        long = json.loads(json.dumps(long))
+        at += size
+    out += receive.long_unit_pieces(state, long, 1, '', final=True)
+    assert out == expected
