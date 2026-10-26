@@ -486,12 +486,18 @@ def test_package_has_no_importable_file_other_than_py():
 
 
 def test_importable_non_source_check_flags_every_form(tmp_path):
-    for rel_path in ('a.pyw', 'sub/b.pyd', 'c.pyc', 'sub/d.cp312-win_amd64.pyd', '__pycache__/e.cpython-312.pyc',
+    """Importable suffixes are the running OS's own: ``.pyw``/``.pyd`` on Windows, ``.so`` extension modules elsewhere."""
+    for rel_path in ('a.pyw', 'sub/b.pyd', 'c.pyc', 'sub/d.cp312-win_amd64.pyd', 'sub/e.so',
+                     'sub/f.cpython-312-x86_64-linux-gnu.so', '__pycache__/e.cpython-312.pyc',
                      'f.py', 'g.txt', 'sub/__pycache__/h.cpython-312.pyc'):
         (tmp_path/rel_path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path/rel_path).write_bytes(b'')
-    assert importable_non_sources(tmp_path) == ['a.pyw', 'c.pyc', 'sub/b.pyd', 'sub/d.cp312-win_amd64.pyd']
-    assert {'.pyw', '.pyc'} <= set(importlib.machinery.all_suffixes()) or os.name != 'nt'
+    if os.name == 'nt':
+        assert importable_non_sources(tmp_path) == ['a.pyw', 'c.pyc', 'sub/b.pyd', 'sub/d.cp312-win_amd64.pyd']
+        assert {'.pyw', '.pyc'} <= set(importlib.machinery.all_suffixes())
+    else:
+        assert importable_non_sources(tmp_path) == ['c.pyc', 'sub/e.so', 'sub/f.cpython-312-x86_64-linux-gnu.so']
+        assert {'.so', '.pyc'} <= set(importlib.machinery.all_suffixes())
 
 
 # 1

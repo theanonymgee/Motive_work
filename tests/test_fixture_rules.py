@@ -263,6 +263,53 @@ def test_shell_scripts_have_valid_syntax():
         assert result.returncode == 0, result.stderr
 
 
+# ---- line endings: files that run on the Linux server are LF in the repository, whatever the exporting PC's autocrlf ----
+
+_LF_ONLY_SUFFIXES = ('.sh', '.service', '.timer', '.conf')
+
+
+def _lf_only_files():
+    deploy = sorted(p for p in (REPO/'tools'/'deploy').iterdir() if p.is_file())
+    scripts = sorted(p for p in (REPO/'tools').glob('*.sh'))
+    return [p.relative_to(REPO).as_posix() for p in deploy + scripts]
+
+
+def test_gitattributes_forces_lf_for_scripts_and_deploy_pieces():
+    """``git archive`` honours ``eol=lf``; without it a Windows export (``core.autocrlf=true``) ships CRLF to the server."""
+    rules = {}
+    for line in (REPO/'.gitattributes').read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            pattern, *attributes = line.split()
+            rules[pattern] = attributes
+    for pattern in ('*.sh', '*.service', '*.timer', '*.conf', 'tools/deploy/*'):
+        assert 'eol=lf' in rules.get(pattern, []) and 'text' in rules[pattern], pattern
+    import fnmatch
+    for relative in _lf_only_files():
+        name = relative.rsplit('/', 1)[-1]
+        assert any('eol=lf' in attributes and fnmatch.fnmatchcase(relative if '/' in pattern else name, pattern)
+                   for pattern, attributes in rules.items()), relative
+    assert any(relative.endswith('.sh') for relative in _lf_only_files())
+
+
+def test_scripts_and_deploy_pieces_are_lf_in_the_repository():
+    import shutil
+    import subprocess
+    files = _lf_only_files()
+    assert any(relative.endswith(_LF_ONLY_SUFFIXES) for relative in files)
+    for relative in files:
+        assert bytes([13]) not in (REPO/relative).read_bytes(), relative
+    git = shutil.which('git')
+    if git is None or not (REPO/'.git').exists():
+        return
+    result = subprocess.run([git, 'ls-files', '--eol', '--'] + files, cwd=REPO, capture_output=True, text=True)
+    if result.returncode != 0:
+        return
+    for line in result.stdout.splitlines():
+        index_eol = line.split()[0]
+        assert index_eol in ('i/lf', 'i/none'), line
+
+
 # ---- review v1 (L6-L10, L12): side-effect-free survey, read-only code path, ^~ location, real test names ----
 
 def test_survey_script_avoids_commands_that_write_as_a_side_effect():

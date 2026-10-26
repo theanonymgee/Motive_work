@@ -236,8 +236,10 @@ def chunk_hashes(db, version_id=None):
 
 
 def latest_version(db, name):
-    return db.execute('SELECT v.id FROM versions v JOIN documents d ON d.id = v.document_id '
-                      'WHERE d.path LIKE ? ORDER BY v.seq DESC LIMIT 1', (f'%\\{name}',)).fetchone()[0]
+    """Newest version of the document whose file name is ``name`` (stored paths use the OS's own separator)."""
+    rows = db.execute('SELECT v.id, d.path FROM versions v JOIN documents d ON d.id = v.document_id '
+                      'ORDER BY v.seq DESC').fetchall()
+    return next(version_id for version_id, path in rows if path.replace('\\', '/').rsplit('/', 1)[-1] == name)
 
 
 def check_fts(db):

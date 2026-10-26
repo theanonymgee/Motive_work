@@ -14,7 +14,7 @@ import pytest
 from fixtures import SENTINEL, bundle
 from workmcp import cli, config, paths, store, tools
 
-UNC = r'\\localhost\C$\synthetic'
+UNC = r'\\localhost\C$\synthetic' if os.name == 'nt' else '//localhost/synthetic'    # a network path in each OS's own form
 
 
 @pytest.fixture

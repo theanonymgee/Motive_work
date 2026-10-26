@@ -1,6 +1,7 @@
 """Source settings and root rules (design M1 §2.1-§2.3). Temporary folders only; no network path is touched."""
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from workmcp import config, paths, store
 
 UNC = r'\\localhost\C$\synthetic' if os.name == 'nt' else '//localhost/synthetic'
+WINDOWS_ONLY = pytest.mark.skipif(sys.platform != 'win32', reason='Windows path form (no UNC long prefix elsewhere)')
 
 
 @pytest.fixture
@@ -35,7 +37,7 @@ def test_valid_root_is_resolved_without_warnings(tmp_path, home):
     ('missing', 'source_root_missing'),
     ('file', 'source_root_missing'),
     ('unc', 'source_root_network'),
-    ('unc_long', 'source_root_network'),
+    pytest.param('unc_long', 'source_root_network', marks=WINDOWS_ONLY),
     ('inside_home', 'source_root_inside_home'),
     ('is_home', 'source_root_inside_home'),
     ('contains_home', 'source_root_contains_home'),

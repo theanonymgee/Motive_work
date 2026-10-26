@@ -1,7 +1,8 @@
 """Data home rules (design §2.2, §8.4 A). Cases call ``validate_home`` directly with explicit env."""
 import os
+import sys
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -109,16 +110,17 @@ def test_sync_env_folder_is_refused(tmp_path, name):
 LONG = '\\\\?\\'  # the Windows \\?\ prefix
 
 
-@pytest.mark.parametrize('make', [lambda t: str(REPO_ROOT/'data.'), lambda t: str(REPO_ROOT) + r' \data',
-                                  lambda t: str(REPO_ROOT) + r'.\data', lambda t: str(t/'OneDrive.'/'wk'),
+@pytest.mark.parametrize('make', [lambda t: str(REPO_ROOT/'data.'), lambda t: str(REPO_ROOT) + ' ' + os.sep + 'data',
+                                  lambda t: str(REPO_ROOT) + '.' + os.sep + 'data', lambda t: str(t/'OneDrive.'/'wk'),
                                   lambda t: str(t/'ok '/'wk'), lambda t: str(t/'wk..'), lambda t: str(t/'wk. ')])
 def test_trailing_dot_or_space_component_is_refused(tmp_path, make):
     assert code_of(make(tmp_path)) == 'home_trailing_dot_space'
 
 
 def test_dot_and_dotdot_components_are_not_trailing_dots(tmp_path):
-    assert validate_home(str(tmp_path) + r'\.\a\..\wk', {}, REPO_ROOT) == (tmp_path/'wk').resolve()
-    assert code_of(str(REPO_ROOT) + '\\..\\' + REPO_ROOT.name + r'\data') == 'home_inside_repo'
+    sep = os.sep
+    assert validate_home(sep.join([str(tmp_path), '.', 'a', '..', 'wk']), {}, REPO_ROOT) == (tmp_path/'wk').resolve()
+    assert code_of(sep.join([str(REPO_ROOT), '..', REPO_ROOT.name, 'data'])) == 'home_inside_repo'
 
 
 def test_long_path_prefix_is_judged_on_the_local_path(tmp_path):
@@ -161,14 +163,29 @@ def test_short_8dot3_names_are_judged_by_the_long_target(tmp_path):
         assert code_of(synced_short + r'\wk') == 'home_sync_component'
 
 
-@pytest.mark.parametrize('drive, system, warned', [('C:', 'C:', False), ('c:', 'C:', False), ('G:', 'C:', True),
-                                                    ('D:', 'C:', True), ('G:', None, False)])
+ON_WINDOWS_ONLY = pytest.mark.skipif(sys.platform != 'win32', reason='drive letters exist on Windows only')
+
+
+@pytest.mark.parametrize('drive, system, warned', [('C:', 'C:', False), ('c:', 'C:', False),
+                                                    pytest.param('G:', 'C:', True, marks=ON_WINDOWS_ONLY),
+                                                    pytest.param('D:', 'C:', True, marks=ON_WINDOWS_ONLY),
+                                                    ('G:', None, False)])
 def test_doctor_warns_when_home_is_off_the_system_drive(drive, system, warned):
     env = {'SystemDrive': system} if system else {}
     message = paths.drive_warning(Path(drive + '\\wk'), env)
     assert (message is not None) is warned
     if warned:
         assert drive in message and 'Google Drive' in message
+
+
+def test_posix_home_has_no_drive_warning():
+    assert paths.drive_warning(PurePosixPath('/srv/workmcp/wk'), {'SystemDrive': 'C:'}) is None
+
+
+@pytest.mark.parametrize('raw, code', [('wk', 'home_relative'), ('./wk', 'home_relative'), ('../wk', 'home_relative'),
+                                       ('//server/share/wk', 'home_unc')])
+def test_relative_and_slash_network_forms_are_refused(raw, code):
+    assert code_of(raw) == code
 
 
 def test_sync_attribute_is_refused(tmp_path, monkeypatch):
@@ -211,7 +228,9 @@ def test_symlink_into_repo_is_judged_by_target(tmp_path):
     try:
         assert code_of(str(link/'data')) == 'home_inside_repo'
     finally:
-        os.rmdir(link)  # removes only the link, so later tmp cleanup never walks into the repository
+        # removes only the link (a Windows junction goes by rmdir, a POSIX symlink by unlink), so later tmp cleanup never
+        # walks into the repository
+        os.rmdir(link) if os.name == 'nt' else os.unlink(link)
     assert (REPO_ROOT/'pyproject.toml').is_file()
 
 
