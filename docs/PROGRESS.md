@@ -1,5 +1,15 @@
 # 진행·재개 기록
 
+### 2026-10-27 — M5 진행 (원격 운영 서버 전환) — 단계 C 승인 대기
+
+- 구조 변경(피터 2026-10-26): 회사 PC 수집기가 파싱·청크·임베딩(BGE-M3) 후 변경분을 Hostinger KVM 2의 운영 서버로 push, 서버가 같은 모델로 질의를 임베딩하고 MCP를 HTTPS+토큰으로 제공. 설계 `M5-원격구조설계_v1`(반영 기록 1–32번이 본문보다 우선).
+- 구현: 1단계 `8f3e5fe`(Streamable HTTP 서버·토큰·push·receive·배포 조각), 2단계 `7526dee`(서버/push/클라이언트 e2e, 감사 두 모드 동시, 측정 — `M5-원격e2e_v1`).
+- 검토: v1 조건부(중간 2: 수집기 홈 재생성 미수렴, 큰 버전 조립 메모리 +236 MiB) → `562faac` → v2 조건부(중간 2: 재생성 전 삭제 파일이 active로 남음, 긴 단위 하나의 메모리·정지) → `199547f` → **v3 통과**(`44e7f07`, 새 낮음 7 — M6에서 회사 자료 전 처리: 거부 문서가 sweep에 쓸림 V3-3, push.lock 6시간 교체 경쟁 V3-5 우선).
+- 결과: 이 PC 2130 passed. VPS(Ubuntu 24.04, Python 3.12.3)에서 `1c00dbe` 기준 2031 passed·22 skipped(Windows 전용·실모델).
+- VPS 단계: A 조사(읽기 전용 `tools/vps_survey.sh`, 출력은 저장소 밖) 완료, B 설치(사용자 `workmcp`, venv, LF 아카이브 — `git -c core.autocrlf=false archive`, `.gitattributes`) 완료.
+- 발견: 시스템 gitconfig `core.autocrlf=true` 때문에 기본 `git archive`가 CRLF로 내보내 리눅스에서 스크립트·테스트 16개 실패 → LF 고정. VPS의 Bun 앱이 *:3000에 열려 있음(손대지 않음, 피터에게 알림).
+- 다음: 피터 승인 순서대로 C(최신 커밋 재배포·모델 다운로드·config·토큰 2개) → D(systemd·nginx 443·certbot, 변경 내용 먼저 보임) → E(백업 타이머) → F(이 PC 합성 수집기 push, Claude Code 원격 MCP 검색·쓰기) → 보안 점검표 실행 → PLAN §5 완료 근거.
+
 ### 2026-10-26 — M4 완료 (구조화 지식·시간 이력)
 
 - 새 Code 탭 세션에서 쓰기 도구 15개가 보여 완료 조건 ⑥ 수행: 시험 홈에서 record_entity → record_fact(근거) → get_entity → record_fact(내 메모, 충돌) → list_knowledge(충돌) → retract(충돌 해소) → supersede(유효 기간 끊기) → get_history → 시점 조회 2축 → record_task·완료 대체 → status, 셸에서 읽기 전용 DB 대조·`verify`·원본 해시 전후 동일. 모두 통과 — `doc/validation/2026-10-25_M4-연결확인_v1.md`.
