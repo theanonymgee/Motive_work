@@ -1,6 +1,6 @@
 """Wire schema of ``workmcp push`` (design M5 remote §3, ``sync.py``): constants, batch ids, envelope checks, gzip
-bodies, vector blobs, the summary hashes and the URL rules. Stage 0 skeleton; stage 1 adds the cross-side
-summary test after a real push (``test_summary_hashes_match_across_sides``). Synthetic data only."""
+bodies, vector blobs, unit pieces, the summary hashes (also across both sides after a real push, through the
+in-memory server of ``test_push``) and the URL rules. Synthetic data only."""
 import base64
 import gzip
 import hashlib
@@ -205,3 +205,47 @@ def test_windows_normcase_matches_ntpath():
     import ntpath
     for path in ('C:/Synthetic/A.TXT', 'c:\\합성\\Ä.md', '\\\\server\\Share/x'):
         assert sync.windows_normcase(path) == ntpath.normcase(path)
+
+
+def test_summary_hashes_match_across_sides(tmp_path):
+    """After a push the server's summary of that collector equals the collector's own; one changed document moves
+    ``documents_sha256`` only, and one more vector moves ``vectors_sha256`` only."""
+    from test_collect import rewrite, scan
+    from test_push import Collector, Server
+    server = Server(tmp_path)
+    collector = server.collector('합성')
+    col = Collector(tmp_path)
+    bundle.write_bundle(col.src)
+    col.collect()
+    try:
+        assert col.push(server, collector)['converged']
+        mine = sync.summary(col.db, col.key)
+        assert sync.summary(server.db, col.key, collector_id=collector['id']) == mine
+        assert sync.document_summaries(server.db, collector_id=collector['id']) == sync.document_summaries(col.db)
+        assert sync.event_count(server.db, collector_id=collector['id']) == sync.event_count(col.db)
+        rewrite(col.src/'docs'/'notes_utf8.txt', '합성 변경 한 줄\n'.encode('utf-8'))
+        scan(col.db, col.root)
+        moved = sync.summary(col.db, col.key)
+        assert moved['documents_sha256'] != mine['documents_sha256'] and moved['vectors_sha256'] == mine['vectors_sha256']
+        col.push(server, collector)
+        assert sync.summary(server.db, col.key, collector_id=collector['id']) == moved
+    finally:
+        col.close()
+        server.close()
+
+
+def test_unit_pieces_cut_long_texts_and_join_back():
+    text = '합성' * (sync.UNIT_PIECE_CHARS // 2) + '끝'
+    unit = {'ordinal': 3, 'kind': 'line', 'locator_json': '{"kind":"line","line":3}', 'text': text,
+            'text_sha256': hashlib.sha256(text.encode()).hexdigest()}
+    pieces = sync.unit_pieces(unit)
+    assert len(pieces) == 2 and all(len(p['text']) <= sync.UNIT_PIECE_CHARS for p in pieces)
+    assert {(p['ordinal'], p['text_sha256']) for p in pieces} == {(3, unit['text_sha256'])}
+    assert sync.join_pieces([{**unit, 'ordinal': 2, 'text': 'a'}, *pieces]) == [{**unit, 'ordinal': 2, 'text': 'a'},
+                                                                                unit]
+    small = sync.unit_pieces(unit, max_bytes=1000)                  # a byte budget cuts finer
+    assert all(sync.canonical_size(p) <= 1000 for p in small) and ''.join(p['text'] for p in small) == text
+    assert sync.unit_pieces({**unit, 'text': 'x'}) == [{**unit, 'text': 'x'}]
+    with pytest.raises(sync.SyncError) as caught:
+        sync.join_pieces([pieces[0], {**pieces[1], 'kind': 'paragraph'}])
+    assert caught.value.code == 'bad_units_hash'

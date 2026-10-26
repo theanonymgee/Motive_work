@@ -1,0 +1,45 @@
+# Caddy piece for workmcp (design M5 remote 4.3 option A for an existing Caddy, option B for a new one).
+# This is a text note, not a ready Caddyfile: put the handle block where the guide says.
+#
+# --- A. Caddy already runs and serves srv1782254.hstgr.cloud (approval step D) ---
+# Add this block inside the EXISTING site block of that host name. Nothing else changes.
+# Caddy keeps the original Host header and adds X-Forwarded-For by default, which is what the
+# app's allowed_hosts check expects.
+#
+#   handle /workmcp/* {
+#       request_body {
+#           max_size 16MB
+#       }
+#       reverse_proxy 127.0.0.1:8765 {
+#           flush_interval -1
+#           transport http {
+#               response_header_timeout 300s
+#           }
+#       }
+#   }
+#
+# Then:  caddy validate --config /etc/caddy/Caddyfile  &&  sudo systemctl reload caddy
+# Rollback: delete the block, validate, reload.
+#
+# --- B. Nothing uses 80/443 and Caddy is installed new (approval step D; Caddy gets the Let's Encrypt
+#        certificate by itself over port 80/443) ---
+#
+#   srv1782254.hstgr.cloud {
+#       handle /workmcp/* {
+#           request_body {
+#               max_size 16MB
+#           }
+#           reverse_proxy 127.0.0.1:8765 {
+#               flush_interval -1
+#               transport http {
+#                   response_header_timeout 300s
+#               }
+#           }
+#       }
+#       handle {
+#           respond 404
+#       }
+#   }
+#
+# Access logs: leave Caddy's access log off for this host (or at its default), and never add a log
+# format that prints request headers: the Authorization header carries the bearer token.

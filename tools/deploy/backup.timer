@@ -1,0 +1,19 @@
+# Daily database backup timer (design M5 remote 9.5, approval step E). It starts workmcp-backup.service
+# (same folder), which runs backup.sh as the workmcp user. Install together:
+#   sudo install -m 644 tools/deploy/backup.timer           /etc/systemd/system/workmcp-backup.timer
+#   sudo install -m 644 tools/deploy/workmcp-backup.service /etc/systemd/system/workmcp-backup.service
+#   sudo install -m 755 -o workmcp -g workmcp tools/deploy/backup.sh /home/workmcp/app/backup.sh
+#   sudo systemctl daemon-reload && sudo systemctl enable --now workmcp-backup.timer
+# Check: systemctl list-timers workmcp-backup.timer ; journalctl -u workmcp-backup.service -n 5 --no-pager
+
+[Unit]
+Description=workmcp daily database backup (kept inside the data home on this VPS only)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=workmcp-backup.service
+
+[Install]
+WantedBy=timers.target

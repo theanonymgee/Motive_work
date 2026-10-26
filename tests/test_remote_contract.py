@@ -1,7 +1,7 @@
-"""M5 remote stage 0 contract (design M5 remote §1.2, §4.1, §4.6, §11.1): ``[push]``/``[server]`` settings, the new
-CLI commands and their argument exits, the push token file rule, the token helpers, and the stage-0 shells of
-``remote``/``push``/``receive``. Stage 1 replaces the "not implemented" exits with the real bodies (``test_remote.py``,
-``test_push.py``, ``test_receive.py``). No network: nothing here binds or connects."""
+"""M5 remote contract (design M5 remote §1.2, §4.1, §4.6, §11.1): ``[push]``/``[server]`` settings, the new
+CLI commands and their argument exits, the push token file rule, the token helpers and the remote route table.
+The bodies are tested in ``test_remote.py`` (server, tokens), ``test_push.py`` and ``test_receive.py``. No
+network: nothing here binds or connects (a valid ``serve --http`` or ``push`` would, so only refusals run)."""
 import argparse
 from pathlib import Path
 
@@ -86,17 +86,13 @@ def write_config(home, text):
 @pytest.mark.parametrize('argv, code, message', [
     (['serve', '--http', '0.0.0.0:8765'], 4, 'loopback'),
     (['serve', '--http', 'localhost:8765'], 4, 'loopback'),
-    (['serve', '--http', '127.0.0.1:8765'], 1, 'not implemented'),   # stage 0
-    (['serve', '--http'], 1, 'not implemented'),                     # [server] http
     (['token', 'issue', '--kind', 'other', '--name', 'x'], 4, '--kind'),
     (['token', 'issue', '--kind', 'mcp', '--name', 'two words'], 4, '--name'),
     (['token', 'issue', '--kind', 'mcp', '--name', 'a', '--collector', 'b'], 4, '--collector'),
+    (['token', 'issue', '--kind', 'push', '--name', 'a', '--collector', 'two words'], 4, '--collector'),
     (['token', 'revoke', '0'], 4, 'ID'),
-    (['token', 'issue', '--kind', 'push', '--name', 'company-pc'], 1, 'not implemented'),
-    (['token', 'list'], 1, 'not implemented'),
-    (['token', 'rotate', '3'], 1, 'not implemented'),
-    (['collectors'], 1, 'not implemented'),
-    (['collectors', 'retire', 'company-pc'], 1, 'not implemented'),
+    (['token', 'rotate', '3'], 4, 'no token with id 3'),
+    (['collectors', 'retire', 'company-pc'], 4, 'no collector'),
 ])
 def test_server_commands_check_their_arguments_first(home, capsys, argv, code, message):
     got, out, err = run(capsys, *argv)
@@ -119,17 +115,14 @@ def test_push_exits(home, capsys, monkeypatch):
     assert code == 4 and 'push token file not found' in err and paths.PUSH_TOKEN_ENV in err
     assert run(capsys, 'push', '--allow-insecure-loopback', '--max-mb', '0')[0] == 4
     assert run(capsys, 'push', '--allow-insecure-loopback', '--limit-docs', '0')[0] == 4
-    write_config(home, f"[push]\nurl = '{PUSH_URL}'\n")
-    (home/paths.PUSH_TOKEN_FILE).write_text('synthetic-token\n', encoding='utf-8')
-    code, out, err = run(capsys, 'push', '--dry-run')
-    assert (code, out) == (1, '') and 'not implemented' in err and 'synthetic-token' not in err
 
 
-def test_verify_stored_is_stage_1_and_refuses_root(home, capsys, tmp_path):
+def test_verify_stored_checks_the_store_and_refuses_root(home, capsys, tmp_path):
     store.open_home(home).close()
     assert run(capsys, 'verify', '--stored', '--root', str(tmp_path))[0] == 4
-    code, _, err = run(capsys, 'verify', '--stored')
-    assert code == 1 and 'not implemented' in err
+    code, out, err = run(capsys, 'verify', '--stored')
+    assert code == 0 and out.startswith('verify (stored text only; originals stay on the collector)')
+    assert 'binding ok' in out and err == ''
 
 
 def test_new_commands_have_the_design_arguments():
@@ -216,22 +209,6 @@ def test_build_server_takes_the_remote_instructions(tmp_path):
     assert server.build_server(home).instructions == server.INSTRUCTIONS
     built = server.build_server(home, instructions=remote.REMOTE_INSTRUCTIONS)
     assert built.instructions == remote.REMOTE_INSTRUCTIONS and built.workmcp_state.role == 'local'
-
-
-@pytest.mark.parametrize('call', [
-    lambda: remote.issue_token(None, 'mcp', 'n'), lambda: remote.list_tokens(None), lambda: remote.revoke_token(None, 1),
-    lambda: remote.rotate_token(None, 1), lambda: remote.lookup_token(None, 't', 'mcp'),
-    lambda: remote.retire_collector(None, 'n'), lambda: remote.auth_settings(config.ServerSettings()),
-    lambda: remote.transport_security(config.ServerSettings()), lambda: remote.open_state(Path('.'), None),
-    lambda: remote.build_remote(Path('.'), None, None),
-    lambda: remote.main(Path('.'), '127.0.0.1', 1, config.Config(Path('c'), False, config.ScanSettings(), ())),
-    lambda: push.execute(Path('.'), None, 't', push.Options()), lambda: push.report_lines({}),
-    lambda: receive.apply(None, {}, {}, raw_bytes=0), lambda: receive.state(None, {}, model_key=None),
-    lambda: receive.state_page(None, {}), lambda: receive.vectors_page(None, {}, model_key='k'),
-])
-def test_stage_0_bodies_are_not_implemented(call):
-    with pytest.raises(NotImplementedError):
-        call()
 
 
 def test_push_contract_constants():

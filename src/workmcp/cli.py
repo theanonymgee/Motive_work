@@ -22,10 +22,13 @@ exit 0 done, 1 a step failed, 2 data home refused (an AppData home without ``--y
 scan or index lock is held (``--upgrade``), 4 arguments. ``doctor`` also reports the venv in use and a
 polluted shell (``PYTHONPATH`` set, a foreign ``VIRTUAL_ENV``; design M5 §2.7).
 
-M5 remote (design M5 remote §4.6; stage 0 fixes the arguments, the bodies come in stage 1 and a stage-0 body
-answers exit 1 with "not implemented"): ``serve --http [HOST:PORT]`` (``remote.main``; loopback host only, else
-exit 4; 5 port in use), ``push`` (``push.main``: 0, 1, 2, 4, 6), ``token issue|list|revoke|rotate`` and
-``collectors [retire NAME]`` (``remote``; 0/4), ``verify --stored`` (stored text only, no original file).
+M5 remote (design M5 remote §4.6): ``serve --http [HOST:PORT]`` (``remote.main``; loopback host only, else
+exit 4; 0 stopped, 2 data home, 3 store locked while a migration is needed, 5 port in use), ``push``
+(``push.main``: 0, 1, 2, 4, 6), ``token issue|list|revoke|rotate`` and ``collectors [retire NAME]``
+(``remote``; 0, 2, 3, 4; only ``token issue``/``rotate`` print a token, once), ``verify --stored`` (stored
+text only, no original file, ``binding.verify(stored_only=True)``; 0 ok, 1 failures, 4 with ``--root``). ``doctor`` adds the role
+of this home (server: tokens or collectors in the store; collector: ``[push] url`` set; else local), the
+``[server]``/``[push]`` settings, live tokens per kind, collectors and the last push (counts and names only).
 """
 from __future__ import annotations
 
@@ -113,7 +116,7 @@ def doctor() -> int:
     if code:
         return code
     db_file = paths.db_path(home)
-    schema, index_lines = None, []
+    schema, index_lines, remote = None, [], None
     if db_file.is_file():
         db = sqlite3.connect(f'{db_file.as_uri()}?mode=ro', uri=True)
         try:
@@ -123,6 +126,7 @@ def doctor() -> int:
                 schema = f'{schema}; {store.DEV_SCHEMA_HINT.format(db=db_file)}'
             else:
                 index_lines = _index_lines(db)
+                remote = _remote_counts(db)
         except sqlite3.Error:
             schema = 'unreadable'
         finally:
@@ -142,10 +146,54 @@ def doctor() -> int:
         f'store: {db_file} ({f"schema v{schema}" if schema is not None else "not created yet"})',
         *index_lines,
         f'model {model["name"]}: {"available" if model["available"] else "unavailable"} - {model["message"]}',
+        *_role_lines(home, remote),
         *_root_lines(home),
     ]
     print('\n'.join(lines))
     return 0
+
+
+def _remote_counts(db) -> dict | None:
+    """Live tokens per kind, collectors and the last push of a v5 store (None before v5); counts only."""
+    try:
+        live = dict(db.execute('SELECT kind, COUNT(*) FROM tokens WHERE revoked_at IS NULL GROUP BY kind'))
+        collectors = db.execute('SELECT COUNT(*), COUNT(retired_at) FROM collectors').fetchone()
+        last = store.last_push(db)
+    except sqlite3.Error:
+        return None
+    return {'mcp': live.get('mcp', 0), 'push': live.get('push', 0), 'collectors': collectors[0],
+            'retired': collectors[1], 'last_push': last}
+
+
+def _role_lines(home, remote: dict | None) -> list[str]:
+    """``role:`` (server when the store has tokens or collectors, collector when ``[push] url`` is set, else
+    local), the ``[server]`` and ``[push]`` settings, live tokens and the last push (design M5 remote §4.6).
+    The push token itself is never read here; only whether the environment variable or the file is there."""
+    from . import config
+    try:
+        cfg = config.load(home)
+    except config.ConfigError as exc:
+        return [f'role: unknown (config error: {exc})']
+    has_tokens = remote is not None and bool(remote['mcp'] or remote['push'] or remote['collectors'])
+    role = 'server' if has_tokens else 'collector' if cfg.push.url else 'local'
+    s = cfg.server
+    lines = [f'role: {role}',
+             f"[server] http {s.http}  http_path {s.http_path}  allowed_hosts {', '.join(s.allowed_hosts) or '-'}  "
+             f"push_max_mb {s.push_max_mb}  model_preload {'yes' if s.model_preload else 'no'}"]
+    if remote is not None:
+        last = remote['last_push']
+        lines.append(f"tokens: mcp {remote['mcp']}, push {remote['push']} live  collectors {remote['collectors']} "
+                     f"(retired {remote['retired']})  last push "
+                     + (f"{last['collector']} {last['at']} (documents {last['documents']}, units {last['units']}, "
+                        f"vectors {last['vectors']})" if last else '-'))
+    if cfg.push.url:
+        source = (f'environment {paths.PUSH_TOKEN_ENV}' if os.environ.get(paths.PUSH_TOKEN_ENV) else
+                  f'file {paths.PUSH_TOKEN_FILE} present' if (home/paths.PUSH_TOKEN_FILE).is_file() else
+                  f'missing (set {paths.PUSH_TOKEN_ENV} or write {home/paths.PUSH_TOKEN_FILE})')
+        lines.append(f'[push] url {cfg.push.url}  token: {source}')
+    else:
+        lines.append('[push] url not set')
+    return lines
 
 
 def _index_lines(db) -> list[str]:
@@ -335,13 +383,17 @@ def verify(args) -> int:
     db, code = _open_store(home)
     if code:
         return code
-    if args.stored:  # design M5 remote §5.2: binding.verify(..., stored_only=True) in stage 1
-        db.close()
+    if args.stored:  # design M5 remote §5.2: the stored text only, no original file
         if args.root:
+            db.close()
             print('--stored checks the stored text only; --root needs the original files', file=sys.stderr)
             return 4
-        print('verify --stored: not implemented yet (M5 stage 1)', file=sys.stderr)
-        return 1
+        try:
+            report = binding.verify(db, document_ids=args.doc or None, stored_only=True)
+        finally:
+            db.close()
+        print('\n'.join(['verify (stored text only; originals stay on the collector)', *verify_lines(report)]))
+        return 0 if report['ok'] else 1
     try:
         root_ids = None
         if args.root:
@@ -742,8 +794,8 @@ def main(argv=None) -> int:
         return _stage1(push.main, args)
     if args.command in ('token', 'collectors'):
         from . import remote
-        return _stage1(remote.token_command if args.command == 'token' else remote.collectors_command, args)
+        return remote.token_command(args) if args.command == 'token' else remote.collectors_command(args)
     if args.command == 'serve' and args.http is not None:
-        return _stage1(serve_http, args)
+        return serve_http(args)
     from . import server  # imports the MCP SDK only when serving
     return server.main()

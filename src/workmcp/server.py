@@ -27,9 +27,10 @@ SQLite's write lock (``BEGIN IMMEDIATE`` holds it from the first read to the com
 Integer and boolean arguments are strict (``StrictInt``/``StrictBool``): the SDK refuses ``true`` or
 ``2.0`` for an integer with its argument validation error (review L1) instead of converting them.
 
-stdout carries MCP JSON-RPC only: nothing here prints to stdout, logs go to stderr. The server
+stdout carries MCP JSON-RPC only: nothing here prints to stdout, logs go to stderr. This module
 runs the stdio transport only and makes no outbound calls; ``anyio`` is used for the idle-release
-ticker (``sleep``, ``create_task_group``) and nothing else.
+ticker (``sleep``, ``create_task_group``) and nothing else. The operating server (``remote.py``) builds
+the same server with token authentication and runs it over Streamable HTTP on a loopback address.
 """
 from __future__ import annotations
 
@@ -87,6 +88,8 @@ class ServerState:
     client: str = UNKNOWN_CLIENT
     call_id: str | None = None
     role: str = 'local'      # 'server' on the operating server (remote.py, design M5 remote §4.7)
+    push_db: sqlite3.Connection | None = None   # the operating server's push receive connection (remote.py)
+    remote: Any = None       # the operating server's route context (``remote.RemoteContext``), None for stdio
 
 
 def make_state(home: Path, *, engine: search.Engine | None = None, write_db: sqlite3.Connection | None = None,
@@ -313,7 +316,8 @@ async def _ticker(state: ServerState) -> None:
 
 
 def _lifespan(state: ServerState):
-    """Per connection (stdio: once): the idle-release ticker runs beside the session (design M3 §6.2)."""
+    """Once per process (stdio: the one connection; Streamable HTTP: the session manager's run, design M5
+    remote §0.1): the idle-release ticker runs beside the sessions (design M3 §6.2)."""
     @contextlib.asynccontextmanager
     async def lifespan(_server):
         async with anyio.create_task_group() as group:
@@ -326,14 +330,15 @@ def _lifespan(state: ServerState):
 
 
 def build_server(home: Path, *, engine: search.Engine | None = None, state: ServerState | None = None,
-                 instructions: str = INSTRUCTIONS, auth=None, token_verifier=None) -> MCPServer:
+                 instructions: str = INSTRUCTIONS, auth=None, token_verifier=None, log_level: str = 'INFO') -> MCPServer:
     """The MCP server with the fifteen tools; ``server.workmcp_state`` is its ``ServerState``.
 
-    The operating server (``remote.py``, design M5 remote §4.2, §4.7) passes its own ``instructions`` and the
-    SDK's ``auth`` (``AuthSettings``) with a ``token_verifier``; the stdio server passes neither."""
+    The operating server (``remote.py``, design M5 remote §4.1, §4.2, §4.7) passes its own ``instructions``,
+    the SDK's ``auth`` (``AuthSettings``) with a ``token_verifier`` and ``log_level='WARNING'`` (the SDK
+    hands it to uvicorn: no access log); the stdio server passes none of them."""
     state = state or make_state(home, engine=engine)
     server = MCPServer('workmcp', version=__version__, instructions=instructions, lifespan=_lifespan(state),
-                       auth=auth, token_verifier=token_verifier)
+                       auth=auth, token_verifier=token_verifier, log_level=log_level)
 
     @server.tool(name='search', structured_output=False)
     async def search_tool(query: str, mode: str = 'hybrid', limit: StrictInt = 10, path_prefix: str | None = None,

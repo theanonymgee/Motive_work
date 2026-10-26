@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "workmcp": {
+      "type": "http",
+      "url": "https://srv1782254.hstgr.cloud/workmcp/mcp",
+      "headers": {"Authorization": "Bearer ${WORKMCP_MCP_TOKEN}"}
+    }
+  }
+}

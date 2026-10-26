@@ -1,0 +1,49 @@
+# workmcp operating server unit (design M5 remote 4.4). Install with approval step D:
+#   sudo install -m 644 tools/deploy/workmcp.service /etc/systemd/system/workmcp.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now workmcp
+#
+# Placeholders to confirm against the survey before installing (nothing here is a secret):
+#   user/group workmcp, /home/workmcp/..., 127.0.0.1:8765 (change the port if the survey shows it taken;
+#   then change the proxy snippet and [server] http in config.toml too).
+# systemd does not allow a trailing "#" comment on a setting line: every comment is on its own line.
+# No token or password belongs in this file; tokens live hashed in the data home database.
+
+[Unit]
+Description=workmcp operating server (MCP over Streamable HTTP, loopback only)
+After=network-online.target
+
+[Service]
+User=workmcp
+Group=workmcp
+Environment=WORKMCP_HOME=/home/workmcp/Motive_work
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/workmcp/app/Motive_work
+ExecStart=/home/workmcp/app/.venv/bin/python -I -m workmcp serve --http 127.0.0.1:8765
+Restart=on-failure
+RestartSec=5
+
+# Memory: above MemoryHigh the kernel reclaims; above MemoryMax the service is killed and restarted,
+# which protects the other services on this VPS (design 7.1). Lower both if the survey shows little free memory.
+MemoryHigh=2500M
+MemoryMax=3G
+TasksMax=64
+
+# Sandbox
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/workmcp
+ReadWritePaths=/home/workmcp
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Egress 0 at kernel level: only loopback is reachable. The model download is NOT run by this unit
+# (it runs once from a shell as the workmcp user). If the host cannot enforce this (cgroup BPF missing),
+# remove these two lines and rely on the security checklist item 4 instead.
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8 ::1
+
+[Install]
+WantedBy=multi-user.target

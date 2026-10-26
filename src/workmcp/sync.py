@@ -8,7 +8,11 @@ same function from their own store (``summary``), the server URL rules and endpo
 codes of a push answer. The answer envelope has the tool envelope's shape: ``{"ok": true, "result": ...}``
 or ``{"ok": false, "error": {"code", "message", "retryable"}}``.
 
-Stage 0 (design M5 remote §11.1) fixes these names; ``push.py`` and ``receive.py`` use them in stage 1.
+Stage 1 additions to the stage-0 names (recorded as design deviations): ``begin`` carries ``started_at`` (two
+runs never share a batch id) and ``model_key`` (the collector's vectors); a version in ``documents`` carries its
+``units_sha256`` (the server answers ``have`` only for the same unit set); a unit longer than one part travels
+as consecutive pieces with the same ordinal (``unit_pieces``); one ``units`` batch may hold the parts of several
+versions; ``GET push/state`` also answers ``events_count``.
 """
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ ENVELOPE_KEYS = frozenset({'protocol', 'collector', 'push_id', 'batch_id', 'kind
 # The keys an item of each kind may have (all of them, design §3.3); nested lists have their own keys.
 # ``path_key`` is the collector's own normalised key (risk 15: the server stores it, never recomputes it).
 WIRE_KEYS = {
-    'begin': frozenset({'roots', 'counts_expected'}),
+    'begin': frozenset({'roots', 'counts_expected', 'started_at', 'model_key'}),
     'documents': frozenset({'local_document_id', 'local_root_id', 'path', 'path_key', 'ext', 'status', 'skip_reason',
                             'first_seen_at', 'last_seen_at', 'deleted_at', 'versions'}),
     'units': frozenset({'local_version_id', 'units_sha256', 'part', 'parts', 'units'}),
@@ -42,7 +46,7 @@ NESTED_KEYS = {
     ('begin', 'roots'): frozenset({'local_root_id', 'path', 'enabled'}),
     ('documents', 'versions'): frozenset({'local_version_id', 'seq', 'sha256', 'size', 'mtime_ns', 'observed_at',
                                           'superseded_at', 'parser', 'parser_version', 'encoding', 'parse_status',
-                                          'parse_error', 'unit_count', 'text_chars'}),
+                                          'parse_error', 'unit_count', 'text_chars', 'units_sha256'}),
     ('units', 'units'): frozenset({'ordinal', 'kind', 'locator_json', 'text', 'text_sha256'}),
     ('vectors', 'items'): frozenset({'text_sha256', 'vector_b64'}),
 }
@@ -55,7 +59,9 @@ UNITS_PER_BATCH = 2_000
 UNIT_CHARS_PER_BATCH = 2 * 2**20     # unit text characters in one units part
 VECTORS_PER_BATCH = 1_024
 EVENTS_PER_BATCH = 5_000
-MAX_PARTS = 25                       # one version: 50 M characters / 2 Mi per part (risk 7)
+MAX_PARTS = 64                       # one version: 50 M characters / 2 Mi per part = 24, plus escapes (risk 7)
+UNIT_PIECE_CHARS = 2**19             # a longer unit text travels as pieces of at most this many characters
+ENVELOPE_RESERVE = 2**16             # bytes kept free in a batch for the envelope and the item keys
 STATE_PAGE_DOCUMENTS = 500
 STATE_PAGE_VECTORS = 5_000
 VECTOR_DIMS = 1_024
@@ -65,23 +71,25 @@ UNIT_STATES = ('have', 'copied', 'need', 'none')
 SUMMARY_KEYS = ('documents_sha256', 'vectors_sha256')
 # GET push/state: one small answer (design §3.2).
 STATE_KEYS = ('collector', 'schema_version', 'chunk_version', 'model_keys', 'documents_sha256', 'vectors_sha256',
-              'events_after')
+              'events_after', 'events_count')
 # GET push/state?full=1&after=N: one page of per-document summaries.
 DOCUMENT_SUMMARY_KEYS = ('local_document_id', 'status', 'seq', 'sha256', 'parse_status', 'parser_version',
                          'units_sha256', 'deleted_at', 'skip_reason', 'superseded_seqs')
 STATE_PAGE_KEYS = ('documents', 'next_after')
 # GET push/state/vectors?model_key=K&after=SHA: text_sha256 of target chunks the server has no vector for.
 VECTORS_PAGE_KEYS = ('missing', 'next_after')
-# ``result`` of a successful batch per kind; a units part that is not the last answers UNITS_PARTIAL_KEYS.
+# ``result`` of a successful batch per kind. ``units``: one ``versions`` entry per item, UNITS_VERSION_KEYS for a
+# version whose units are now stored, UNITS_PARTIAL_KEYS for a part of a split version that is not the last.
 RESULT_KEYS = {
     'begin': ('push_id', 'root_ids'),
     'documents': ('documents', 'versions', 'refused'),
-    'units': ('version_id', 'units', 'chunks', 'vectors_missing'),
+    'units': ('versions', 'vectors_missing'),
     'vectors': ('stored', 'ignored', 'invalid'),
     'events': ('stored', 'ignored'),
     'end': ('documents_sha256', 'vectors_sha256', 'vectors_missing_total'),
 }
-UNITS_PARTIAL_KEYS = ('received', 'of')
+UNITS_PARTIAL_KEYS = ('local_version_id', 'received', 'of')
+UNITS_VERSION_KEYS = ('local_version_id', 'version_id', 'units', 'chunks')   # units result: versions[]
 VERSION_RESULT_KEYS = ('id', 'units')          # documents result: versions[local_version_id]
 REFUSED_KEYS = ('local_document_id', 'code')   # documents result: refused[]
 ENDPOINTS = {'state': 'push/state', 'vectors': 'push/state/vectors', 'batch': 'push/batch'}
@@ -244,6 +252,48 @@ def vector_from_b64(text: str, dims: int = VECTOR_DIMS) -> bytes:
     return blob
 
 
+# ---- unit pieces ----------------------------------------------------------------------------------------
+
+def unit_pieces(unit: Mapping, max_bytes: int = BATCH_MAX_BYTES - ENVELOPE_RESERVE) -> list[dict]:
+    """A wire unit (``NESTED_KEYS[('units', 'units')]``) as one or more pieces whose canonical JSON is at most
+    ``max_bytes``: a long text is cut into consecutive pieces of at most ``UNIT_PIECE_CHARS`` characters that
+    keep the unit's ordinal, kind, locator and ``text_sha256`` (the hash of the whole text). ``join_pieces``
+    puts them back together."""
+    whole = dict(unit)
+    if len(whole['text']) <= UNIT_PIECE_CHARS and len(canonical(whole)) <= max_bytes:
+        return [whole]
+    text, pieces, at, step = whole['text'], [], 0, UNIT_PIECE_CHARS
+    while at < len(text):
+        piece = {**whole, 'text': text[at:at + step]}
+        if len(canonical(piece)) > max_bytes and step > 1:
+            step //= 2
+            continue
+        pieces.append(piece)
+        at += len(piece['text'])
+    return pieces
+
+
+def join_pieces(units: Iterable[Mapping]) -> list[dict]:
+    """Consecutive entries with the same ordinal joined into one unit (their texts concatenated); a piece that
+    disagrees with the first one on kind, locator or hash raises ``SyncError('bad_units_hash')``."""
+    joined: list[dict] = []
+    for unit in units:
+        if joined and joined[-1]['ordinal'] == unit['ordinal']:
+            last = joined[-1]
+            if (last['kind'], last['locator_json'], last['text_sha256']) != \
+                    (unit['kind'], unit['locator_json'], unit['text_sha256']):
+                raise SyncError('bad_units_hash', f'pieces of unit {unit["ordinal"]} disagree')
+            last['text'] += unit['text']
+        else:
+            joined.append(dict(unit))
+    return joined
+
+
+def canonical_size(obj) -> int:
+    """Bytes of ``canonical(obj)``: what a batch body counts against ``BATCH_MAX_BYTES``."""
+    return len(canonical(obj))
+
+
 # ---- summary hashes (design §3.2): the same function on both sides -------------------------------------
 
 def _field(value) -> str:
@@ -330,6 +380,23 @@ def summary(db, model_key: str | None, *, collector_id: int | None = None) -> di
     lines = sorted(document_line(row) for row in document_summaries(db, collector_id=collector_id))
     return {'documents_sha256': _sha_of_lines(lines),
             'vectors_sha256': _sha_of_lines(vector_shas(db, model_key, collector_id=collector_id))}
+
+
+def event_count(db, *, collector_id: int | None = None) -> int:
+    """Document events of this store, or the events of one collector's documents on the server."""
+    if collector_id is None:
+        return db.execute('SELECT COUNT(*) FROM document_events').fetchone()[0]
+    return db.execute('SELECT COUNT(*) FROM document_events e JOIN collector_documents m ON m.document_id = '
+                      'e.document_id WHERE m.collector_id = ?', (collector_id,)).fetchone()[0]
+
+
+def events_after(db, collector_id: int) -> str | None:
+    """The latest event time among one collector's documents on the server (``STATE_KEYS``): the collector
+    sends its events at or after it (the server drops the ones it has)."""
+    row = db.execute('SELECT e.at FROM document_events e JOIN collector_documents m ON m.document_id = e.document_id '
+                     'WHERE m.collector_id = ? ORDER BY julianday(e.at) DESC, e.id DESC LIMIT 1',
+                     (collector_id,)).fetchone()
+    return row[0] if row else None
 
 
 # ---- server URL and endpoints -----------------------------------------------------------------------------

@@ -9,16 +9,27 @@ Files are read through ``collect.read_source`` only (mode ``'rb'``), once per do
 cloud placeholder (online-only file) is not read unless ``read_cloud_placeholders`` is set: reading
 it would make the sync client download it (design §2.4). Failure entries carry the path, short
 hash, unit coordinates and a fixed problem code, never unit text.
+
+``stored_only`` (design M5 remote §5.2, the operating server's ``verify --stored``): no file is read and no
+parser runs; the stored units themselves are the derivation, so the check is that every unit's text hashes to
+its ``text_sha256``, ordinals run 1..n, the set matches the hash the collector sent
+(``collector_versions.units_sha256``, ``units_sha256_mismatch``), chunks are slices of the joined units and
+the chunk set is ``build_chunks`` of them, and evidence quotes are what their locators point at. The result is
+``ok`` or ``failed`` (nothing is unverifiable without files).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 
 from . import chunks as chunk_rules
 from . import collect, locator, parsers, store
 
+SCOPE_STORED = ('결속(저장 텍스트) = parse_status가 ok인 버전 전부에 대해, 저장된 단위 텍스트의 해시·순서·수집기가 보낸 '
+                '단위 집합 해시, 청크(같은 청크 규칙으로 다시 만든 값), 근거 인용이 저장 텍스트끼리 맞음. 원본 파일은 '
+                '수집기(회사 PC)에만 있어 원본 재도출은 수집기의 verify가 함.')
 SCOPE = ('결속 100% = parse_status가 ok인 버전 중 현재 파일의 sha256이 그 버전과 같은 것 전부에 대해, 저장된 '
          '단위(순서·종류·좌표·텍스트·해시)·청크·근거 인용이 같은 파서 버전으로 현재 파일에서 다시 만들어진 값과 '
          '같음. 파서가 원문을 올바르게 읽었는지는 보이지 않음. 파일이 바뀐 옛 버전은 재검증 불가(stale)로 따로 셈.')
@@ -63,7 +74,7 @@ def _read(path: str, size: int, read_cloud_placeholders: bool = False):
 
 
 def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | None = None, files: dict | None = None,
-                   *, read_cloud_placeholders: bool = False) -> dict:
+                   *, read_cloud_placeholders: bool = False, stored_only: bool = False) -> dict:
     """Re-derive one version (design §6.2). ``cache`` keeps parse results by (sha256, parser version)
     and ``files`` keeps one read per document.
 
@@ -90,6 +101,8 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
         else:
             report['result'] = 'skipped_not_ok'
         return report
+    if stored_only:
+        return _check_stored(db, version_id, document_id, path, sha256, report)
     if document_id not in files or files[document_id][0] == 'stale':
         files[document_id] = _read(path, size, read_cloud_placeholders)
     outcome, data, current_sha = files[document_id]
@@ -152,6 +165,14 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
     report['units_bound'] = bound
 
     units = list(result.units)
+    _check_chunks_and_evidence(db, version_id, document_id, sha256, units, report, fail)
+    report['result'] = 'failed' if failures else 'ok'
+    return report
+
+
+def _check_chunks_and_evidence(db, version_id: int, document_id: int, sha256: str, units, report: dict, fail) -> None:
+    """The chunk and evidence part of ``verify_version`` against ``units`` (objects with ``ordinal``, ``unit``
+    and ``text``): re-derived from the file, or the stored units themselves (``stored_only``)."""
     current = set()  # rows of the current chunk rules, compared with the chunks derived again (design M2 §2.7)
     for chunk_version, ordinal, first, last, start, end, text, text_sha256 in db.execute(
             'SELECT chunk_version, ordinal, unit_first, unit_last, char_start, char_end, text, text_sha256 FROM chunks '
@@ -204,8 +225,59 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
                 report['evidence_stale_after_reparse'] += 1
             else:
                 fail(None, f'evidence:{code}')
+
+
+@dataclass(frozen=True)
+class _StoredUnit:
+    ordinal: int
+    unit: dict
+    text: str
+
+
+def _check_stored(db, version_id: int, document_id: int, path: str, sha256: str, report: dict) -> dict:
+    """``verify_version(..., stored_only=True)`` of an ``ok`` version: the stored units are the derivation."""
+    failures = report['failures']
+
+    def fail(ordinal, problem, unit=None):
+        if len(failures) < MAX_FAILURES:
+            failures.append({'version_id': version_id, 'ordinal': ordinal, 'problem': problem, 'path': path,
+                             'sha12': sha256[:12], 'unit_label': _label(unit)})
+
+    stored = db.execute('SELECT ordinal, kind, locator_json, text, text_sha256 FROM units WHERE version_id=? '
+                        'ORDER BY ordinal', (version_id,)).fetchall()
+    report['units_total'] = len(stored)
+    expected = db.execute('SELECT unit_count FROM versions WHERE id=?', (version_id,)).fetchone()[0]
+    if len(stored) != expected:
+        fail(None, 'unit_count_mismatch')
+    if [row[0] for row in stored] != list(range(1, len(stored) + 1)):
+        fail(None, 'unit_ordinals_not_1_to_n')
+    sent = db.execute('SELECT units_sha256 FROM collector_versions WHERE version_id=?', (version_id,)).fetchone()
+    if sent is not None and sent[0] is not None and sent[0] != units_sha256(stored):
+        fail(None, 'units_sha256_mismatch')
+    units, bound = [], 0
+    for ordinal, kind, locator_json, text, text_sha256 in stored:
+        unit = _unit_or_none(locator_json)
+        if text_sha256 != _sha(text):
+            fail(ordinal, 'unit_text_sha256_mismatch', unit)
+        elif not isinstance(unit, dict) or unit.get('kind') != kind or parsers.unit_json(unit) != locator_json:
+            fail(ordinal, 'unit_locator_mismatch', unit)
+        else:
+            bound += 1
+        units.append(_StoredUnit(ordinal, unit if isinstance(unit, dict) else {'kind': kind}, text))
+    report['units_bound'] = bound
+    try:
+        _check_chunks_and_evidence(db, version_id, document_id, sha256, units, report, fail)
+    except (KeyError, TypeError):            # a damaged locator the chunk rules cannot group
+        fail(None, 'unit_locator_mismatch')
     report['result'] = 'failed' if failures else 'ok'
     return report
+
+
+def units_sha256(rows) -> str:
+    """``sync.units_sha256`` of ``(ordinal, kind, locator_json, text, text_sha256)`` rows (the wire hash; kept
+    here so this module does not import the wire schema)."""
+    lines = [f'{ordinal}|{kind}|{locator_json}|{text_sha256}' for ordinal, kind, locator_json, _, text_sha256 in rows]
+    return hashlib.sha256('\n'.join(lines).encode('utf-8')).hexdigest()
 
 
 def _unit_or_none(locator_json):
@@ -223,8 +295,9 @@ def _label(unit) -> str:
 
 
 def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None = None, *,
-           read_cloud_placeholders: bool = False) -> dict:
+           read_cloud_placeholders: bool = False, stored_only: bool = False) -> dict:
     """Every version in scope (all, some roots, or some documents), aggregated (design §6.3).
+    ``stored_only``: the operating server's check of the stored text (no file, no parser; module doc).
 
     ``ok`` is "no failure among the checked versions"; ``versions.checked == 0`` means nothing was
     verified (the CLI says so)."""
@@ -245,7 +318,8 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     chunks = other_chunks = evidence = stale_evidence = 0
     failures, stale_latest = [], set()
     for version_id in ids:
-        report = verify_version(db, version_id, cache, limits, files, read_cloud_placeholders=read_cloud_placeholders)
+        report = verify_version(db, version_id, cache, limits, files, read_cloud_placeholders=read_cloud_placeholders,
+                                stored_only=stored_only)
         result = report['result']
         if result in ('ok', 'failed'):
             versions['checked'] += 1
@@ -267,7 +341,7 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
         notice.append(f'{mismatched}개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱')
     if stale_evidence:
         notice.append(REPARSE_STALE_NOTICE.format(stale_evidence))
-    return {'scope': SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version
+    return {'scope': SCOPE_STORED if stored_only else SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version
                                                 for ext in sorted(parsers.SUPPORTED_EXTENSIONS)},
             'checked_at': store.now(), 'versions': versions, 'units': units, 'chunks_checked': chunks,
             'chunks_other_version': other_chunks, 'evidence_checked': evidence,

@@ -6,6 +6,7 @@
 |---|---|---|
 | `mcp.json.example` | `.mcp.json` | Claude Code (터미널·데스크톱 Code 탭) |
 | `codex-config.toml.example` | `.codex/config.toml` | Codex (CLI·데스크톱 앱) |
+| `mcp-remote.json.example` | `.mcp.json` (원격 운영 서버에 붙일 때. 위 로컬 stdio 템플릿과 **둘 중 하나**) | Claude Code — 아래 "원격 연결" 절 |
 
 ## 사용법
 
@@ -40,3 +41,41 @@ Claude·Codex 데스크톱 앱은 MSIX 패키지 앱이라, 앱 안에서 도는
 2. **Codex 데스크톱 앱**: 이 저장소 폴더를 프로젝트로 열 때의 신뢰 승인(앱이 `~/.codex/config.toml`에 `projects` 항목을 스스로 기록한다).
 
 Codex가 프로젝트 `.codex/config.toml`의 `mcp_servers`를 읽지 않으면 멈추고 피터에게 전역 설정 추가를 묻는다.
+
+## 원격 연결 (workmcp 운영 서버, M5)
+
+운영 서버는 VPS에서 돌고, 클라이언트는 HTTPS로 붙는다(설계 `doc/planning/2026-10-26_M5-원격구조설계_v1.md` §9.6). 이때 이 PC에는 venv·`WORKMCP_HOME`·데이터 홈이 필요 없다(데이터는 서버에 있다). 배포 자체는 `doc/guides/2026-10-26_VPS-배포절차서_v1.md`.
+
+### 토큰
+
+- 서버가 발급하는 **mcp 토큰**을 쓴다(`workmcp token issue --kind mcp --name ...`, 배포 절차서 C-4). **push 토큰은 MCP 경로에서 거부된다**(종류가 다르다). 토큰은 발급 때 한 번만 보이고 서버에는 해시만 있다.
+- 토큰 평문을 파일·채팅·문서·git에 적지 않는다. 템플릿의 `${WORKMCP_MCP_TOKEN}`은 자리표시자이고, 값은 이 PC의 사용자 환경변수 `WORKMCP_MCP_TOKEN`에 피터가 직접 넣는다(Windows 설정의 환경 변수 화면). 환경변수 확장 `${VAR}`을 `.mcp.json`의 `headers`에서 지원하는지는 **[추정]** — 연결이 401이면 확장이 안 되는 것이므로 아래 `claude mcp add` 방식을 쓴다.
+- 토큰을 바꿀 때(`workmcp token rotate`): 환경변수(또는 등록)를 새 값으로 갱신한다. 옛 토큰은 즉시 무효가 된다.
+
+### Claude Code
+
+1. **프로젝트 범위(이 저장소 폴더에서만):** `mcp-remote.json.example`을 `.mcp.json`으로 복사한다. 이 파일은 로컬 stdio용 `mcp.json.example`과 같은 이름 자리를 쓰므로 둘 중 하나만 둔다. `.mcp.json`은 `.gitignore`로 제외되어 커밋되지 않는다.
+2. **사용자 범위(어느 폴더에서나, 설계 §9.6의 기본):** 피터가 자기 터미널에서 실행한다(에이전트는 토큰을 보지 않는다).
+
+   ```
+   claude mcp add --scope user --transport http workmcp https://srv1782254.hstgr.cloud/workmcp/mcp --header "Authorization: Bearer <MCP_TOKEN>"
+   claude mcp list
+   ```
+
+   **[추정]** `--transport http`, `--header`, `--scope user` 옵션 이름과 헤더 형식은 설계의 추정이다. 이 PC에는 `claude` 명령이 PATH에 없어(확인 2026-10-26) `claude mcp add --help`로 확인하지 못했다. 실행하기 전에 피터가 `claude mcp add --help`로 옵션 이름을 확인하고, 다르면 그 이름을 따른다. 토큰이 셸 기록에 남는 것이 싫으면 위 1번의 환경변수 방식을 쓴다.
+3. 확인: `claude mcp list`에서 `workmcp`가 연결 상태인지, Code 탭에서 `status` 도구가 `role: server`를 돌려주는지 본다. 첫 의미 검색은 서버가 모델을 읽느라 수십 초 걸릴 수 있다.
+
+### Codex
+
+- **[추정]** `codex mcp add workmcp --url https://srv1782254.hstgr.cloud/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN`. 이 PC에는 `codex` 명령도 없고 Codex 원격 연결은 M6 범위(회사 PC)라서 지금은 확인하지 않는다. 옵션 이름은 그때 `codex mcp add --help`로 맞춘다.
+
+### 로컬 stdio와 헷갈리지 않기
+
+| | 로컬 stdio (위쪽 절) | 원격 (이 절) |
+|---|---|---|
+| 서버가 도는 곳 | 클라이언트가 이 PC에서 띄움 | VPS (systemd 서비스) |
+| 데이터 | 이 PC의 데이터 홈 | VPS (수집기가 `push`로 올린 텍스트·벡터) |
+| 인증 | 없음(프로세스 직접 실행) | mcp 토큰(Bearer) |
+| 설정에 필요한 것 | venv 경로·`WORKMCP_HOME` | 서버 URL·토큰 |
+
+두 방식을 같은 이름 `workmcp`로 동시에 등록하지 않는다(어느 쪽이 답하는지 흐려진다). 원격으로 옮길 때는 로컬 등록을 지운다.

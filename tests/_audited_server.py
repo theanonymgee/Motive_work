@@ -27,12 +27,16 @@ remote ...|push ...]``
 - ``embed`` (M2): the real model from the data home, only when it is there: ``mode_embed`` delegates to
   ``tests/_embed_mode.py`` ``run(home)``; otherwise ``skipped: model_missing``.
   A mode whose package function is still a stage-0 stub reports ``skipped`` (the test skips).
-- ``remote`` (M5 remote §6.2): ``workmcp serve --http 127.0.0.1:<port>`` under ``judge_remote`` (its own
-  listener on that port and numeric loopback lookups allowed; no egress, no name resolution, no process).
+- ``remote PORT STOP_FILE [ROOT]`` (M5 remote §6.2): ``cli.main(['serve', '--http', '127.0.0.1:PORT'])`` under
+  ``judge_remote`` (its own listener on that port and numeric loopback lookups allowed; no egress, no name
+  resolution, no process). The test drives it over HTTP and creates STOP_FILE when done; a test-side thread
+  here then raises SIGTERM (the service stop), the server exits by itself and the report has its
+  ``exit_code`` and, with ROOT, ``source_opens`` (must be 0: the server answers from the store).
 - ``push`` (M5 remote §6.3): ``workmcp push`` under ``judge_push`` with a ``PushTarget`` (the configured
   server's host, port, resolved addresses and URL prefix only; ``source_opens`` must be 0). Its body is
-  ``tests/_audit_push.py`` ``run(argv)`` (stage 1, design §11.2); without that file, ``skipped``.
-  Stage 0 has the judges and the mode names; both modes report ``skipped`` until stage 1.
+  ``tests/_audit_push.py`` ``run(argv)`` (executor B's, design §11.2); without that file, ``skipped``. That
+  module reaches this one as ``sys.modules['__main__']`` (or ``import _audited_server``: the same module) and
+  narrows the judgement by rebinding ``judge`` or through ``set_judge``.
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
 ::1), no name resolution and no process creation. Loopback is allowed only because the
@@ -260,6 +264,7 @@ def judge_source_write(event: str, args: tuple, root) -> str | None:
 
 
 EVENTS: list[dict] = []
+JUDGE: list = []             # the network judge set by ``set_judge`` (remote mode); empty: ``judge``
 SOURCE_ROOT: list[str] = []  # set by scan/probe; empty means no source-write judgement
 CONNECTS: list[str] = []     # sqlite3.connect targets while RECORD_CONNECTS holds an entry (search phase)
 RECORD_CONNECTS: list[bool] = []
@@ -270,6 +275,13 @@ def _detail(args) -> str:
         return repr(args)[:300]
     except Exception:  # repr of a half-built object
         return '<unrepresentable>'
+
+
+def set_judge(function) -> None:
+    """Judge network and process events with ``function(event, args) -> reason | None`` from now on. Without
+    it the hook calls this module's ``judge`` by name, so a helper that rebinds ``judge`` (the push mode body)
+    takes effect too."""
+    JUDGE[:] = [function]
 
 
 def hook(event, args):
@@ -286,7 +298,7 @@ def hook(event, args):
         return
     if not event.startswith(WATCHED):
         return
-    reason = judge(event, args)
+    reason = (JUDGE[0] if JUDGE else judge)(event, args)
     EVENTS.append({'event': event, 'detail': _detail(args), 'violation': reason})
     if reason:
         raise PermissionError(f'blocked by test audit hook: {reason}')
@@ -517,10 +529,32 @@ def embed() -> dict:
 STAGE1_M5 = 'not_implemented (M5 remote stage 1)'
 
 
+REMOTE_LIFE_SECONDS = 600
+
+
+def _stop_when_asked(path: Path) -> None:
+    """Test-side thread: SIGTERM once ``path`` exists (polled; a thread blocked on a stdin pipe would stall
+    the server's own handle checks on Windows)."""
+    import signal
+    import time
+    ends = time.monotonic() + REMOTE_LIFE_SECONDS   # never outlive the test run, whatever the test does
+    while not path.exists() and time.monotonic() < ends:
+        time.sleep(0.1)
+    signal.raise_signal(signal.SIGTERM)
+
+
 def remote_mode(argv) -> dict:
-    """``remote PORT [ROOT]``: stage 1 runs ``cli.main(['serve', '--http', f'127.0.0.1:{PORT}'])`` with
-    ``judge_remote`` (design §6.2; the test terminates the process and reads the appended log)."""
-    return {'skipped': STAGE1_M5}
+    """``remote PORT STOP_FILE [ROOT]``: ``cli.main(['serve', '--http', f'127.0.0.1:{PORT}'])`` under
+    ``judge_remote`` (design §6.2) until STOP_FILE appears; the exit code and the opens under ROOT."""
+    import threading
+    port, stop_file = int(argv[0]), Path(argv[1])
+    set_judge(lambda event, args: judge_remote(event, args, port))
+    if len(argv) > 2:
+        SOURCE_ROOT.append(str(Path(argv[2]).resolve()))
+    threading.Thread(target=_stop_when_asked, args=(stop_file,), daemon=True).start()
+    from workmcp import cli
+    code = cli.main(['serve', '--http', f'127.0.0.1:{port}'])
+    return {'exit_code': code, 'source_opens': _source_opens(0), 'port': port}
 
 
 def push_mode(argv) -> dict:
@@ -534,6 +568,7 @@ def push_mode(argv) -> dict:
 
 def main(argv) -> int:
     log, mode = Path(argv[1]), (argv[2] if len(argv) > 2 else 'serve')
+    sys.modules.setdefault('_audited_server', sys.modules[__name__])  # helpers import this very module
     sys.addaudithook(hook)
     report, code = {'mode': mode, 'completed': False}, 1
     try:

@@ -2,51 +2,63 @@
 §3.6).
 
 The server is the reference and this side keeps no record of what it sent: every run asks the server for
-its two summary hashes (``sync.summary`` on both sides); equal hashes end the run with no batch and no
-byte sent. Otherwise documents and versions go first, then the unit text of the versions the server asks
-for (split into parts), the vectors it lacks, the document events and the end batch. A batch is
-idempotent (``sync.batch_id``): connection errors, 5xx and retryable answers resend the same batch after
-``RETRY_DELAYS``; a 4xx stops the run (exit 1).
+its two summary hashes (``sync.summary`` on both sides) and its event count; equal values end the run with no
+batch and no byte sent. Otherwise the per-document summaries are compared page by page and only the
+documents that differ go out (with all their versions), then the unit text of the versions the server
+answers ``need`` for (a version the server can copy from another one with the same content is never sent;
+a long version is split into parts, a long unit into pieces), the vectors it lacks, the document events and
+the end batch. A batch is idempotent (``sync.batch_id``): connection errors, 5xx answers and retryable
+refusals (``store_busy``) resend the same batch after ``RETRY_DELAYS``; any other refusal stops the run.
 
 Boundaries (``tests/test_network_boundary.py``, ``tests/test_readonly.py``): besides the model download this is
 the only module that sends anything over the network, and only to the configured server. ``urllib`` is
 imported inside the request function only; no ``ssl`` import (the default context; a private CA comes
 through ``SSL_CERT_FILE``); no URL literal: every destination is ``sync.endpoint`` of ``config [push] url``.
-No file is opened here: the store is read through ``store.open_read`` and the token through
-``paths.read_token`` (or ``WORKMCP_PUSH_TOKEN``). It never imports the collector, the parsers or the binding
-check, so it cannot read an original file. Its log ``<home>/logs/push-YYYYMMDD.log`` and the report hold
-paths, short hashes and counts, never unit text or the token.
+The opener follows no redirect and uses no proxy (neither the environment's nor the system's), so the
+connection goes to the configured host and nowhere else. The token travels as an unredirected
+``Authorization`` header (not in the request's audited headers, never logged).
+No file is opened here: the store is read through ``store.open_read`` (one read snapshot for the whole run)
+and the token through ``paths.read_token`` (or ``WORKMCP_PUSH_TOKEN``). It never imports the collector, the
+parsers or the binding check, so it cannot read an original file. Its log ``<home>/logs/push-YYYYMMDD.log``
+and the report hold paths, short hashes and counts, never unit text or the token.
 
-Exit codes: 0 done (up to date included), 1 a batch refused or a step failed, 2 data home refused, 4 settings,
-arguments, no token or a server of another schema/chunk version, 6 server unreachable after the retries.
-
-Stage 0 (design M5 remote §11.1) fixes the signatures, the report keys and the exit codes; ``execute`` and the
-request function come in stage 1. (Not named ``run``: the network boundary test reserves ``run(...)`` for the
-MCP transports.)
+Exit codes: 0 done (up to date included), 1 a batch or document refused or a step failed, 2 data home refused,
+4 settings, arguments, no token or a server of another schema/chunk version, 6 server unreachable after the
+retries. (Not named ``run``: the network boundary test reserves ``run(...)`` for the MCP transports.)
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-from . import config, paths, sync
+from . import chunks, config, paths, store, sync
 
 LOG = logging.getLogger('workmcp.push')
-STAGE1 = 'workmcp push: not implemented yet (M5 stage 1)'
+LOG_FORMAT = '%(asctime)s | %(message)s'
 EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_USAGE, EXIT_UNREACHABLE = 0, 1, 2, 4, 6
 RETRY_DELAYS = (1, 2, 4, 8, 16)            # seconds before each resend of the same batch
 REQUEST_TIMEOUT_SECONDS = 300
+CLIENT_VERSION = '0.0.1'
 
 # execute() result: what left this PC (design §3.6); counts, sizes, hashes and paths only.
 REPORT_KEYS = ('exit_code', 'push_id', 'url', 'collector', 'started_at', 'up_to_date', 'dry_run', 'state', 'sent',
-               'batches', 'bytes_sent', 'state_requests', 'refused', 'retries', 'elapsed', 'log', 'server')
+               'batches', 'bytes_sent', 'state_requests', 'refused', 'retries', 'elapsed', 'log', 'server',
+               'converged', 'error')
 STATE_COUNT_KEYS = ('documents_changed', 'added', 'changed', 'deleted', 'restored', 'reparsed', 'vectors_missing')
-SENT_KEYS = ('documents', 'versions', 'units', 'chars', 'vectors', 'vector_bytes', 'events')
+SENT_KEYS = ('documents', 'versions', 'units', 'chars', 'vectors', 'vector_bytes', 'events', 'copied_versions')
 SERVER_KEYS = ('documents_sha256', 'vectors_sha256', 'vectors_missing')
+REFUSED_KEYS = ('path', 'code')
+
+# A transport sends one request and returns (HTTP status, response body bytes); it raises Unreachable when
+# no answer came. The default is ``http_transport``; tests pass an in-memory one.
+Transport = Callable[[str, str, bytes | None], tuple[int, bytes]]
 
 
 @dataclass(frozen=True)
@@ -80,14 +92,463 @@ def push_token(home: Path, env: Mapping[str, str], options: Options) -> str:
     return token or paths.read_token(home, options.token_file)
 
 
-def execute(home: Path, settings: config.Config, token: str, options: Options, *, log=print) -> dict:
-    """One push run (design §3.4) to ``settings.push.url``; returns ``REPORT_KEYS``. Stage 1."""
-    raise NotImplementedError(STAGE1)
+# ---- requests ------------------------------------------------------------------------------------------
+
+class Unreachable(Exception):
+    """No answer from the server (connection refused or reset, timeout, name not found); the message is the
+    exception class name only."""
+
+
+class Stop(Exception):
+    """The run ends here: ``exit_code`` and one line for the report (codes and counts, no text)."""
+
+    def __init__(self, exit_code: int, message: str):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def http_transport(token: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Transport:
+    """Requests through ``urllib`` with no redirect and no proxy; the token as an unredirected header."""
+
+    def send(method: str, url: str, data: bytes | None) -> tuple[int, bytes]:
+        import urllib.error
+        import urllib.request
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None                        # a 3xx answer is an error, never another destination
+
+        headers = {'Accept': 'application/json'}
+        if data is not None:
+            headers.update({'Content-Type': 'application/json', 'Content-Encoding': 'gzip'})
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
+        request.add_unredirected_header('Authorization', f'Bearer {token}')
+        # urlopen through an opener without proxy and redirect handling, for this one request only
+        urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read()
+        except (urllib.error.URLError, OSError, ValueError) as exc:   # TimeoutError, ConnectionError are OSError
+            raise Unreachable(type(exc).__name__) from None
+        finally:
+            urllib.request.install_opener(None)
+
+    return send
+
+
+@dataclass
+class _Run:
+    url: str
+    send: Transport
+    sleep: Callable[[float], None]
+    logger: logging.Logger
+    report: dict
+    collector: str = ''
+    push_id: int | None = None
+    budget: int | None = None                       # --max-mb in bytes
+    stopped: str | None = None                      # why sending stopped early (--max-mb)
+    note: str | None = None                         # what this run left for the next one (--limit-docs)
+
+    def get(self, name: str, query: dict | None = None) -> dict:
+        self.report['state_requests'] += 1
+        return self._request('GET', sync.endpoint(self.url, name, query), None)
+
+    def post(self, kind: str, items: list) -> dict:
+        body = sync.envelope(kind, items, collector=self.collector, push_id=self.push_id,
+                             client_version=CLIENT_VERSION)
+        result = self._request('POST', sync.endpoint(self.url, 'batch'), sync.gzip_json(body))
+        self.report['batches'] += 1
+        return result
+
+    def over_budget(self) -> bool:
+        if self.budget is not None and self.report['bytes_sent'] >= self.budget:
+            self.stopped = f'stopped after --max-mb ({self.report["bytes_sent"]} bytes sent)'
+        return self.stopped is not None
+
+    def _request(self, method: str, url: str, data: bytes | None) -> dict:
+        reason = ''
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            if attempt:
+                self.report['retries'] += 1
+                self.sleep(RETRY_DELAYS[attempt - 1])
+            if data is not None:
+                self.report['bytes_sent'] += len(data)
+            try:
+                status, raw = self.send(method, url, data)
+            except Unreachable as exc:
+                reason = f'server unreachable ({exc})'
+                continue
+            try:
+                answer = json.loads(raw.decode('utf-8'))
+                answer_ok = answer['ok'] is True
+            except (UnicodeDecodeError, ValueError, TypeError, KeyError):
+                answer, answer_ok = None, False
+            if status == 200 and answer_ok:
+                return answer['result']
+            error = answer.get('error') if isinstance(answer, dict) and not answer_ok else None
+            code = error.get('code') if isinstance(error, dict) else None
+            retryable = status >= 500 or (isinstance(error, dict) and error.get('retryable') is True)
+            reason = f'HTTP {status}' + (f' {code}' if code else '')
+            if not retryable:
+                exit_code = EXIT_USAGE if code in ('schema_version_mismatch', 'chunk_version_mismatch') else EXIT_FAILED
+                message = error.get('message') if isinstance(error, dict) else ''
+                raise Stop(exit_code, f'refused: {reason}' + (f' ({message})' if message else ''))
+        unreachable = reason.startswith('server unreachable')
+        raise Stop(EXIT_UNREACHABLE if unreachable else EXIT_FAILED, f'{reason} after {len(RETRY_DELAYS)} retries')
+
+
+# ---- what this store holds -----------------------------------------------------------------------------
+
+_DOCUMENT_COLUMNS = ('id', 'root_id', 'path', 'path_key', 'ext', 'status', 'skip_reason', 'first_seen_at',
+                     'last_seen_at', 'deleted_at')
+_VERSION_COLUMNS = ('id', 'seq', 'sha256', 'size', 'mtime_ns', 'observed_at', 'superseded_at', 'parser',
+                    'parser_version', 'encoding', 'parse_status', 'parse_error', 'unit_count', 'text_chars')
+
+
+def local_model_key(db) -> str | None:
+    """The model key of this collector's vectors: that of its last finished ``index`` run."""
+    last = store.last_index(db)
+    return last['model_key'] if last else None
+
+
+def document_item(db, document_id: int) -> tuple[dict, str]:
+    """The ``documents`` item of one document (every version with its ``units_sha256``) and its path."""
+    row = dict(zip(_DOCUMENT_COLUMNS, db.execute(f'SELECT {", ".join(_DOCUMENT_COLUMNS)} FROM documents WHERE id = ?',
+                                                 (document_id,)).fetchone()))
+    versions = []
+    for values in db.execute(f'SELECT {", ".join(_VERSION_COLUMNS)} FROM versions WHERE document_id = ? ORDER BY seq',
+                             (document_id,)).fetchall():
+        version = dict(zip(_VERSION_COLUMNS, values))
+        local = version.pop('id')
+        has_units = version['parse_status'] == 'ok' and version['unit_count']
+        versions.append({'local_version_id': local, **version,
+                         'units_sha256': sync.version_units_sha256(db, local) if has_units else None})
+    item = {'local_document_id': row['id'], 'local_root_id': row['root_id'], 'path': row['path'],
+            'path_key': row['path_key'], 'ext': row['ext'], 'status': row['status'], 'skip_reason': row['skip_reason'],
+            'first_seen_at': row['first_seen_at'], 'last_seen_at': row['last_seen_at'],
+            'deleted_at': row['deleted_at'], 'versions': versions}
+    return item, row['path']
+
+
+def unit_parts(db, version_id: int) -> list[list[dict]]:
+    """The wire units of one version cut into parts that each fit one batch (``UNITS_PER_BATCH`` entries,
+    ``UNIT_CHARS_PER_BATCH`` characters, ``BATCH_MAX_BYTES`` less the envelope reserve)."""
+    budget = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE
+    parts, current, chars, size = [], [], 0, 0
+    for ordinal, kind, locator_json, text, text_sha256 in db.execute(
+            'SELECT ordinal, kind, locator_json, text, text_sha256 FROM units WHERE version_id = ? ORDER BY ordinal',
+            (version_id,)):
+        unit = {'ordinal': ordinal, 'kind': kind, 'locator_json': locator_json, 'text': text, 'text_sha256': text_sha256}
+        for piece in sync.unit_pieces(unit, budget // 2):
+            piece_size, piece_chars = sync.canonical_size(piece) + 1, len(piece['text'])
+            if current and (len(current) >= sync.UNITS_PER_BATCH or chars + piece_chars > sync.UNIT_CHARS_PER_BATCH
+                            or size + piece_size > budget):
+                parts.append(current)
+                current, chars, size = [], 0, 0
+            current.append(piece)
+            chars += piece_chars
+            size += piece_size
+    if current:
+        parts.append(current)
+    if len(parts) > sync.MAX_PARTS:
+        raise Stop(EXIT_FAILED, f'version {version_id} needs {len(parts)} parts (at most {sync.MAX_PARTS})')
+    return parts
+
+
+def _batches(items, *, count: int, budget: int = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE):
+    """Consecutive lists of ``items`` with at most ``count`` entries and ``budget`` canonical bytes each."""
+    current, size = [], 0
+    for item in items:
+        item_size = sync.canonical_size(item) + 1
+        if current and (len(current) >= count or size + item_size > budget):
+            yield current
+            current, size = [], 0
+        current.append(item)
+        size += item_size
+    if current:
+        yield current
+
+
+def _kind_of_change(local: dict, remote: dict | None) -> str:
+    if remote is None:
+        return 'added'
+    if local['status'] == 'deleted' and remote['status'] != 'deleted':
+        return 'deleted'
+    if local['status'] == 'active' and remote['status'] in ('deleted', 'skipped'):
+        return 'restored'
+    if local['seq'] == remote['seq'] and local['sha256'] == remote['sha256']:
+        return 'reparsed'
+    return 'changed'
+
+
+def _missing_targets(db, model_key: str | None) -> int:
+    """Target chunk texts of this store without a vector for ``model_key`` (``--require-vectors``)."""
+    sql = f'SELECT COUNT(DISTINCT c.text_sha256) FROM {store.latest_chunks_sql()} AND c.chunk_version = ?'
+    if model_key is None:
+        return db.execute(sql, (chunks.CHUNK_VERSION,)).fetchone()[0]
+    return db.execute(sql + ' AND NOT EXISTS(SELECT 1 FROM chunk_vectors x WHERE x.model_key = ? AND '
+                            'x.text_sha256 = c.text_sha256)', (chunks.CHUNK_VERSION, model_key)).fetchone()[0]
+
+
+# ---- one run --------------------------------------------------------------------------------------------
+
+def _file_logger(home: Path) -> tuple[logging.Logger, logging.Handler, Path]:
+    log_file = home/'logs'/f'push-{datetime.now():%Y%m%d}.log'
+    handler = logging.FileHandler(log_file, encoding='utf-8')
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logger = logging.getLogger('workmcp.push.file')
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+    return logger, handler, log_file
+
+
+def new_report(url: str) -> dict:
+    report = dict.fromkeys(REPORT_KEYS)
+    report.update(exit_code=EXIT_OK, url=url, started_at=store.now(), up_to_date=False, dry_run=False,
+                  state=dict.fromkeys(STATE_COUNT_KEYS, 0), sent=dict.fromkeys(SENT_KEYS, 0), batches=0, bytes_sent=0,
+                  state_requests=0, refused=[], retries=0, converged=False)
+    return report
+
+
+def execute(home: Path, settings: config.Config, token: str, options: Options, *,
+            transport: Transport | None = None, sleep: Callable[[float], None] = time.sleep) -> dict:
+    """One push run (design §3.4) to ``settings.push.url``; returns ``REPORT_KEYS``. ``transport`` replaces the
+    HTTP requests (tests), ``sleep`` the waits between retries."""
+    begin = time.monotonic()
+    url = settings.push.url
+    report = new_report(url)
+    report['dry_run'] = options.dry_run
+    paths.ensure_home(home)
+    logger, handler, log_file = _file_logger(home)
+    report['log'] = str(log_file)
+    run = _Run(url, transport or http_transport(token), sleep, logger, report,
+               budget=None if options.max_mb is None else options.max_mb * 2**20)
+    db = None
+    try:
+        db = store.open_read(home)
+        db.execute('BEGIN')                        # one read snapshot: summaries and items agree
+        _push(db, run, options)
+        if options.require_vectors and (missing := _missing_targets(db, local_model_key(db))):
+            raise Stop(EXIT_FAILED, f'--require-vectors: {missing} target chunk texts have no vector here (run index)')
+    except Stop as exc:
+        report['exit_code'] = exc.exit_code
+        report['error'] = str(exc)
+        logger.info(f'stopped | {exc}')
+    except FileNotFoundError as exc:
+        report['exit_code'] = EXIT_USAGE
+        report['error'] = f'{exc}; run workmcp scan first'
+    finally:
+        if db is not None:
+            db.close()
+        report['elapsed'] = round(time.monotonic() - begin, 3)
+        logger.info(f"done | push #{report['push_id']} | exit {report['exit_code']} | batches {report['batches']} | "
+                    f"bytes {report['bytes_sent']}")
+        logger.removeHandler(handler)
+        handler.close()
+    if report['exit_code'] == EXIT_OK and report['refused']:
+        report['exit_code'] = EXIT_FAILED
+    return report
+
+
+def _push(db, run: _Run, options: Options) -> None:
+    report, logger = run.report, run.logger
+    model_key = local_model_key(db)
+    state = run.get('state', {'model_key': model_key} if model_key else None)
+    run.collector = report['collector'] = state['collector']
+    if (state['schema_version'], state['chunk_version']) != (store.SCHEMA_VERSION, chunks.CHUNK_VERSION):
+        raise Stop(EXIT_USAGE, f"server schema {state['schema_version']} / chunks {state['chunk_version']}, this "
+                               f'collector {store.SCHEMA_VERSION} / {chunks.CHUNK_VERSION}: update the server first')
+    mine = sync.summary(db, model_key)
+    if all(state[key] == mine[key] for key in sync.SUMMARY_KEYS) and state['events_count'] == sync.event_count(db):
+        report['up_to_date'] = report['converged'] = True
+        report['server'] = {**mine, 'vectors_missing': None}
+        logger.info(f'up to date | {run.url} | {run.collector}')
+        return
+
+    remote, after = {}, 0
+    while True:
+        page = run.get('state', {'full': 1, 'after': after})
+        remote.update({row['local_document_id']: row for row in page['documents']})
+        if page['next_after'] is None:
+            break
+        after = page['next_after']
+    changed = [row for row in sync.document_summaries(db) if remote.get(row['local_document_id']) != row]
+    if options.limit_docs is not None and len(changed) > options.limit_docs:
+        changed = changed[:options.limit_docs]
+        run.note = f'--limit-docs {options.limit_docs}: the other changed documents go next time'
+    counts = report['state']
+    counts['documents_changed'] = len(changed)
+    for row in changed:
+        counts[_kind_of_change(row, remote.get(row['local_document_id']))] += 1
+    if options.dry_run:
+        if model_key is not None:
+            counts['vectors_missing'] = len(_server_missing(run, model_key))
+        return
+
+    roots = [{'local_root_id': root_id, 'path': path, 'enabled': enabled}
+             for root_id, path, enabled in db.execute('SELECT id, path, enabled FROM source_roots ORDER BY id')]
+    begun = run.post('begin', [{'roots': roots, 'counts_expected': {'documents': len(changed)},
+                                'started_at': datetime.now().astimezone().isoformat(timespec='microseconds'),
+                                'model_key': model_key}])
+    run.push_id = report['push_id'] = begun['push_id']
+    logger.info(f'start | push #{run.push_id} | {run.url} | {run.collector} | documents changed {len(changed)}')
+
+    # documents and versions (no text), then the units of the versions the server needs
+    sent_docs, need, paths_by_doc, versions_by_local = set(), [], {}, {}
+    items = []
+    for row in changed:
+        item, path = document_item(db, row['local_document_id'])
+        paths_by_doc[item['local_document_id']] = path
+        versions_by_local.update({v['local_version_id']: (path, v) for v in item['versions']})
+        items.append(item)
+    for batch in _batches(items, count=sync.DOCUMENTS_PER_BATCH):
+        if run.over_budget():
+            break
+        answer = run.post('documents', batch)
+        report['sent']['documents'] += len(batch)
+        report['sent']['versions'] += sum(len(item['versions']) for item in batch)
+        refused = {entry['local_document_id']: entry['code'] for entry in answer['refused']}
+        for item in batch:
+            local = item['local_document_id']
+            if local in refused:
+                report['refused'].append({'path': paths_by_doc[local], 'code': refused[local]})
+                logger.info(f'refused | {paths_by_doc[local]} | {refused[local]}')
+                continue
+            sent_docs.add(local)
+        for local, entry in answer['versions'].items():
+            path, version = versions_by_local[int(local)]
+            if entry['units'] == 'need':
+                need.append(int(local))
+            elif entry['units'] == 'copied':
+                report['sent']['copied_versions'] += 1
+                logger.info(f"copied | {path} | {version['sha256'][:12]} | units {version['unit_count']} "
+                            '| on the server, nothing sent')
+    _send_units(db, run, need, versions_by_local)
+
+    # vectors the server lacks and this store has
+    if model_key is not None and not run.over_budget():
+        missing = _server_missing(run, model_key)
+        counts['vectors_missing'] = len(missing)
+        vectors = []
+        for sha in missing:
+            row = db.execute('SELECT dims, vector FROM chunk_vectors WHERE model_key = ? AND text_sha256 = ?',
+                             (model_key, sha)).fetchone()
+            if row is not None and row[0] == sync.VECTOR_DIMS:
+                vectors.append({'text_sha256': sha, 'vector_b64': sync.vector_to_b64(row[1])})
+        for at in range(0, len(vectors), sync.VECTORS_PER_BATCH):
+            if run.over_budget():
+                break
+            part = vectors[at:at + sync.VECTORS_PER_BATCH]
+            run.post('vectors', [{'model_key': model_key, 'dims': sync.VECTOR_DIMS, 'items': part}])
+            report['sent']['vectors'] += len(part)
+            report['sent']['vector_bytes'] += len(part) * sync.VECTOR_DIMS * 4
+        if vectors:
+            logger.info(f"vectors | {report['sent']['vectors']}")
+
+    # document events: those at or after the server's latest, and every event of the documents sent now
+    known = set(remote) | sent_docs
+    events = [{'local_document_id': doc, 'local_version_id': version, 'kind': kind, 'at': at}
+              for doc, version, kind, at, recent in db.execute(
+                  'SELECT document_id, version_id, kind, at, (? IS NULL OR julianday(at) >= julianday(?)) '
+                  'FROM document_events ORDER BY id', (state['events_after'], state['events_after']))
+              if doc in sent_docs or (recent and doc in known)]
+    for batch in _batches(events, count=sync.EVENTS_PER_BATCH):
+        if run.over_budget():
+            break
+        run.post('events', batch)
+        report['sent']['events'] += len(batch)
+
+    final = run.post('end', [{'counts': dict(report['sent']), 'bytes_sent': report['bytes_sent']}])
+    report['server'] = {'documents_sha256': final['documents_sha256'], 'vectors_sha256': final['vectors_sha256'],
+                        'vectors_missing': final['vectors_missing_total']}
+    report['converged'] = all(final[key] == mine[key] for key in sync.SUMMARY_KEYS)
+    if run.stopped or run.note:
+        report['error'] = '; '.join(text for text in (run.stopped, run.note) if text)
+
+
+def _server_missing(run: _Run, model_key: str) -> list[str]:
+    missing, after = [], ''
+    while True:
+        page = run.get('vectors', {'model_key': model_key, **({'after': after} if after else {})})
+        missing += page['missing']
+        if page['next_after'] is None:
+            return missing
+        after = page['next_after']
+
+
+def _send_units(db, run: _Run, need: list[int], versions_by_local: dict) -> None:
+    report, logger = run.report, run.logger
+    batch, entries, units, chars, size = [], 0, 0, 0, 0
+    budget = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE
+
+    def flush():
+        nonlocal batch, entries, units, chars, size
+        if batch:
+            run.post('units', batch)
+            report['sent']['units'] += units
+            report['sent']['chars'] += chars
+        batch, entries, units, chars, size = [], 0, 0, 0, 0
+
+    for local in need:
+        if run.over_budget():
+            break
+        path, version = versions_by_local[local]
+        parts = unit_parts(db, local)
+        for number, part in enumerate(parts, start=1):
+            item = {'local_version_id': local, 'units_sha256': version['units_sha256'], 'part': number,
+                    'parts': len(parts), 'units': part}
+            item_size = sync.canonical_size(item) + 1
+            part_chars = sum(len(unit['text']) for unit in part)
+            if batch and (entries + len(part) > sync.UNITS_PER_BATCH or chars + part_chars > sync.UNIT_CHARS_PER_BATCH
+                          or size + item_size > budget):
+                flush()
+            batch.append(item)
+            entries += len(part)
+            units += len({unit['ordinal'] for unit in part}
+                         - ({parts[number - 2][-1]['ordinal']} if number > 1 else set()))
+            chars += part_chars
+            size += item_size
+        logger.info(f"pushed | {path} | {version['sha256'][:12]} | units {version['unit_count']} "
+                    f"| chars {version['text_chars']}")
+    flush()
+
+
+# ---- report ---------------------------------------------------------------------------------------------
+
+def _short(value: str | None) -> str:
+    return f'{value[:4]}…' if value else '-'
 
 
 def report_lines(report: dict) -> list[str]:
-    """The stdout report of ``execute`` (design §3.6). Stage 1."""
-    raise NotImplementedError(STAGE1)
+    """The stdout report of ``execute`` (design §3.6)."""
+    who = f"to {report['url']}" + (f" as {report['collector']}" if report['collector'] else '')
+    head = f"push #{report['push_id']} {who}" if report['push_id'] is not None else f'push {who}'
+    if report['up_to_date']:
+        return [f"{head}  up to date (batches 0, bytes sent 0, state requests {report['state_requests']})"]
+    lines = [f"{head}  started {report['started_at']}" + ('  (dry run: nothing sent)' if report['dry_run'] else '')]
+    c, s = report['state'], report['sent']
+    lines.append(f"  state: documents changed {c['documents_changed']} (added {c['added']} changed {c['changed']} "
+                 f"deleted {c['deleted']} restored {c['restored']} reparsed {c['reparsed']})  "
+                 f"vectors missing on server {c['vectors_missing']}")
+    if not report['dry_run']:
+        lines.append(f"  sent: documents {s['documents']}  versions {s['versions']}  units {s['units']:,} "
+                     f"({s['chars']:,} chars)  vectors {s['vectors']} ({s['vector_bytes'] // 1024:,} KB)  "
+                     f"events {s['events']}  copied on the server {s['copied_versions']}")
+    lines.append(f"  batches {report['batches']}  bytes sent {report['bytes_sent']:,} (gzip)  refused "
+                 f"{len(report['refused'])}  retries {report['retries']}  {report['elapsed']}s   log: {report['log']}")
+    lines += [f"  refused: {entry['path']} : {entry['code']}" for entry in report['refused']]
+    if report['server']:
+        server = report['server']
+        lines.append(f"  server now: documents_sha256 {_short(server['documents_sha256'])}  vectors_sha256 "
+                     f"{_short(server['vectors_sha256'])}  vectors still missing {server['vectors_missing']}"
+                     + ('' if report['converged'] else '  (not yet the same as this collector)'))
+    if report['error']:
+        lines.append(f"  error: {report['error']}")
+    return lines
 
 
 def main(args) -> int:

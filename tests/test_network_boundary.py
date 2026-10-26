@@ -80,18 +80,21 @@ MODULE_IMPORTS = {
     # M5 remote (design M5 remote §6.1): the operating server's HTTP adapter receives through the SDK only
     # (auth settings, access token, Host/Origin checks, starlette request/response of the push routes) and
     # makes tokens (secrets, hmac); no uvicorn, socket, ssl or http import. gzip/base64 live in sync.py
-    # (narrower than the design table, which also listed them here and in push.py).
+    # (narrower than the design table, which also listed them here and in push.py). Stage 1 adds the SDK's
+    # Host/Origin check object for the push and health routes (the SDK checks only its MCP route), ``time``
+    # for the refusal log window and ``signal`` to make SIGTERM/SIGBREAK the clean stop SIGINT is.
     'remote.py': frozenset({'mcp.server.auth.settings.AuthSettings', 'mcp.server.auth.provider.AccessToken',
-                            'mcp.server.transport_security.TransportSecuritySettings', 'starlette.requests.Request',
+                            'mcp.server.transport_security.TransportSecuritySettings',
+                            'mcp.server.transport_security.TransportSecurityMiddleware', 'starlette.requests.Request',
                             'starlette.responses.Response', 'starlette.responses.JSONResponse', 'secrets', 'hmac',
-                            'time', 'logging'}),
+                            'time', 'logging', 'signal'}),
     'push.py': frozenset({'time', 'logging'}),   # retry delays and the push log; urllib inside functions only
     'sync.py': frozenset({'gzip', 'base64'}),    # batch bodies and vector blobs, both sides
 }
-# Entries the stage-0 shells do not import yet (design M5 remote §11.1): exempt from the exactness test while
-# unused; the test fails as soon as one is used, so stage 1 moves it out of here (and drops what stays unused).
-STAGE1_PENDING = frozenset({('remote.py', 'starlette.responses.JSONResponse'), ('remote.py', 'time'),
-                            ('push.py', 'time'), ('push.py', 'urllib.request'), ('push.py', 'urllib.error')})
+# Entries a module being written in parallel may or may not import yet (design M5 remote §11.2): exempt from
+# the exactness test either way (they stay inside the allowlist above, so nothing wider is allowed). Empty since
+# stage 1 ended: every remote.py and push.py entry is used, and the exactness test is strict again.
+STAGE1_PENDING: frozenset = frozenset()
 # M5 (design M5 §12, model source): ``setup.download_model`` is the one caller of a models network
 # function outside models.py, and only of ``fetch``; only ``cli.py`` may import ``setup`` at all, so the
 # server and the tools never reach it. ``tools/`` lies outside the package and is not checked here;
@@ -507,14 +510,12 @@ def test_allowlists_match_the_sources_exactly():
         pending = {entry for owner, entry in STAGE1_PENDING if owner == module}
         names = {dotted for dotted, _, in_function in used[module] if not covered(dotted, COMMON_IMPORTS)
                  and not (in_function and covered(dotted, FUNCTION_IMPORTS.get(module, frozenset())))}
-        assert not names & pending, f'{module}: now used, remove from STAGE1_PENDING: {sorted(names & pending)}'
-        assert names == extra - pending, module
+        assert names - pending == extra - pending, module
     for module, extra in FUNCTION_IMPORTS.items():
         pending = {entry for owner, entry in STAGE1_PENDING if owner == module}
         module_level = COMMON_IMPORTS | MODULE_IMPORTS.get(module, frozenset())
         names = {dotted for dotted, _, _ in used[module] if not covered(dotted, module_level)}
-        assert not names & pending, f'{module}: now used, remove from STAGE1_PENDING: {sorted(names & pending)}'
-        assert names == extra - pending, module
+        assert names - pending == extra - pending, module
         assert all(in_function for dotted, _, in_function in used[module] if covered(dotted, extra))
     special = {e for extras in (*MODULE_IMPORTS.values(), *FUNCTION_IMPORTS.values()) for e in extras}
     for module, imports in used.items():
@@ -1586,12 +1587,126 @@ def test_push_judge_allows_the_configured_server_only(event, args, outside):
     assert (_audited_server.judge_push(event, args, TARGET) is not None) is outside
 
 
-@pytest.mark.parametrize('mode', ['remote', 'push'])
-def test_m5_audit_modes_are_stage_1(tmp_path, mode):
-    """Stage 0 has the judges; the remote and push runs report skipped until stage 1 fills them in."""
-    _, report = run_wrapper(tmp_path, mode)
+def test_push_audit_mode_without_a_target_is_skipped(tmp_path):
+    """The push mode's body is executor B's ``tests/_audit_push.py`` (design §11.2), run with its target by
+    ``tests/test_push.py``; without one (or without that file) the mode reports skipped and reaches nothing."""
+    _, report = run_wrapper(tmp_path, 'push')
     assert report['skipped'].startswith('not_implemented')
     assert [e for e in report['events'] if e['violation']] == []
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+def _remote_requests(base: str, tokens: dict) -> dict:
+    """R-1..R-9 (design §6.2) and a short MCP session (initialize, status, search) from this test process;
+    returns the HTTP status of each request by name (R-6: the two tool replies)."""
+    import httpx2
+    body = json.dumps(initialize())
+    mcp_headers = {'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json'}
+
+    def bearer(token):
+        return {'Authorization': f'Bearer {token}'}
+
+    seen = {}
+    with httpx2.Client(trust_env=False, timeout=30) as http:
+        def post(headers):
+            return http.post(f'{base}/mcp', content=body, headers={**mcp_headers, **headers}).status_code
+        seen['R-1'] = post({})
+        seen['R-2'] = post(bearer('B' * 43))
+        seen['R-3'] = post(bearer(tokens['revoked']))
+        seen['R-4'] = post(bearer(tokens['push']))
+        seen['R-5'] = http.get(f'{base}/push/state', headers=bearer(tokens['mcp'])).status_code
+        seen['R-7'] = post({**bearer(tokens['mcp']), 'Host': 'evil.example'})
+        seen['R-8'] = http.get(f'{base}/healthz').status_code
+        root = base.rsplit('/workmcp', 1)[0]
+        seen['R-9'] = sorted({http.get(f'{root}{path}').status_code for path in ('/', '/mcp', '/workmcp')})
+        opened = http.post(f'{base}/mcp', content=body, headers={**mcp_headers, **bearer(tokens['mcp'])})
+        session = {**mcp_headers, **bearer(tokens['mcp']), 'Mcp-Session-Id': opened.headers['mcp-session-id'],
+                   'Mcp-Protocol-Version': '2025-06-18'}
+        http.post(f'{base}/mcp', content=json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}),
+                  headers=session)
+        seen['R-6'] = [http.post(f'{base}/mcp', content=json.dumps(tool_call(number, name, arguments)),
+                                 headers=session).json()
+                       for number, name, arguments in ((2, 'status', {}), (3, 'search', {'query': SENTINEL}))]
+        seen['push_state'] = http.get(f'{base}/push/state', headers=bearer(tokens['push'])).status_code
+    return seen
+
+
+LOOPBACK_DETAIL = re.compile(r"\('(127\.0\.0\.1|::1)', \d+")
+LOOPBACK_LOOKUP = re.compile(r"\((b?'127\.0\.0\.1'|b?'::1'),")
+
+
+def test_remote_mode_has_no_egress_and_refuses_unauthenticated(tmp_path):
+    """Design §6.2: the real ``serve --http`` under the audit hook (mode ``remote``) on a scanned and indexed
+    synthetic home, driven from this process: the refusals R-1..R-5, R-7..R-9, a tool session R-6, and R-10:
+    every socket event on loopback, the only fixed-port bind its own listener, no name resolution other than
+    the numeric loopback host, no HTTP client, no process, no open under the source root; it stops cleanly."""
+    import time
+
+    import httpx2
+    from workmcp import remote, store
+    home, src, _ = filled_home(tmp_path)
+    db = store.open_home(home)
+    try:
+        tokens = {'mcp': remote.issue_token(db, 'mcp', 'audit-client')['token'],
+                  'push': remote.issue_token(db, 'push', 'audit-pc')['token']}
+        revoked = remote.issue_token(db, 'mcp', 'audit-old')
+        remote.revoke_token(db, revoked['id'])
+        tokens['revoked'] = revoked['token']
+    finally:
+        db.close()
+    port, log, stop = _free_port(), tmp_path/'audit-remote.json', tmp_path/'remote.stop'
+    env = {**os.environ, 'WORKMCP_HOME': str(home), 'PYTHONPATH': str(ROOT/'src')}
+    stderr_file = tmp_path/'remote.err'
+    with open(stderr_file, 'w', encoding='utf-8') as err:
+        proc = subprocess.Popen([sys.executable, str(WRAPPER), str(log), 'remote', str(port), str(stop), str(src)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err, env=env, cwd=tmp_path)
+    base = f'http://127.0.0.1:{port}/workmcp'
+    try:
+        deadline = time.monotonic() + 60
+        with httpx2.Client(trust_env=False, timeout=5, headers={'Authorization': f"Bearer {tokens['mcp']}"}) as http:
+            while time.monotonic() < deadline and proc.poll() is None:
+                try:
+                    if http.get(f'{base}/healthz').status_code == 200:
+                        break
+                except httpx2.TransportError:
+                    time.sleep(0.2)
+        assert proc.poll() is None, stderr_file.read_text(encoding='utf-8', errors='replace')
+        seen = _remote_requests(base, tokens)
+        stop.write_text('stop', encoding='utf-8')
+        code = proc.wait(timeout=60)
+    finally:
+        proc.kill()
+    stderr = stderr_file.read_text(encoding='utf-8', errors='replace')
+    assert code == 0, stderr
+    report = json.loads(log.read_text(encoding='utf-8'))
+    assert report['completed'] is True and report['exit_code'] == 0, stderr
+    assert {name: seen[name] for name in ('R-1', 'R-2', 'R-3', 'R-4', 'R-5', 'R-7', 'R-8', 'R-9')} == {
+        'R-1': 401, 'R-2': 401, 'R-3': 401, 'R-4': 401, 'R-5': 401, 'R-7': 421, 'R-8': 401, 'R-9': [404]}
+    envelopes = [json.loads(reply['result']['content'][0]['text']) for reply in seen['R-6']]
+    assert all(envelope['ok'] for envelope in envelopes) and envelopes[0]['result']['role'] == 'server'
+    assert envelopes[1]['result']['hits'] and envelopes[1]['delivered_sources']
+    assert seen['push_state'] == 200
+    events = report['events']                                                      # R-10
+    assert [e for e in events if e['violation']] == [], stderr
+    for e in events:
+        if e['event'] in _audited_server.ADDRESS_EVENTS:
+            assert LOOPBACK_DETAIL.search(e['detail']), e
+    binds = [e for e in events if e['event'] == 'socket.bind']
+    assert any(f', {port})' in e['detail'] or f', {port},' in e['detail'] for e in binds), binds   # its listener
+    fixed = [e for e in binds if not re.search(rf"', (0|{port})[,)]", e['detail'])]
+    assert fixed == [], fixed
+    lookups = [e for e in events if e['event'].startswith(('socket.getaddrinfo', 'socket.gethostbyname'))]
+    assert all(LOOPBACK_LOOKUP.match(e['detail']) for e in lookups), lookups
+    assert not [e for e in events if e['event'].startswith(_audited_server.PROCESS_EVENTS)]
+    assert not [e for e in events if e['event'].startswith(_audited_server.NETWORK_EVENTS)]
+    assert report['source_opens'] == 0
+    assert SENTINEL not in stderr and all(token not in stderr for token in tokens.values())
 
 
 def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):

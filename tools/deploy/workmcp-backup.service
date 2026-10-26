@@ -1,0 +1,21 @@
+# Runs the daily backup once (started by backup.timer). See backup.sh and the deployment guide.
+# Comments are on their own lines: systemd does not allow a trailing comment after a setting.
+
+[Unit]
+Description=workmcp database backup (online copy, inside the data home)
+
+[Service]
+Type=oneshot
+User=workmcp
+Group=workmcp
+Environment=WORKMCP_HOME=/home/workmcp/Motive_work
+Environment=WORKMCP_PY=/home/workmcp/app/.venv/bin/python
+ExecStart=/home/workmcp/app/backup.sh
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/workmcp
+ReadWritePaths=/home/workmcp
+PrivateTmp=yes
+PrivateDevices=yes
+IPAddressDeny=any
