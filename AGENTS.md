@@ -4,28 +4,30 @@ Personal work-knowledge MCP server. `Motive_work` is a working title (folder nam
 
 ## Purpose
 
-- Turn the user's own work material on the **company PC** into a structured, evidence-linked knowledge base, and expose it to the AI coding/chat tools the user already runs there (Claude Code, Codex, and other MCP clients) through a standard **MCP** server.
+- Turn the user's own work material on the **company PC** into a structured, evidence-linked knowledge base, and expose it to the AI coding/chat tools the user already runs (Claude Code, Codex, and other MCP clients) through a standard **MCP** server.
+- **Operating structure (피터 decision 2026-10-26):** a **collector** on the company PC reads originals, parses, chunks and embeds them, and pushes only the changes to the **workmcp operating server** on 피터's own Hostinger VPS (KVM 2). The operating server stores chunk text, vectors, source locators and knowledge, embeds queries with the same model, and serves MCP over HTTPS with token authentication. Clients connect to that remote MCP server.
 - Personal use only, single user. Not a product for sale, no multi-tenant features, no web service.
 - Origin: the original intent of the sibling project `Motive_vari` (G0, "company context → evidence-linked decisions", spec v0.3 in `../Motive_vari/doc/specification/`), restarted as a lightweight personal tool. Fork points in `Motive_vari`: tags `g0-freeze-20261017` (G0 code, frozen incomplete) and `kakao-p1-complete-20261022` (local parsing/binding/embedding/search code proven on this PC). Port only what is needed; do not copy the G0 synthetic auth, evaluation harness or decision workbench.
 
 ## Hard constraints
 
-- **Data stays on the PC.** Originals, extracted text, indexes and embeddings are stored locally (outside the repository, default `%LOCALAPPDATA%\Motive_work\` or a configured path; never in OneDrive/sync folders). No cloud storage, no telemetry.
-- **No external AI API calls from the server.** Embeddings and any optional local model run on CPU on the PC (ONNX Runtime; BGE-M3 class). Reasoning and writing are done by the MCP client the user chooses. Only the snippets a client requests through MCP tools leave the server, to that client.
-- **Model download** happens only in one explicit module/command (with SHA256 manifest) or from an offline bundle; the server itself has no other network egress.
-- **Company data never enters git**, test fixtures, docs, logs or issue text. Development and tests use synthetic or public documents. Real company material exists only on the company PC.
+- **Where data lives (피터 decision 2026-10-26).** Original files stay on the company PC only and are never uploaded. Extracted unit/chunk text, embeddings, indexes, source locators and knowledge are stored in exactly two places: the collector's local data home on the company PC (outside the repository, default `%USERPROFILE%\Motive_work`, never in OneDrive/sync folders) and 피터's own Hostinger VPS (workmcp operating server). No other cloud storage, no telemetry. Storing company text on the VPS is 피터's decision and responsibility.
+- **No external AI API calls** from the collector or the operating server. Embeddings run on CPU with ONNX Runtime (BGE-M3 class): documents on the company PC, queries on the VPS, with the same model and manifest. Reasoning and writing are done by the MCP client the user chooses. Only the snippets a client requests through MCP tools leave the operating server, to that client.
+- **Network boundary.** The collector's only network egress is HTTPS to the configured workmcp operating server (plus the explicit model download module). The operating server accepts MCP and upload requests only over TLS with a valid token (no unauthenticated endpoints) and has no egress except the model download module. Both are fixed by tests.
+- **Model download** happens only in one explicit module/command (with SHA256 manifest, pinned revision) or from an offline bundle.
+- **Company data never enters git**, test fixtures, docs, logs or issue text. Development and tests use synthetic or public documents. Real company material exists only on the company PC and, as extracted text/vectors, on the operating server.
 - **No admin rights assumed** on the company PC; user-level Python venv or a portable bundle. Company security software, proxies and blocked downloads are expected.
-- **Clients (confirmed 2026-10-23):** 피터 uses both Claude Code and Codex on the company PC with the same stdio MCP server; snippets a client requests go to that client's provider (Anthropic or OpenAI), accepted by 피터.
-- **Company AI policy** compliance (installing the tool, sending snippets to Claude/Codex) is the user's responsibility; the tool must make what leaves the PC visible (tool responses list exact sources).
+- **Clients (confirmed 2026-10-23, remote since 2026-10-26):** 피터 uses both Claude Code and Codex; both connect to the same remote workmcp server; snippets a client requests go to that client's provider (Anthropic or OpenAI), accepted by 피터.
+- **Company AI policy** compliance (installing the collector, storing extracted text on the VPS, sending snippets to Claude/Codex) is the user's responsibility; the tool must make what leaves the PC and the server visible (push reports, tool responses list exact sources).
 - **Read-only to sources.** The server never modifies, moves or deletes the user's original files.
 - **Evidence binding.** Every returned fact or snippet carries an exact source locator (file, version hash, page/sheet/line or character range). Structured knowledge written through MCP must cite a source locator or be explicitly marked as the user's own note.
-- Secrets in a git-ignored `.env` only; never print or commit them.
+- Secrets (server tokens, VPS credentials) in a git-ignored `.env` or the OS secret store only; never print, log or commit them.
 
 ## Stack (initial, may change by plan)
 
-- Python 3.12, standard library first; `onnxruntime` (CPU), `tokenizers`, `numpy` for local embeddings; official `mcp` Python SDK for the stdio server; SQLite (WAL) for metadata, chunks, vectors and history.
+- Python 3.12, standard library first; `onnxruntime` (CPU), `tokenizers`, `numpy` for embeddings; official `mcp` Python SDK (stdio locally, Streamable HTTP on the operating server); SQLite (WAL) for metadata, chunks, vectors and history on both sides.
 - Parsers: text/markdown, PDF, DOCX, PPTX, XLSX, EML/MSG, HWP/HWPX (port from `Motive_vari` research extractor and G0 parsing where licences and quality allow).
-- Windows first (company PC). Keep paths and encodings Windows-safe (UTF-8, CP949 inputs).
+- Collector: Windows first (company PC); keep paths and encodings Windows-safe (UTF-8, CP949 inputs). Operating server: Ubuntu 24.04 on the VPS, coexisting with 피터's other services there.
 
 ## Documentation
 

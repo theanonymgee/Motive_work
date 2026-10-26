@@ -4,8 +4,8 @@
 
 ## Non-negotiables (summary of AGENTS.md)
 
-- Personal work-knowledge MCP server for 피터's company PC. Single user, local only.
-- Originals, text, indexes and embeddings stay on the PC (outside the repo, not in sync folders). The server makes **no external AI/API calls**; embeddings run locally on CPU. Only snippets that an MCP client requests leave the PC, to that client.
+- Personal work-knowledge MCP server. Single user. Structure (2026-10-26): a collector on the company PC parses, chunks and embeds documents and pushes changes to the workmcp operating server on 피터's Hostinger VPS, which serves MCP over HTTPS with a token.
+- Originals stay on the company PC. Chunk text, vectors, indexes and knowledge live only in the collector's data home and on 피터's VPS. **No external AI/API calls** anywhere; embeddings run on CPU (same model on both sides). The collector's only egress is the operating server (plus the explicit model download). Only snippets that an MCP client requests leave the server, to that client.
 - Company data never goes into git, fixtures, docs or logs. Use synthetic/public documents for development and tests.
 - Never modify the user's source files. Every returned snippet/fact carries an exact source locator.
 - No admin rights assumed. Model download only through the explicit download module or an offline bundle.
