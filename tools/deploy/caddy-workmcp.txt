@@ -18,6 +18,15 @@
 #       }
 #   }
 #
+# Order check (Caddy sorts directives by its own fixed order, not by where you write them): a
+# site-level `redir`, `rewrite`, `basic_auth`, `forward_auth`, `header`, `encode` or `request_header`
+# of the existing site block runs BEFORE any `handle`, so it would also act on /workmcp/* (a
+# `basic_auth` would answer 401 to the bearer client; a `redir` would redirect it). If the existing
+# block has any of these at site level, wrap them in their own `handle { ... }` first or ask the owner.
+# Among several `handle` blocks the most specific path matcher wins, so `/workmcp/*` beats an existing
+# catch-all `handle { ... }` or a shorter prefix. Check with the adapted config (read-only, prints JSON):
+#   caddy adapt --config /etc/caddy/Caddyfile --pretty    (the /workmcp/ route must come before the others)
+#
 # Then:  caddy validate --config /etc/caddy/Caddyfile  &&  sudo systemctl reload caddy
 # Rollback: delete the block, validate, reload.
 #

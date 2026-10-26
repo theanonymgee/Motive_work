@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # workmcp VPS survey (design M5 remote 9.1, approval step A). READ-ONLY: it changes nothing on the host.
 #
-# Run it on the VPS and keep the output (the output is the evidence for the branch table in the
-# deployment guide):
-#   ssh <vps> 'bash -s' < tools/vps_survey.sh > survey-before.txt
+# Run it on the VPS and keep the output OUTSIDE the repository (the output is the evidence for the
+# branch table in the deployment guide):
+#   tr -d '\r' < tools/vps_survey.sh | ssh <vps> 'bash -s' > "%USERPROFILE%\workmcp-deploy\survey-YYYYMMDD.txt"
 #
 # Rules this script keeps:
 #   - only commands that read state; no install, no write, no restart, no reload, no file output
+#   - commands that are known to write as a side effect are replaced by plain reads:
+#       nginx -T (may create log files)  -> grep over /etc/nginx files
+#       apache2ctl -S                    -> grep over /etc/apache2 files
+#       certbot certificates (writes /var/log/letsencrypt) -> ls /etc/letsencrypt/live + openssl x509 -enddate
+#       python (writes .pyc)             -> python -B -I with PYTHONDONTWRITEBYTECODE=1, in memory only
 #   - no network access of its own (no curl, no dig, no package index update)
 #   - sudo is used only as `sudo -n` (never asks for a password) and only for read commands
+#   - the ONLY traces left on the host are ones the operating system makes by itself: the SSH login
+#     and each `sudo` call are written to the system auth log/journal, and sudo keeps its own
+#     timestamp file. They are not state of any service.
 #   - every command reads no stdin, and its output is passed through scrub() so a secret-looking
 #     assignment is replaced by <redacted>; web server configs are filtered to a few directives
 #   - process list shows names only (no command lines, which can carry secrets)
@@ -17,6 +25,7 @@
 
 export LC_ALL=C
 export PAGER=cat SYSTEMD_PAGER=
+export PYTHONDONTWRITEBYTECODE=1
 
 scrub() {
     sed -E \
@@ -96,11 +105,12 @@ for u in nginx caddy apache2 httpd haproxy traefik docker podman fail2ban ufw; d
 done
 
 section "nginx (only server_name / listen / location / ssl_certificate / include / proxy_pass lines)"
-if has nginx; then
-    $SUDO nginx -T </dev/null 2>/dev/null \
-        | grep -E '^[[:space:]]*(server_name|listen|location|ssl_certificate |include|proxy_pass|# configuration file)' \
+if has nginx || [ -d /etc/nginx ]; then
+    # files are read with grep (not `nginx -T`, which may create log files); -R follows the sites-enabled symlinks
+    $SUDO grep -RnE '^[[:space:]]*(server_name|listen|location|ssl_certificate[[:space:]]|include|proxy_pass)' \
+        /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/snippets </dev/null 2>&1 \
         | head -150 | scrub
-    echo "-- nginx -v"; nginx -v </dev/null 2>&1
+    has nginx && { echo "-- nginx -v"; nginx -v </dev/null 2>&1; }
 else
     echo "(not available)"
 fi
@@ -119,7 +129,13 @@ else
 fi
 
 section "apache"
-if has apache2ctl; then $SUDO apache2ctl -S </dev/null 2>&1 | head -40 | scrub; else echo "(not available)"; fi
+if has apache2ctl || [ -d /etc/apache2 ]; then
+    # files are read with grep (not `apache2ctl -S`, which opens the configured log files)
+    $SUDO grep -RnE '^[[:space:]]*(ServerName|ServerAlias|<VirtualHost|Listen|SSLCertificateFile)' \
+        /etc/apache2/ports.conf /etc/apache2/sites-enabled </dev/null 2>&1 | head -60 | scrub
+else
+    echo "(not available)"
+fi
 
 section "containers (name, image, published ports; no environment)"
 if has docker; then
@@ -132,25 +148,38 @@ else
     echo "(not available)"
 fi
 
-section "certificates (names and expiry only)"
+section "certificates (names and expiry only; not certbot, which writes its log on every run)"
 if [ -n "$SUDO" ] || [ -r /etc/letsencrypt/live ]; then
     $SUDO ls /etc/letsencrypt/live </dev/null 2>&1
-    has certbot && $SUDO certbot certificates </dev/null 2>&1 | grep -E 'Certificate Name|Domains|Expiry Date' | scrub
+    for name in $($SUDO ls /etc/letsencrypt/live </dev/null 2>/dev/null); do
+        if [ -f "/etc/letsencrypt/live/$name/cert.pem" ] && has openssl; then
+            printf '%s: ' "$name"
+            $SUDO openssl x509 -noout -enddate -in "/etc/letsencrypt/live/$name/cert.pem" </dev/null 2>&1
+        fi
+    done
 else
     echo "(/etc/letsencrypt not readable without sudo)"
 fi
 
 section "firewall (rules only)"
-if has ufw; then $SUDO ufw status verbose </dev/null 2>&1 | scrub; else echo "ufw: (not available)"; fi
+if has ufw || [ -f /etc/ufw/ufw.conf ]; then
+    # files are read (not `ufw status`, a python program that may write bytecode as root)
+    echo "-- /etc/ufw/ufw.conf"
+    $SUDO grep -E '^(ENABLED|LOGLEVEL)=' /etc/ufw/ufw.conf </dev/null 2>&1
+    echo "-- ufw rules (tuple lines of user.rules and user6.rules)"
+    $SUDO grep -h '^### tuple' /etc/ufw/user.rules /etc/ufw/user6.rules </dev/null 2>&1 | head -60
+else
+    echo "ufw: (not available)"
+fi
 if has nft; then $SUDO nft list ruleset </dev/null 2>&1 | head -80 | scrub; else echo "nft: (not available)"; fi
 echo "-- note: the Hostinger panel firewall (not visible from inside the VPS) is checked separately"
 
-section "python and sqlite (this runs python in memory only; no file is written)"
-try python3 --version
+section "python and sqlite (python -B -I: in memory only, no bytecode and no file is written)"
+try python3 -B --version
 for py in python3.12 python3; do
     if has "$py"; then
         echo "-- $py"
-        "$py" - </dev/null <<'PY' 2>&1
+        "$py" -B -I - </dev/null <<'PY' 2>&1
 import sqlite3, sys
 print(sys.version.split()[0], "sqlite", sqlite3.sqlite_version)
 db = sqlite3.connect(":memory:")
@@ -173,7 +202,7 @@ if has apt-cache; then apt-cache policy python3.12 python3.12-venv </dev/null 2>
 section "scheduled jobs (names only)"
 ls /etc/cron.d </dev/null 2>&1 | head -30
 echo "-- current user crontab"
-crontab -l </dev/null 2>&1 | head -20 | scrub
+if has crontab; then crontab -l </dev/null 2>&1 | head -20 | scrub; else echo "(not available)"; fi
 
 echo
 echo "== end of survey (nothing was changed) =="

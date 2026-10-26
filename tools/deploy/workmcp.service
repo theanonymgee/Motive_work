@@ -17,6 +17,7 @@ User=workmcp
 Group=workmcp
 Environment=WORKMCP_HOME=/home/workmcp/Motive_work
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/home/workmcp/app/Motive_work
 ExecStart=/home/workmcp/app/.venv/bin/python -I -m workmcp serve --http 127.0.0.1:8765
 Restart=on-failure
@@ -35,7 +36,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=tmpfs
 BindPaths=/home/workmcp
-ReadWritePaths=/home/workmcp
+# Writable: the data home only (db, logs, tmp, models, backup). The code and venv under app/ are read-only
+# for the service, so a bug or an attacker inside it cannot change its own code.
+ReadWritePaths=/home/workmcp/Motive_work
+ReadOnlyPaths=/home/workmcp/app
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

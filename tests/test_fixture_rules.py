@@ -261,3 +261,64 @@ def test_shell_scripts_have_valid_syntax():
     for path in (REPO/'tools'/'vps_survey.sh', REPO/'tools'/'deploy'/'backup.sh'):
         result = subprocess.run([bash, '-n', str(path)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
+
+
+# ---- review v1 (L6-L10, L12): side-effect-free survey, read-only code path, ^~ location, real test names ----
+
+def test_survey_script_avoids_commands_that_write_as_a_side_effect():
+    """``nginx -T``/``apache2ctl -S`` may create log files, ``certbot`` writes its log on every run, ``ufw status`` is a
+    python program, and python writes bytecode unless ``-B``: the survey reads files or uses ``-B -I`` instead."""
+    code = _script_code(_text(REPO/'tools'/'vps_survey.sh'))
+    position = r'(?:^|[|;&]|\$\(|\bthen\b|\bdo\b|\belse\b)\s*(?:sudo\s+-n\s+|\$SUDO\s+|nice\s+|exec\s+)?'
+    for command in (r'nginx\s+-T', r'certbot\b', r'apache2ctl\s+-S', r'ufw\s+status', r'caddy\s+(?:run|start|reload|adapt)'):
+        assert not re.search(position + command, code, re.MULTILINE), command
+    interpreters = re.findall(r'(?m)^\s*"\$py"[^\n<]*', code) + re.findall(r'(?m)^\s*try python3[^\n]*', code)
+    assert len(interpreters) == 2 and all(' -B ' in text + ' ' for text in interpreters), interpreters
+    assert 'PYTHONDONTWRITEBYTECODE=1' in code
+    assert 'openssl x509 -noout -enddate' in code
+
+
+def test_service_code_path_is_read_only_and_only_the_data_home_is_writable():
+    deploy = REPO/'tools'/'deploy'
+    for name in ('workmcp.service', 'workmcp-backup.service'):
+        text = _text(deploy/name)
+        assert 'ReadWritePaths=/home/workmcp/Motive_work\n' in text, name
+        assert 'ReadOnlyPaths=/home/workmcp/app\n' in text, name
+        assert not re.search(r'(?m)^ReadWritePaths=/home/workmcp\s*$', text), name
+    assert 'PYTHONDONTWRITEBYTECODE=1' in _text(deploy/'workmcp.service')
+
+
+def test_nginx_location_wins_over_regex_locations_and_caddy_note_covers_order():
+    nginx = _text(REPO/'tools'/'deploy'/'nginx-workmcp.conf')
+    assert re.search(r'(?m)^location \^~ /workmcp/ \{', nginx)
+    assert not re.search(r'(?m)^location /workmcp/ \{', nginx)
+    caddy = _text(REPO/'tools'/'deploy'/'caddy-workmcp.txt')
+    assert 'handle /workmcp/*' in caddy and 'caddy adapt' in caddy and 'basic_auth' in caddy
+
+
+def test_guides_name_only_tests_that_exist():
+    """Every ``tests/<file>.py::<name>`` the guides point at is a real test function (a missing name makes pytest exit 5)."""
+    found = {}
+    pattern = re.compile(r'(tests/[A-Za-z0-9_]+\.py)::([A-Za-z0-9_]+)')
+    for path in GUIDE_FILES:
+        for file, name in pattern.findall(_text(path)):
+            source = REPO/file
+            if not source.exists() or not re.search(rf'(?m)^(?:async )?def {name}\(', _text(source)):
+                found.setdefault(path.name, []).append(f'{file}::{name}')
+    assert found == {}
+    assert any(pattern.search(_text(path)) for path in GUIDE_FILES)
+
+
+def test_guides_do_not_point_at_pytest_selectors_that_select_nothing():
+    """``-k route_table`` selected no test (review L12): the checklist names tests by their full ids."""
+    for path in GUIDE_FILES:
+        assert 'route_table' not in _text(path), path.name
+
+
+def test_deployment_guide_covers_the_synthetic_collector_home_and_restore_follow_ups():
+    guide = _text(REPO/'doc'/'guides'/'2026-10-26_VPS-배포절차서_v1.md')
+    for needle in ('WORKMCP_HOME', '[push]', 'url = "https://', 'PYTHONPATH', '--dry-run', 'workmcp token list',
+                   'workmcp-deploy', '다시 폐기'):
+        assert needle in guide or needle.replace('workmcp token list', 'wm token list') in guide, needle
+    assert 'survey-before-' in guide and 'Motive_work_synthetic' in guide
+    assert 'git에 넣지 않는다' in guide

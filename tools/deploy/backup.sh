@@ -35,7 +35,7 @@ mkdir -p "$DEST" || exit 2
 TMP="$TARGET.partial"
 rm -f "$TMP"
 
-"$PY" -I - "$DB" "$TMP" <<'PY'
+"$PY" -B -I - "$DB" "$TMP" <<'PY'
 import sqlite3
 import sys
 
