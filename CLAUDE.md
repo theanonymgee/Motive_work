@@ -9,7 +9,7 @@
 - Company data never goes into git, fixtures, docs or logs. Use synthetic/public documents for development and tests.
 - Never modify the user's source files. Every returned snippet/fact carries an exact source locator.
 - No admin rights assumed. Model download only through the explicit download module or an offline bundle.
-- Secrets only in git-ignored `.env`.
+- Secrets only outside the repository (server keeps token hashes; push token in the data home or env; MCP token in the client config or env).
 
 ## Commands
 
