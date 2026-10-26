@@ -23,8 +23,15 @@ parsers or the binding check, so it cannot read an original file. Its log ``<hom
 and the report hold paths, short hashes and counts, never unit text or the token.
 
 Exit codes: 0 done (up to date included), 1 a batch or document refused or a step failed, 2 data home refused,
-4 settings, arguments, no token or a server of another schema/chunk version, 6 server unreachable after the
-retries. (Not named ``run``: the network boundary test reserves ``run(...)`` for the MCP transports.)
+3 another push of this data home is running (``push.lock``), 4 settings, arguments, no token or a server of
+another schema/chunk version, 6 server unreachable after the retries, 7 the server's TLS certificate did not
+verify (not retried).
+
+A rebuilt or restored store (review M5 remote v1 M-1) needs nothing special: the server matches documents by
+path and versions by content, the local ids it no longer finds here are sent as ``forget``, and when the
+event history differs from the server's (``events_sha256``) all events are sent again with ``events_reset``.
+
+(Not named ``run``: the network boundary test reserves ``run(...)`` for the MCP transports.)
 """
 from __future__ import annotations
 
@@ -42,7 +49,9 @@ from . import chunks, config, paths, store, sync
 
 LOG = logging.getLogger('workmcp.push')
 LOG_FORMAT = '%(asctime)s | %(message)s'
-EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_USAGE, EXIT_UNREACHABLE = 0, 1, 2, 4, 6
+EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_LOCKED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_TLS = 0, 1, 2, 3, 4, 6, 7
+PUSH_LOCK = 'push.lock'                    # one push at a time per data home (store.acquire_lock)
+CERTIFICATE_ERRORS = ('SSLCertVerificationError',)   # by class name: this module does not import ssl
 RETRY_DELAYS = (1, 2, 4, 8, 16)            # seconds before each resend of the same batch
 REQUEST_TIMEOUT_SECONDS = 300
 CLIENT_VERSION = '0.0.1'
@@ -52,7 +61,8 @@ REPORT_KEYS = ('exit_code', 'push_id', 'url', 'collector', 'started_at', 'up_to_
                'batches', 'bytes_sent', 'state_requests', 'refused', 'retries', 'elapsed', 'log', 'server',
                'converged', 'error')
 STATE_COUNT_KEYS = ('documents_changed', 'added', 'changed', 'deleted', 'restored', 'reparsed', 'vectors_missing')
-SENT_KEYS = ('documents', 'versions', 'units', 'chars', 'vectors', 'vector_bytes', 'events', 'copied_versions')
+SENT_KEYS = ('documents', 'versions', 'units', 'chars', 'vectors', 'vector_bytes', 'events', 'copied_versions',
+             'forgotten')
 SERVER_KEYS = ('documents_sha256', 'vectors_sha256', 'vectors_missing')
 REFUSED_KEYS = ('path', 'code')
 
@@ -99,6 +109,10 @@ class Unreachable(Exception):
     exception class name only."""
 
 
+class CertificateFailed(Exception):
+    """The server's TLS certificate did not verify (never retried: the same certificate fails again)."""
+
+
 class Stop(Exception):
     """The run ends here: ``exit_code`` and one line for the report (codes and counts, no text)."""
 
@@ -132,6 +146,9 @@ def http_transport(token: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> T
             with exc:
                 return exc.code, exc.read()
         except (urllib.error.URLError, OSError, ValueError) as exc:   # TimeoutError, ConnectionError are OSError
+            reason = getattr(exc, 'reason', None)
+            if CERTIFICATE_ERRORS[0] in (type(exc).__name__, type(reason).__name__):
+                raise CertificateFailed(type(reason or exc).__name__) from None
             raise Unreachable(type(exc).__name__) from None
         finally:
             urllib.request.install_opener(None)
@@ -178,6 +195,10 @@ class _Run:
                 self.report['bytes_sent'] += len(data)
             try:
                 status, raw = self.send(method, url, data)
+            except CertificateFailed:
+                host = sync.parse_url(self.url).host
+                raise Stop(EXIT_TLS, f'TLS certificate verification failed for {host} (not retried): check the '
+                                     'server name in [push] url, or set SSL_CERT_FILE to the CA that signed it') from None
             except Unreachable as exc:
                 reason = f'server unreachable ({exc})'
                 continue
@@ -279,7 +300,7 @@ def _kind_of_change(local: dict, remote: dict | None) -> str:
         return 'deleted'
     if local['status'] == 'active' and remote['status'] in ('deleted', 'skipped'):
         return 'restored'
-    if local['seq'] == remote['seq'] and local['sha256'] == remote['sha256']:
+    if local['sha256'] == remote['sha256'] and local['superseded'] == remote['superseded']:
         return 'reparsed'
     return 'changed'
 
@@ -323,6 +344,11 @@ def execute(home: Path, settings: config.Config, token: str, options: Options, *
     report = new_report(url)
     report['dry_run'] = options.dry_run
     paths.ensure_home(home)
+    try:
+        lock, _ = store.acquire_lock(home, PUSH_LOCK)
+    except store.Locked as exc:
+        report.update(exit_code=EXIT_LOCKED, error=str(exc), elapsed=round(time.monotonic() - begin, 3))
+        return report
     logger, handler, log_file = _file_logger(home)
     report['log'] = str(log_file)
     run = _Run(url, transport or http_transport(token), sleep, logger, report,
@@ -349,6 +375,7 @@ def execute(home: Path, settings: config.Config, token: str, options: Options, *
                     f"bytes {report['bytes_sent']}")
         logger.removeHandler(handler)
         handler.close()
+        store.release_lock(lock)
     if report['exit_code'] == EXIT_OK and report['refused']:
         report['exit_code'] = EXIT_FAILED
     return report
@@ -363,7 +390,15 @@ def _push(db, run: _Run, options: Options) -> None:
         raise Stop(EXIT_USAGE, f"server schema {state['schema_version']} / chunks {state['chunk_version']}, this "
                                f'collector {store.SCHEMA_VERSION} / {chunks.CHUNK_VERSION}: update the server first')
     mine = sync.summary(db, model_key)
-    if all(state[key] == mine[key] for key in sync.SUMMARY_KEYS) and state['events_count'] == sync.event_count(db):
+    # events: the same set (nothing to send), a prefix the server has (send the rest), or another history
+    # (a rebuilt or restored store: the server maps them all again)
+    if state['events_sha256'] == sync.events_sha256(db):
+        events_after, events_reset = None, False
+    elif state['events_sha256'] == sync.events_sha256(db, upto=state['events_max']):
+        events_after, events_reset = state['events_max'], False
+    else:
+        events_after, events_reset = 0, True
+    if all(state[key] == mine[key] for key in sync.SUMMARY_KEYS) and events_after is None:
         report['up_to_date'] = report['converged'] = True
         report['server'] = {**mine, 'vectors_missing': None}
         logger.info(f'up to date | {run.url} | {run.collector}')
@@ -393,7 +428,8 @@ def _push(db, run: _Run, options: Options) -> None:
              for root_id, path, enabled in db.execute('SELECT id, path, enabled FROM source_roots ORDER BY id')]
     begun = run.post('begin', [{'roots': roots, 'counts_expected': {'documents': len(changed)},
                                 'started_at': datetime.now().astimezone().isoformat(timespec='microseconds'),
-                                'model_key': model_key}])
+                                'nonce': os.urandom(8).hex(), 'model_key': model_key,
+                                'events_reset': events_reset}])
     run.push_id = report['push_id'] = begun['push_id']
     logger.info(f'start | push #{run.push_id} | {run.url} | {run.collector} | documents changed {len(changed)}')
 
@@ -427,6 +463,13 @@ def _push(db, run: _Run, options: Options) -> None:
                 report['sent']['copied_versions'] += 1
                 logger.info(f"copied | {path} | {version['sha256'][:12]} | units {version['unit_count']} "
                             '| on the server, nothing sent')
+    # documents the server maps to local ids this store no longer has (a rebuilt or restored store)
+    local_ids = {row[0] for row in db.execute('SELECT id FROM documents')}
+    stale = [{'local_document_id': local} for local in sorted(set(remote) - local_ids)]
+    for batch in _batches(stale, count=sync.EVENTS_PER_BATCH):
+        report['sent']['forgotten'] += run.post('forget', batch)['forgotten']
+    if stale:
+        logger.info(f"forgotten | {report['sent']['forgotten']} documents this store no longer has")
     _send_units(db, run, need, versions_by_local)
 
     # vectors the server lacks and this store has
@@ -449,13 +492,10 @@ def _push(db, run: _Run, options: Options) -> None:
         if vectors:
             logger.info(f"vectors | {report['sent']['vectors']}")
 
-    # document events: those at or after the server's latest, and every event of the documents sent now
-    known = set(remote) | sent_docs
-    events = [{'local_document_id': doc, 'local_version_id': version, 'kind': kind, 'at': at}
-              for doc, version, kind, at, recent in db.execute(
-                  'SELECT document_id, version_id, kind, at, (? IS NULL OR julianday(at) >= julianday(?)) '
-                  'FROM document_events ORDER BY id', (state['events_after'], state['events_after']))
-              if doc in sent_docs or (recent and doc in known)]
+    # document events after the prefix the server has (all of them after a reset), by this store's event ids
+    events = [] if events_after is None else [
+        {'local_event_id': event_id, 'local_document_id': doc, 'local_version_id': version, 'kind': kind, 'at': at}
+        for event_id, doc, version, kind, at in sync.event_rows(db, after=events_after)]
     for batch in _batches(events, count=sync.EVENTS_PER_BATCH):
         if run.over_budget():
             break
@@ -537,7 +577,8 @@ def report_lines(report: dict) -> list[str]:
     if not report['dry_run']:
         lines.append(f"  sent: documents {s['documents']}  versions {s['versions']}  units {s['units']:,} "
                      f"({s['chars']:,} chars)  vectors {s['vectors']} ({s['vector_bytes'] // 1024:,} KB)  "
-                     f"events {s['events']}  copied on the server {s['copied_versions']}")
+                     f"events {s['events']}  copied on the server {s['copied_versions']}"
+                     + (f"  forgotten {s['forgotten']}" if s['forgotten'] else ''))
     lines.append(f"  batches {report['batches']}  bytes sent {report['bytes_sent']:,} (gzip)  refused "
                  f"{len(report['refused'])}  retries {report['retries']}  {report['elapsed']}s   log: {report['log']}")
     lines += [f"  refused: {entry['path']} : {entry['code']}" for entry in report['refused']]

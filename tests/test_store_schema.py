@@ -17,7 +17,7 @@ from workmcp import paths, store, tools
 TABLES = {'schema_migrations', 'source_roots', 'documents', 'versions', 'units', 'chunks', 'chunk_vectors',
           'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans', 'meta', 'index_runs',
           'tool_calls', 'document_events', 'assertion_events', 'collectors', 'tokens', 'pushes', 'push_batches',
-          'push_parts', 'collector_documents', 'collector_versions'}
+          'push_parts', 'collector_documents', 'collector_versions', 'collector_events'}
 TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_status_guard', 'assertions_no_delete',
             'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace',
             'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq',
@@ -1154,7 +1154,7 @@ CHECKSUMS = {1: '8af56d4806389a3c203106e716761371491aec393673bb8d5b52164c5858fee
              2: '4f4a3f6ca60a895ec9f4080123af85936df83caf63ffb07123b437dc158d1c0b',
              3: '8a5fb855fa097a080861523499f83f6a8ba0ae862a1fa08f8217e971d15c6592',
              4: '548f45f16d520dbfea0b3ccf4f8f0ffbbd1e55e78322c823865c0311bcd99bc0',
-             5: '31c6f2f87383b1b39a0c1d0fa1b52ac3dd7af15dfe91eef2fca57668d9074a8c'}
+             5: 'd5abc536868a67923c34e260ea37c9a6c7e972390f03a5774fd49983537c4f9f'}  # v5 edited before any server DB (review M5 remote v1 M-1)
 
 
 def test_migration_checksums_are_pinned():

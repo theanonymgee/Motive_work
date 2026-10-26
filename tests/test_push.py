@@ -550,6 +550,286 @@ def test_http_transport_sends_the_token_unredirected_without_proxy(monkeypatch):
     assert urllib.request._opener is None                                  # installed for that request only
 
 
+# ---- a rebuilt, restored or taken-over collector store converges (review M5 remote v1 M-1) -----------------
+
+def cite(server: Server, suffix: str) -> tuple[int, dict, str]:
+    """A decision on the server citing line 1 of the current version of the document ending in ``suffix``."""
+    doc_id, path, version_id, sha = server.db.execute(
+        'SELECT d.id, d.path, v.id, v.sha256 FROM documents d JOIN versions v ON v.document_id = d.id '
+        'WHERE d.path_key LIKE ? AND v.superseded_at IS NULL', (f'%{suffix}',)).fetchone()
+    unit_json, text = server.db.execute('SELECT locator_json, text FROM units WHERE version_id=? AND ordinal=1',
+                                        (version_id,)).fetchone()
+    obj, quote = locator.make(doc_id, path, sha, json.loads(unit_json), text, [0, 10]), text[:10]
+    assertion = server.db.execute(
+        "INSERT INTO assertions(kind, statement, recorded_from, status, source_kind, recorded_by) "
+        "VALUES('decision', '합성 결정', '2026-01-01T09:00:00+09:00', 'active', 'evidence', 'test')").lastrowid
+    server.db.execute('INSERT INTO evidence(assertion_id, version_id, chunk_id, locator_json, quote, quote_sha256) '
+                      'VALUES(?, ?, NULL, ?, ?, ?)', (assertion, version_id, json.dumps(obj, ensure_ascii=False),
+                                                      quote, binding._sha(quote)))
+    return version_id, obj, quote
+
+
+def source_state(server: Server, version_id: int, obj: dict, quote: str) -> str:
+    status, superseded = server.db.execute('SELECT d.status, v.superseded_at FROM versions v JOIN documents d ON '
+                                           'd.id = v.document_id WHERE v.id = ?', (version_id,)).fetchone()
+    return knowledge_query.source_state(status, superseded,
+                                        knowledge_query.still_matches(server.db, version_id, obj, quote))
+
+
+def converges(col: Collector, server: Server, collector: dict) -> dict:
+    """One push that converges with nothing refused, then a second that sends nothing."""
+    report = col.push(server, collector)
+    assert report['exit_code'] == 0 and report['converged'] and report['refused'] == [], report
+    second = col.push(server, collector)
+    assert second['up_to_date'] and (second['batches'], second['bytes_sent']) == (0, 0), second
+    assert sync.summary(server.db, col.key, collector_id=collector['id']) == sync.summary(col.db, col.key)
+    assert sync.document_summaries(server.db, collector_id=collector['id']) == sync.document_summaries(col.db)
+    assert sync.events_sha256(server.db, collector_id=collector['id']) == sync.events_sha256(col.db)
+    assert binding.verify(server.db, stored_only=True)['ok']
+    return report
+
+
+def served_paths(server: Server, status: str = 'active') -> set[str]:
+    return {row[0] for row in server.db.execute('SELECT path_key FROM documents WHERE status = ?', (status,))}
+
+
+def test_a_rebuilt_collector_store_converges_and_keeps_the_sources(pair, tmp_path):
+    col, server, collector = pair
+    rewrite(col.src/CHANGED, other_docx())                     # some history before the rebuild
+    (col.src/DELETED).unlink()
+    col.collect()
+    converges(col, server, collector)
+    cited = cite(server, 'notes_utf8.txt')
+    documents, versions = server.count('documents'), server.count('versions')
+    active = served_paths(server)
+    # the collector's home is lost: a new store scans the same root, pushes with the same collector (token)
+    fresh = Collector(tmp_path, 'rebuilt', src=col.src)
+    try:
+        fresh.collect()
+        assert fresh.count('documents') == col.count('documents') - 1    # the deleted file is not seen again
+        report = converges(fresh, server, collector)
+        assert report['sent']['units'] == 0                     # nothing to re-send but ids and events
+        assert server.count('documents') == documents and server.count('versions') == versions
+        assert served_paths(server) == active                                     # same documents served
+        assert source_state(server, *cited) == 'current'                          # the decision's source holds
+        doc = server.db.execute("SELECT status FROM documents WHERE path_key LIKE ?", (f'%{DELETED.split("/")[-1]}',))
+        assert doc.fetchone() == ('deleted',)
+        # and it keeps converging as files change
+        rewrite(fresh.src/'docs/notes_utf8.txt', '합성 재구성 뒤 변경\n'.encode('utf-8'))
+        fresh.collect()
+        converges(fresh, server, collector)
+        assert source_state(server, *cited) == 'changed'
+    finally:
+        fresh.close()
+
+
+def test_a_store_restored_from_an_old_backup_converges(pair, tmp_path):
+    import sqlite3
+    col, server, collector = pair
+    col.push(server, collector)
+    backup = sqlite3.connect(tmp_path/'backup.sqlite3')
+    col.db.backup(backup)
+    # after the backup: a change, a deletion and a new file, all pushed
+    rewrite(col.src/CHANGED, other_docx())
+    (col.src/DELETED).unlink()
+    (col.src/'docs'/'새 파일.txt').write_text('\n'.join(LINES_KO[:2]), encoding='utf-8')
+    col.collect()
+    converges(col, server, collector)
+    cited = cite(server, 'report.docx')
+    # the store goes back to the backup (rowids of the later rows are given again), first pushed as it is ...
+    col.db.close()
+    target = sqlite3.connect(paths_module.db_path(col.home))
+    backup.backup(target)
+    target.close()
+    backup.close()
+    col.db = store.open_home(col.home)
+    converges(col, server, collector)
+    assert served_paths(server) == {row[0] for row in col.db.execute(
+        "SELECT path_key FROM documents WHERE status = 'active'")}
+    # ... then scanned again: the files on disk are the truth again
+    col.collect()
+    converges(col, server, collector)
+    # the report the decision cited is that content again, in a newer server version: changed, with a requote
+    version_id, obj, quote = cited
+    assert source_state(server, *cited) == 'changed'
+    assert knowledge_query.requote(server.db, obj['doc'], obj['path'], obj, quote)['found']
+    assert binding.verify(col.db)['ok']
+
+
+def test_a_retired_collectors_root_is_taken_over_by_a_new_collector(pair, tmp_path):
+    from workmcp import remote
+    col, server, collector = pair
+    converges(col, server, collector)
+    cited = cite(server, 'notes_utf8.txt')
+    documents = server.count('documents')
+    successor = server.collector('합성-후임')
+    fresh = Collector(tmp_path, 'successor', src=col.src)
+    try:
+        fresh.collect()
+        # while the first collector is live, its root (in any spelling) is refused to another
+        refused_ = fresh.push(server, successor)
+        assert refused_['exit_code'] == push.EXIT_FAILED and 'root_owned_by_other_collector' in refused_['error']
+        remote.retire_collector(server.db, collector['name'])
+        report = converges(fresh, server, successor)
+        assert report['sent']['units'] == 0                     # the server has every unit already
+        assert server.count('documents') == documents
+        assert source_state(server, *cited) == 'current'
+        owners = {row[0] for row in server.db.execute('SELECT collector_id FROM source_roots')}
+        assert owners == {successor['id']}
+        assert server.db.execute('SELECT COUNT(*) FROM collector_documents WHERE collector_id = ?',
+                                 (collector['id'],)).fetchone()[0] == 0
+    finally:
+        fresh.close()
+
+
+def test_root_spelling_and_nesting_do_not_get_around_ownership(tmp_path):
+    server = Server(tmp_path)
+    first, second = server.collector('합성-하나'), server.collector('합성-둘')
+    a = Collector(tmp_path, 'pc-a')
+    (a.src/'notes.txt').write_text('\n'.join(LINES_KO), encoding='utf-8')
+    a.collect()
+    try:
+        assert a.push(server, first)['converged']
+        root = a.db.execute('SELECT path FROM source_roots').fetchone()[0]
+        for path in (root.upper(), root.replace('\\', '/'), root + '\\sub', str(Path(root).parent)):
+            begin = sync.envelope('begin', [{'roots': [{'local_root_id': 1, 'path': path, 'enabled': 1}],
+                                             'started_at': store.now()}], collector=second['name'], push_id=None,
+                                  client_version='0')
+            answer = receive.apply(server.db, second, begin, raw_bytes=1)
+            assert answer['error']['code'] == 'root_owned_by_other_collector', path
+        assert server.count('source_roots') == 1
+    finally:
+        a.close()
+        server.close()
+
+
+def test_one_push_per_data_home_and_tls_failures_are_not_retried(pair, monkeypatch):
+    col, server, collector = pair
+    lock, _ = store.acquire_lock(col.home, push.PUSH_LOCK)
+    try:
+        locked = col.push(server, collector)
+        assert locked['exit_code'] == push.EXIT_LOCKED == 3 and 'another push is running' in locked['error']
+        assert server.requests == []
+    finally:
+        store.release_lock(lock)
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    def refuse(request, timeout):
+        raise urllib.error.URLError(ssl.SSLCertVerificationError(1, 'certificate verify failed'))
+    monkeypatch.setattr(urllib.request, 'urlopen', refuse)
+    report = push.execute(col.home, settings(), TOKEN, push.Options(), sleep=col.sleeps.append)
+    assert report['exit_code'] == push.EXIT_TLS == 7 and report['retries'] == 0 and col.sleeps == []
+    assert 'TLS certificate verification failed for srv.example.invalid' in report['error']
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda request, timeout: (_ for _ in ()).throw(
+        urllib.error.URLError(ConnectionRefusedError())))
+    assert push.execute(col.home, settings(), TOKEN, push.Options(), sleep=col.sleeps.append)['exit_code'] == \
+        push.EXIT_UNREACHABLE
+
+
+# ---- a large version is applied part by part (review M5 remote v1 M-2) ---------------------------------------
+
+def big_text(chars: int) -> str:
+    line = '합성 대량 문장이 길게 이어진다, synthetic bulk line for the part test. ' * 2
+    lines, total, n = [], 0, 0
+    while total < chars:
+        text = f'{n:07d} {line}'
+        lines.append(text)
+        total += len(text) + 1
+        n += 1
+    return '\n'.join(lines)
+
+
+def test_a_split_version_is_applied_part_by_part_with_a_bounded_python_peak(tmp_path):
+    """8 M characters in parts: every part is its own short transaction (chunks and FTS rows grow part by part),
+    nothing waits in ``push_parts`` but a continuing unit, and the Python allocation peak of applying one part
+    stays near one batch (tracemalloc over ``receive.apply``; SQLite's own cache is outside it)."""
+    import tracemalloc
+    server = Server(tmp_path)
+    collector = server.collector('합성-큰문서')
+    col = Collector(tmp_path)
+    (col.src/'big.txt').write_text(big_text(8_300_000), encoding='utf-8')
+    col.collect()
+    peaks, chunk_counts, waiting = [], [], []
+    real_apply = receive.apply
+
+    def measured(db, owner, body, **kwargs):
+        tracemalloc.start()
+        try:
+            return real_apply(db, owner, body, **kwargs)
+        finally:
+            peaks.append((body['kind'], tracemalloc.get_traced_memory()[1]))
+            tracemalloc.stop()
+            chunk_counts.append(db.execute('SELECT COUNT(*) FROM chunks').fetchone()[0])
+            waiting.append(db.execute('SELECT COALESCE(SUM(LENGTH(body_json)), 0) FROM push_parts').fetchone()[0])
+    receive.apply = measured
+    try:
+        report = col.push(server, collector)
+    finally:
+        receive.apply = real_apply
+    try:
+        assert report['exit_code'] == 0 and report['converged'], report
+        units_batches = [i for i, (kind, _) in enumerate(peaks) if kind == 'units']
+        assert len(units_batches) >= 4
+        counts = [chunk_counts[i] for i in units_batches]
+        assert counts == sorted(counts) and counts[0] > 0         # chunks are built as the parts come
+        assert max(peak for kind, peak in peaks if kind == 'units') < 48 * 2**20
+        assert max(waiting) < 2**20 and server.count('push_parts') == 0
+        mirrored(col, server, collector)
+    finally:
+        col.close()
+        server.close()
+
+
+def test_unfinished_and_out_of_order_parts_are_cleared(tmp_path):
+    server = Server(tmp_path)
+    collector = server.collector('합성-중단')
+    col = Collector(tmp_path)
+    (col.src/'big.txt').write_text(big_text(5_000_000), encoding='utf-8')
+    col.collect()
+    sent = []
+
+    def stop_after_two_parts(method, name, body, call):
+        if body is not None and body['kind'] == 'units':
+            sent.append(body)
+            if len(sent) >= 3:
+                raise push.Unreachable('ConnectionResetError')
+        return call()
+    server.hook = stop_after_two_parts
+    try:
+        assert col.push(server, collector)['exit_code'] == push.EXIT_UNREACHABLE
+        assert server.count('units') > 0 and server.count('push_parts') >= 1      # two parts applied
+        server.hook = None
+        # a part out of order, and the first part of a second split version while one is open, are refused
+        push_id = server.db.execute("SELECT id FROM pushes WHERE status = 'running'").fetchone()[0]
+        item = sent[1]['items'][0]
+        skipped = sync.envelope('units', [{**item, 'part': item['part'] + 2}], collector=collector['name'],
+                                push_id=push_id, client_version='0')
+        assert receive.apply(server.db, collector, skipped, raw_bytes=1)['error']['code'] == 'bad_batch'
+        # the next push aborts the old one, removes its partial version and converges
+        report = col.push(server, collector)
+        assert report['exit_code'] == 0 and report['converged']
+        assert server.count('push_parts') == 0
+        mirrored(col, server, collector)
+        # an end with a split version still open removes it too
+        rewrite(col.src/'big.txt', big_text(4_000_000).encode('utf-8'))
+        col.collect()
+        server.hook = lambda method, name, body, call: (200, json.dumps(sync.ok(
+            {'versions': [], 'vectors_missing': []})).encode()) if body and body['kind'] == 'units' and \
+            body['items'][0]['part'] > 1 else call()
+        partial = col.push(server, collector)
+        assert server.count('push_parts') == 0 and not partial['converged']
+        version = server.db.execute('SELECT id FROM versions WHERE superseded_at IS NULL').fetchone()[0]
+        assert server.db.execute('SELECT COUNT(*) FROM units WHERE version_id = ?', (version,)).fetchone()[0] == 0
+        server.hook = None
+        assert col.push(server, collector)['converged']
+        mirrored(col, server, collector)
+    finally:
+        col.close()
+        server.close()
+
+
 # ---- runtime audit (design §6.3) ---------------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):

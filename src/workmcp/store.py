@@ -301,8 +301,10 @@ CREATE INDEX units_locator ON units(version_id, locator_json);
 # two unique keys (id, token_sha256) are guarded against REPLACE like versions. ``source_roots.collector_id``
 # names the collector that owns a root on the server (NULL on a collector or a local home). ``pushes`` is one
 # row per push run (with its server ``scans`` row), ``push_batches`` the idempotency record per batch id,
-# ``push_parts`` the parts of a split version until the last one arrives; ``collector_documents`` and
-# ``collector_versions`` map a collector's own rowids to the server's.
+# ``push_parts`` the progress of a split version being applied part by part (row ``part`` 0: its state; other
+# rows: the text pieces of a unit that continues into the next part); ``collector_documents``,
+# ``collector_versions`` and ``collector_events`` map a collector's own rowids to the server's (they are
+# re-pointed when a collector store is rebuilt; the server rows themselves stay).
 SCHEMA_V5 = """
 CREATE TABLE collectors(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL, last_push_at TEXT, retired_at TEXT, note TEXT);
@@ -345,6 +347,9 @@ CREATE TABLE collector_versions(collector_id INTEGER NOT NULL REFERENCES collect
   local_version_id INTEGER NOT NULL, version_id INTEGER NOT NULL UNIQUE REFERENCES versions(id),
   units_sha256 TEXT,
   PRIMARY KEY(collector_id, local_version_id));
+CREATE TABLE collector_events(collector_id INTEGER NOT NULL REFERENCES collectors(id),
+  local_event_id INTEGER NOT NULL, event_id INTEGER NOT NULL REFERENCES document_events(id),
+  PRIMARY KEY(collector_id, local_event_id));
 """
 
 # (version, name, sql). Never edit an applied entry; append a new one.
@@ -676,7 +681,7 @@ def take_chunk_ids(db: sqlite3.Connection, count: int) -> int:
 
 
 def insert_chunks(db: sqlite3.Connection, version_id: int, chunk_version: str, specs=(), *,
-                  copy_from: int | None = None) -> int:
+                  copy_from: int | None = None, append: bool = False) -> int:
     """Store the chunks of one version under ``chunk_version`` and add them to ``chunks_fts``.
 
     ``specs``: objects with ``ordinal, unit_first, unit_last, char_start, char_end, text``
@@ -684,31 +689,44 @@ def insert_chunks(db: sqlite3.Connection, version_id: int, chunk_version: str, s
     ``chunk_version`` rows are copied (same sha256 and parser version, design M2 §4.1 step 2), in
     which case ``specs`` must be empty. The version must have no rows under ``chunk_version`` yet.
     Returns the number of rows stored. No transaction control: the caller commits.
+    ``append``: the version may already hold rows of ``chunk_version`` (the operating server builds a split
+    version's chunks part by part; the specs continue its ordinals). A copy is done in SQL, so a large version
+    is never held in memory.
     """
-    if db.execute('SELECT 1 FROM chunks WHERE version_id=? AND chunk_version=? LIMIT 1',
-                  (version_id, chunk_version)).fetchone():
+    if not append and db.execute('SELECT 1 FROM chunks WHERE version_id=? AND chunk_version=? LIMIT 1',
+                                 (version_id, chunk_version)).fetchone():
         raise ValueError(f'version {version_id} already has chunks of {chunk_version}')
+    first_new = None
     if copy_from is not None:
         if specs:
             raise ValueError('pass specs or copy_from, not both')
-        rows = db.execute('SELECT ordinal, unit_first, unit_last, char_start, char_end, text, text_sha256 FROM chunks '
-                          'WHERE version_id=? AND chunk_version=? ORDER BY ordinal',
-                          (copy_from, chunk_version)).fetchall()
+        count = db.execute('SELECT COUNT(*) FROM chunks WHERE version_id=? AND chunk_version=?',
+                           (copy_from, chunk_version)).fetchone()[0]
+        stored = 0
+        if count:
+            first_new = take_chunk_ids(db, count)
+            stored = db.execute(
+                'INSERT INTO chunks(id, version_id, chunk_version, ordinal, unit_first, unit_last, char_start, '
+                'char_end, text, text_sha256) SELECT ? + ROW_NUMBER() OVER (ORDER BY ordinal) - 1, ?, chunk_version, '
+                'ordinal, unit_first, unit_last, char_start, char_end, text, text_sha256 FROM chunks '
+                'WHERE version_id=? AND chunk_version=? ORDER BY ordinal',
+                (first_new, version_id, copy_from, chunk_version)).rowcount
     else:
         rows = [(spec.ordinal, spec.unit_first, spec.unit_last, spec.char_start, spec.char_end, spec.text,
                  hashlib.sha256(spec.text.encode('utf-8')).hexdigest()) for spec in specs]
-    sql = ('INSERT INTO chunks(id, version_id, chunk_version, ordinal, unit_first, unit_last, char_start, char_end, '
-           'text, text_sha256) VALUES(?,?,?,?,?,?,?,?,?,?)')
-    stored = 0
-    for at in range(0, len(rows), CHUNK_INSERT_BATCH):
-        part = rows[at:at + CHUNK_INSERT_BATCH]
-        first = take_chunk_ids(db, len(part))
-        db.executemany(sql, [(first + n, version_id, chunk_version, *row) for n, row in enumerate(part)])
-        stored += len(part)
+        sql = ('INSERT INTO chunks(id, version_id, chunk_version, ordinal, unit_first, unit_last, char_start, '
+               'char_end, text, text_sha256) VALUES(?,?,?,?,?,?,?,?,?,?)')
+        stored = 0
+        for at in range(0, len(rows), CHUNK_INSERT_BATCH):
+            part = rows[at:at + CHUNK_INSERT_BATCH]
+            first = take_chunk_ids(db, len(part))
+            first_new = first if first_new is None else first_new
+            db.executemany(sql, [(first + n, version_id, chunk_version, *row) for n, row in enumerate(part)])
+            stored += len(part)
     if stored:
         if fts_in_step(db):
             db.execute('INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks '
-                       'WHERE version_id=? AND chunk_version=?', (version_id, chunk_version))
+                       'WHERE version_id=? AND chunk_version=? AND id >= ?', (version_id, chunk_version, first_new))
         else:
             fts_mark_unsynced(db)
         bump_data_generation(db)

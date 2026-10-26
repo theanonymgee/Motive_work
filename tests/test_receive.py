@@ -107,9 +107,12 @@ def test_one_push_by_hand_mirrors_units_and_rebuilds_chunks(server):
     assert stored == {'stored': 1, 'ignored': 1, 'invalid': 2}
     assert store.meta_get(server.db, 'index_generation') == '1'
     events = ok(server, collector, 'events', [
-        {'local_document_id': 1, 'local_version_id': 11, 'kind': 'added', 'at': '2026-10-26T09:00:00+09:00'},
-        {'local_document_id': 1, 'local_version_id': 11, 'kind': 'added', 'at': '2026-10-26T09:00:00+09:00'},
-        {'local_document_id': 9, 'local_version_id': None, 'kind': 'deleted', 'at': '2026-10-26T09:00:00+09:00'}],
+        {'local_event_id': 1, 'local_document_id': 1, 'local_version_id': 11, 'kind': 'added',
+         'at': '2026-10-26T09:00:00+09:00'},
+        {'local_event_id': 1, 'local_document_id': 1, 'local_version_id': 11, 'kind': 'added',
+         'at': '2026-10-26T09:00:00+09:00'},
+        {'local_event_id': 2, 'local_document_id': 9, 'local_version_id': None, 'kind': 'deleted',
+         'at': '2026-10-26T09:00:00+09:00'}],
         push_id)
     assert events == {'stored': 1, 'ignored': 2}
     end = ok(server, collector, 'end', [{'counts': {'documents': 1, 'units': 5, 'vectors': 1}, 'bytes_sent': 50}],
@@ -121,7 +124,7 @@ def test_one_push_by_hand_mirrors_units_and_rebuilds_chunks(server):
     assert server.db.execute('SELECT batches, bytes_in, status FROM pushes').fetchone() == (6, 60, 'done')
     assert store.fts_status(server.db)['consistent']
     state = receive.state(server.db, collector, model_key=H)
-    assert tuple(state) == sync.STATE_KEYS and state['events_count'] == 1 and state['model_keys'] == [H]
+    assert tuple(state) == sync.STATE_KEYS and state['events_max'] == 1 and state['model_keys'] == [H]
     assert {k: state[k] for k in sync.SUMMARY_KEYS} == {k: end[k] for k in sync.SUMMARY_KEYS}
     page = receive.state_page(server.db, collector)
     assert tuple(page) == sync.STATE_PAGE_KEYS and page['next_after'] is None
@@ -141,7 +144,7 @@ def test_batch_is_one_transaction_and_refuses_bad_hashes(server):
             'bad_units_hash')
     refused(server, collector, 'units', [units_item(units_sha256='e' * 64)], push_id, 'bad_units_hash')
     other = [dict(UNITS[0], kind='paragraph'), *UNITS[1:]]
-    refused(server, collector, 'units', [units_item(units=other)], push_id, 'bad_units_hash')
+    refused(server, collector, 'units', [units_item(units=other)], push_id, 'bad_batch')     # kind != locator's
     refused(server, collector, 'units', [units_item(local=99)], push_id, 'version_not_awaiting_units')
     # a good item and a bad one in the same batch: neither is applied
     refused(server, collector, 'units', [units_item(), units_item(local=99)], push_id, 'version_not_awaiting_units')
@@ -192,24 +195,39 @@ def test_a_batch_sent_again_answers_the_stored_response_and_applies_nothing(serv
     assert server.db.execute("SELECT status FROM scans ORDER BY id").fetchall() == [('aborted',), ('running',)]
 
 
-def test_a_document_whose_versions_disagree_is_refused_alone(server):
+def server_versions(server, doc_id):
+    return server.db.execute('SELECT seq, sha256, superseded_at IS NOT NULL FROM versions WHERE document_id = ? '
+                             'ORDER BY seq', (doc_id,)).fetchall()
+
+
+def test_versions_are_matched_by_content_and_the_server_keeps_its_history(server):
+    """Review M5 v1 M-1: a version is matched within its document by content, never refused for an observation
+    the server already holds; what the collector no longer has stays on the server as superseded history."""
     collector = server.collector('합성')
     push_id = begun(server, collector)
     ok(server, collector, 'documents', [document(), document(local=2, path='C:\\synthetic\\b.txt',
                                                              versions=[version(local=21)])], push_id)
-    changed = document(versions=[version(digest='f' * 64)])            # an observed sha256 never changes
-    result = ok(server, collector, 'documents', [changed, document(local=2, path='C:\\synthetic\\b.txt',
-                                                                   status='deleted', deleted_at=store.now(),
-                                                                   versions=[version(local=21)])], push_id)
-    assert result['refused'] == [{'local_document_id': 1, 'code': 'version_identity_conflict'}]
-    assert set(result['documents']) == {'2'}
-    assert server.db.execute('SELECT sha256 FROM versions WHERE id=1').fetchone() == ('a' * 64,)
+    # the same local version id now holds other content (a rebuilt store): a new server version, the old kept
+    result = ok(server, collector, 'documents', [document(versions=[version(digest='f' * 64)]),
+                                                 document(local=2, path='C:\\synthetic\\b.txt', status='deleted',
+                                                          deleted_at=store.now(), versions=[version(local=21)])],
+                push_id)
+    assert result['refused'] == [] and result['versions']['11'] == {'id': 3, 'units': 'need'}
+    assert server_versions(server, 1) == [(1, 'a' * 64, 1), (2, 'f' * 64, 0)]
     assert server.db.execute('SELECT status FROM documents WHERE id=2').fetchone() == ('deleted',)
-    superseded = document(versions=[version(superseded_at='2026-10-26T10:00:00+09:00'),
-                                    version(local=12, seq=2, digest='b' * 64)])
-    ok(server, collector, 'documents', [superseded], push_id)
-    back = document(versions=[version(superseded_at=None), version(local=12, seq=2, digest='b' * 64)])
-    assert ok(server, collector, 'documents', [back], push_id)['refused'][0]['code'] == 'version_identity_conflict'
+    summary = sync.document_summaries(server.db, collector_id=collector['id'])[0]
+    assert (summary['sha256'], summary['superseded']) == ('f' * 64, 0)    # only mapped versions count
+    # an older store (restored) whose current version the server had superseded: a new version, the newer
+    # server version becomes history
+    ok(server, collector, 'documents', [document(local=4, path='C:\\synthetic\\d.txt', versions=[
+        version(local=41, digest='d' * 64, superseded_at='2026-10-26T10:00:00+09:00'),
+        version(local=42, seq=2, digest='e' * 64)])], push_id)
+    doc4 = server.db.execute("SELECT id FROM documents WHERE path_key LIKE '%d.txt'").fetchone()[0]
+    ok(server, collector, 'documents', [document(local=4, path='C:\\synthetic\\d.txt',
+                                                 versions=[version(local=41, digest='d' * 64)])], push_id)
+    assert server_versions(server, doc4) == [(1, 'd' * 64, 1), (2, 'e' * 64, 1), (3, 'd' * 64, 0)]
+    assert server.db.execute('SELECT COUNT(*) FROM collector_versions m JOIN versions v ON v.id = m.version_id '
+                             'WHERE v.document_id = ?', (doc4,)).fetchone()[0] == 1
     # a locked placeholder gets its real sha256 when it is read (the collector's fill in place)
     locked = version(local=31, digest='0' * 64, parse_status='locked', parser=None, parser_version=None,
                      encoding=None, unit_count=None, text_chars=None, units_sha256=None)
@@ -217,6 +235,70 @@ def test_a_document_whose_versions_disagree_is_refused_alone(server):
     filled = ok(server, collector, 'documents', [document(local=3, path='C:\\synthetic\\c.txt',
                                                           versions=[version(local=31, digest='c' * 64)])], push_id)
     assert filled['refused'] == [] and filled['versions']['31']['units'] == 'need'
+    doc3 = filled['documents']['3']
+    assert server_versions(server, doc3) == [(1, 'c' * 64, 0)]
+
+
+def test_documents_outside_their_root_or_over_the_size_limit_are_refused_alone(server):
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    big = version(local=51, unit_count=sync.VERSION_MAX_UNITS + 1)
+    huge = version(local=52, text_chars=sync.VERSION_MAX_CHARS + 1)
+    result = ok(server, collector, 'documents', [
+        document(local=5, path='C:\\other\\a.txt'),                                # outside its root
+        document(local=6, path='C:\\synthetic-x\\a.txt'),                          # a prefix, not a folder
+        document(local=7, path='C:\\synthetic\\big.txt', versions=[big]),
+        document(local=8, path='C:\\synthetic\\huge.txt', versions=[huge]),
+        document(local=9, path='C:\\synthetic\\fine.txt', versions=[version(local=91)])], push_id)
+    assert result['refused'] == [{'local_document_id': 5, 'code': 'path_outside_root'},
+                                 {'local_document_id': 6, 'code': 'path_outside_root'},
+                                 {'local_document_id': 7, 'code': 'version_too_large'},
+                                 {'local_document_id': 8, 'code': 'version_too_large'}]
+    assert set(result['documents']) == {'9'} and server.count('documents') == 1
+    assert sync.VERSION_MAX_UNITS == parsers.Limits().max_units
+    assert sync.VERSION_MAX_CHARS == parsers.Limits().max_text_chars
+    assert sync.MAX_PARTS >= -(-sync.VERSION_MAX_UNITS // sync.UNITS_PER_BATCH)
+    assert sync.MAX_PARTS >= -(-sync.VERSION_MAX_CHARS // sync.UNIT_CHARS_PER_BATCH)
+
+
+@pytest.mark.parametrize('change', [
+    lambda b: b['items'][0]['versions'][0].update(mtime_ns=10**30),
+    lambda b: b['items'][0].update(local_document_id=2**70),
+    lambda b: b['items'][0]['versions'][0].update(size=-1),
+    lambda b: b['items'][0].update(versions='not a list'),
+])
+def test_malformed_values_are_bad_batch_not_an_exception(server, change):
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    bad = body(collector, 'documents', [document()], push_id)
+    change(bad)
+    bad['batch_id'] = sync.batch_id(bad)
+    before = snapshot(server.db)
+    assert receive.apply(server.db, collector, bad, raw_bytes=1)['error']['code'] == 'bad_batch'
+    assert snapshot(server.db) == before
+
+
+def test_deep_nesting_and_bad_locators_are_bad_batch(server):
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    deep = '{"a":' * 100_000 + '1' + '}' * 100_000
+    status, answer = receive.dispatch(server.db, collector, 'POST', 'batch', {}, __import__('gzip').compress(deep.encode()))
+    assert (status, answer['error']['code']) == (400, 'bad_batch')
+    nested = body(collector, 'events', [], push_id)
+    value = []
+    for _ in range(50_000):
+        value = [value]
+    nested['items'] = [{'local_event_id': 1, 'local_document_id': 1, 'local_version_id': None, 'kind': 'added',
+                        'at': value}]
+    assert receive.apply(server.db, collector, nested, raw_bytes=1)['error']['code'] == 'bad_batch'
+    ok(server, collector, 'documents', [document()], push_id)
+    for locator_json in ('not json', '{"line":1,"kind":"line"}', parsers.unit_json({'kind': 'page', 'page': 1}),
+                         parsers.unit_json({'kind': 'line', 'line': 0}), parsers.unit_json({'kind': 'line'})):
+        units = [dict(UNITS[0], locator_json=locator_json), *UNITS[1:]]
+        refused(server, collector, 'units', [units_item(units=units, units_sha256=sync.units_sha256(units))], push_id,
+                'bad_batch')
+    assert receive.unit_json({'kind': 'line', 'line': 3, 'b': '한'}) == parsers.unit_json({'kind': 'line', 'line': 3,
+                                                                                            'b': '한'})
 
 
 def test_two_collectors_share_vectors_and_keep_roots_apart(tmp_path):
@@ -325,3 +407,32 @@ def test_report_lines_name_what_left_the_pc():
     assert lines[3].startswith('  batches 5  bytes sent 12,345 (gzip)  refused 0  retries 0  0.5s')
     assert lines[4] == '  server now: documents_sha256 aaaa…  vectors_sha256 bbbb…  vectors still missing 0'
     assert TOKEN not in '\n'.join(lines)
+
+
+def test_chunk_stream_resumed_between_parts_equals_build_chunks(tmp_path):
+    """The server's part-by-part chunk stream (state kept as JSON between batches) gives exactly
+    ``chunks.build_chunks`` of the whole version, for every version of the bundle and long units."""
+    from fixtures import bundle as synthetic_bundle
+    col = Collector(tmp_path)
+    synthetic_bundle.write_bundle(col.src)
+    (col.src/'long.txt').write_text('\n'.join(['짧은 줄'] * 30 + ['긴 문장입니다. ' * 400] + ['끝 줄'] * 5),
+                                    encoding='utf-8')
+    scan(col.db, col.root)
+    try:
+        versions = [row[0] for row in col.db.execute("SELECT id FROM versions WHERE parse_status = 'ok' AND unit_count > 0")]
+        assert len(versions) > 20
+        for version_id in versions:
+            units = [(o, json.loads(u), t) for o, u, t in col.db.execute(
+                'SELECT ordinal, locator_json, text FROM units WHERE version_id = ? ORDER BY ordinal', (version_id,))]
+            expected = chunks.build_chunks(units)
+            for every in (1, 2, 7, len(units)):
+                out, state = [], None
+                for at in range(0, len(units), every):
+                    stream = receive.ChunkStream(state)
+                    for unit in units[at:at + every]:
+                        out += stream.feed(*unit)
+                    state = json.loads(json.dumps(stream.state))
+                out += receive.ChunkStream(state).finish()
+                assert out == expected, (version_id, every)
+    finally:
+        col.close()

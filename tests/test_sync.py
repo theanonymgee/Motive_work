@@ -222,7 +222,8 @@ def test_summary_hashes_match_across_sides(tmp_path):
         mine = sync.summary(col.db, col.key)
         assert sync.summary(server.db, col.key, collector_id=collector['id']) == mine
         assert sync.document_summaries(server.db, collector_id=collector['id']) == sync.document_summaries(col.db)
-        assert sync.event_count(server.db, collector_id=collector['id']) == sync.event_count(col.db)
+        assert sync.events_sha256(server.db, collector_id=collector['id']) == sync.events_sha256(col.db)
+        assert sync.events_max(server.db, collector['id']) == col.count('document_events')
         rewrite(col.src/'docs'/'notes_utf8.txt', '합성 변경 한 줄\n'.encode('utf-8'))
         scan(col.db, col.root)
         moved = sync.summary(col.db, col.key)
