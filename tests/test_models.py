@@ -25,7 +25,8 @@ def sha(data: bytes) -> str:
 
 @pytest.fixture
 def fake(monkeypatch):
-    spec = {'repo': 'test/none', 'revision': 'rev1', 'kind': 'embedding', 'license': 'test', 'source': 'test',
+    spec = {'repo': 'test/none', 'revision': 'rev1', 'base_url': 'https://example.invalid', 'kind': 'embedding',
+            'license': 'test', 'source': 'test',
             'precision': 'fp32', 'pooling': 'cls', 'query_prefix': '', 'passage_prefix': '', 'dims': 4,
             'max_tokens': 8, 'model_file': 'tiny.onnx', 'tokenizer_file': 'tiny.tokenizer.json',
             'files': [{'path': TREE_PATH[n], 'size': len(c), 'sha256': sha(c)} for n, c in CONTENT.items()]}
@@ -201,6 +202,24 @@ def test_manifest_entries_are_pinned_and_layout_is_flat():
         assert models.identity(name)['dims'] == item['dims'] and models.identity(name)['real_model'] is True
 
 
+def test_download_urls_name_the_pinned_revision(fake):
+    """M5 design §12: the model is downloaded from the pinned commit, never a branch (string only, no network)."""
+    for name, item in models.MANIFEST.items():
+        for spec in item['files']:
+            url = models.file_url(name, spec)
+            assert url == f"{item['base_url']}/{item['repo']}/resolve/{item['revision']}/{spec['path']}"
+            assert url.startswith('https://') and '/resolve/main/' not in url
+    item = models.MANIFEST['bge-m3']
+    assert item['base_url'] == models.BASE_URL == 'https://huggingface.co' and item['source'] == 'huggingface'
+    assert models.file_url('tiny', fake['files'][0]) == 'https://example.invalid/test/none/resolve/rev1/onnx/tiny.onnx'
+
+
+@pytest.mark.parametrize('header, start', [('bytes 100-199/200', 100), ('bytes 0-9/10', 0), (None, None),
+                                           ('bytes */200', None), ('items 1-2/3', None), ('', None)])
+def test_content_range_start(header, start):
+    assert models._range_start(header) == start
+
+
 def test_fetch_model_cli_requires_from_and_verify_model_reports(fake, home, tmp_path, capsys):
     assert cli.main(['fetch-model', 'tiny']) == 4
     assert '--from' in capsys.readouterr().err
@@ -255,3 +274,62 @@ def test_real_model_verifies_and_loads(name):
     vector = loaded.embed(['합성 문장', 'A synthetic sentence'], query=False)
     assert vector.shape == (2, models.entry(name)['dims']) and loaded.providers == ['CPUExecutionProvider']
     assert abs(float((vector[0]**2).sum()) - 1.0) < 1e-4
+
+
+class FakeResponse:
+    """What ``download_file`` reads from an opened URL: ``status``, ``headers``, ``read`` (no socket)."""
+
+    def __init__(self, status, body, content_range=None):
+        self.status, self.body, self.headers = status, body, {'Content-Range': content_range} if content_range else {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n):
+        block, self.body = self.body[:n], self.body[n:]
+        return block
+
+
+def fake_opener(data: bytes, mode: str, seen: list):
+    """``mode``: ``range`` honours Range, ``ignore`` answers 200 with everything, ``shifted`` a 206 from byte 0."""
+    def opener(request, timeout):
+        assert request.full_url.startswith('https://example.invalid/') and timeout == 60
+        seen.append(request.get_header('Range'))
+        have = int(request.get_header('Range')[len('bytes='):-1]) if request.get_header('Range') else 0
+        if not have or mode == 'ignore':
+            return FakeResponse(200, data)
+        start = have if mode == 'range' else 0
+        return FakeResponse(206, data[start:], f'bytes {start}-{len(data) - 1}/{len(data)}')
+    return opener
+
+
+@pytest.mark.parametrize('mode, ranges, note', [
+    ('range', ['bytes=1000-'], None),
+    ('ignore', ['bytes=1000-'], 'server ignored Range'),
+    ('shifted', ['bytes=1000-', None], 'unexpected Content-Range'),  # partial deleted, then a fresh request
+])
+def test_download_file_resumes_a_partial_and_replaces_atomically(fake, home, mode, ranges, note):
+    """Offline (fake opener): a fresh file, then a resumed partial; a wrong answer restarts the file."""
+    data = CONTENT['tiny.onnx_data']
+    target, partial = models.file_path('tiny', 'tiny.onnx_data', home), home/'tmp'/'tiny-tiny.onnx_data.partial'
+    url, seen, lines = models.file_url('tiny', fake['files'][1]), [], []
+    models.download_file(url, target, partial, len(data), sha(data), log=quiet, opener=fake_opener(data, mode, seen))
+    assert target.read_bytes() == data and not partial.exists()
+    target.unlink()
+    partial.write_bytes(data[:1000])  # left by an interrupted run
+    models.download_file(url, target, partial, len(data), sha(data), log=lines.append,
+                         opener=fake_opener(data, mode, seen))
+    assert target.read_bytes() == data and not partial.exists() and seen == [None, *ranges]
+    assert note is None or any(note in line for line in lines)
+
+
+def test_download_file_deletes_a_partial_with_the_wrong_hash(fake, home):
+    data = CONTENT['tiny.onnx_data']
+    target, partial = models.file_path('tiny', 'tiny.onnx_data', home), home/'tmp'/'x.partial'
+    with pytest.raises(models.ModelFileError, match='SHA-256 mismatch'):
+        models.download_file('https://example.invalid/x', target, partial, len(data), sha(b'other'), log=quiet,
+                             opener=fake_opener(data, 'range', []))
+    assert not partial.exists() and not target.exists()

@@ -16,6 +16,11 @@ every file is in place, 1 otherwise, 4 without ``--from``; ``verify-model`` 0/1.
 ``search`` import their modules (numpy) only when they run; ``scan``/``verify``/``doctor`` do not.
 ``search`` prints snippets to the console on purpose (the user reads them locally); the index log
 has counts and fixed codes only, never document text or queries.
+
+M5: ``setup`` (design M5 §2.3, §12; body in ``setup.py``, imported only here and only when it runs):
+exit 0 done, 1 a step failed, 2 data home refused (an AppData home without ``--yes`` too), 3 a store,
+scan or index lock is held (``--upgrade``), 4 arguments. ``doctor`` also reports the venv in use and a
+polluted shell (``PYTHONPATH`` set, a foreign ``VIRTUAL_ENV``; design M5 §2.7).
 """
 from __future__ import annotations
 
@@ -69,6 +74,35 @@ def _root_lines(home) -> list[str]:
     return lines
 
 
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def venv_label(prefix: str, base_prefix: str, repo_root) -> str:
+    """``this repository`` (``<repo>/.venv``), another venv's folder, or ``none`` (design M5 §2.7)."""
+    if _same_path(prefix, base_prefix):
+        return 'none (base interpreter)'
+    if repo_root is not None and _same_path(prefix, str(Path(repo_root)/'.venv')):
+        return 'this repository'
+    return prefix
+
+
+def environment_lines(env, *, prefix: str, isolated: bool) -> list[str]:
+    """``doctor`` lines for a polluted shell (design M5 §2.7): ``PYTHONPATH`` set, or ``VIRTUAL_ENV`` naming
+    another environment than this interpreter's ``prefix``. ``isolated``: this process runs with ``-I``/``-E``
+    (``PYTHONPATH`` ignored here, but ``uv run`` and other commands from the same shell still see it)."""
+    lines = []
+    if env.get('PYTHONPATH'):
+        lines.append('warning: env: PYTHONPATH is set (ignored here by python -I; commands without -I, '
+                     'such as uv run, may load other packages)' if isolated else
+                     'warning: env: PYTHONPATH is set and used by this process (packages may come from '
+                     'another environment); clear it or run <venv python> -I -m workmcp ...')
+    virtual_env = env.get('VIRTUAL_ENV')
+    if virtual_env and not _same_path(virtual_env, prefix):
+        lines.append(f"warning: env: VIRTUAL_ENV={virtual_env} is not this interpreter's environment ({prefix})")
+    return lines or ['env: clean (no PYTHONPATH, no foreign VIRTUAL_ENV)']
+
+
 def doctor() -> int:
     home, code = _home()
     if code:
@@ -90,9 +124,11 @@ def doctor() -> int:
             db.close()
     model = models.quick_status(models.DEFAULT_MODEL, home)
     fts5 = store.fts5_available()
+    venv = venv_label(sys.prefix, sys.base_prefix, paths.find_repo_root())
     lines = [
         f'workmcp {__version__}',
-        f'python: {".".join(map(str, sys.version_info[:3]))} ({sys.executable})',
+        f'python: {".".join(map(str, sys.version_info[:3]))} ({sys.executable})  venv: {venv}',
+        *environment_lines(os.environ, prefix=sys.prefix, isolated=bool(sys.flags.ignore_environment)),
         f'mcp: {importlib.metadata.version("mcp")}',
         f'sqlite: {sqlite3.sqlite_version}, fts5 trigram: {"yes" if fts5 else "no (lexical search falls back to LIKE)"}',
         f'data home: {home} (rules ok; {"exists" if home.exists() else "not created yet"})',
@@ -595,6 +631,20 @@ def main(argv=None) -> int:
     search_parser.add_argument('--since', metavar='ISO')
     search_parser.add_argument('--until', metavar='ISO')
     search_parser.add_argument('--json', action='store_true', help='the M3 tool result as JSON')
+    setup_parser = sub.add_parser('setup', help='set up the data home, config.toml, model and client registration '
+                                                '(idempotent)')
+    setup_parser.add_argument('--home', metavar='PATH', help=r'data home (e.g. %%USERPROFILE%%\Motive_work)')
+    setup_parser.add_argument('--source', action='append', metavar='PATH', help='source root for a new config.toml')
+    setup_parser.add_argument('--model', metavar='download|none', help='download the pinned model, or none (lexical)')
+    setup_parser.add_argument('--model-from', metavar='DIR', help='copy the model from a folder on this PC')
+    setup_parser.add_argument('--clients', default='claude,codex', metavar='claude,codex')
+    setup_parser.add_argument('--scope', default='user', metavar='user|project',
+                              help='user: print the registration commands; project: write files in --project')
+    setup_parser.add_argument('--project', metavar='DIR', help='project folder for --scope project')
+    setup_parser.add_argument('--scan', action='store_true', help='scan the configured sources afterwards')
+    setup_parser.add_argument('--index', action='store_true', help='index afterwards')
+    setup_parser.add_argument('--upgrade', action='store_true', help='back up and migrate the store, then doctor')
+    setup_parser.add_argument('--yes', action='store_true', help='accept an AppData home or overwrite project files')
     fetch_parser = sub.add_parser('fetch-model', help='copy and verify model files from a folder on this PC')
     fetch_parser.add_argument('name', metavar='NAME')
     fetch_parser.add_argument('--from', dest='source', metavar='FOLDER')
@@ -620,5 +670,8 @@ def main(argv=None) -> int:
         return fetch_model_command(args)
     if args.command == 'verify-model':
         return verify_model_command(args)
+    if args.command == 'setup':
+        from . import setup  # the only importer of setup (network boundary test)
+        return setup.main(args)
     from . import server  # imports the MCP SDK only when serving
     return server.main()

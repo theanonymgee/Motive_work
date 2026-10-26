@@ -21,18 +21,41 @@ def test_repo_root_is_found_from_the_package():
     assert paths.find_repo_root() == REPO_ROOT
 
 
-def test_default_is_localappdata_motive_work(tmp_path):
-    env = {'LOCALAPPDATA': str(tmp_path/'AppData'/'Local')}
-    assert validate_home(None, env, REPO_ROOT) == (tmp_path/'AppData'/'Local'/'Motive_work').resolve()
+def profile_env(tmp_path):
+    profile = tmp_path/'profile'
+    return profile, {'USERPROFILE': str(profile), 'LOCALAPPDATA': str(profile/'AppData'/'Local'),
+                     'APPDATA': str(profile/'AppData'/'Roaming')}
+
+
+def test_default_is_userprofile_motive_work(tmp_path):
+    """M5 design §12 Q4: the default home moved out of AppData to ``%USERPROFILE%\\Motive_work``."""
+    profile, env = profile_env(tmp_path)
+    home = validate_home(None, env, REPO_ROOT)
+    assert home == (profile/'Motive_work').resolve()
+    assert not paths.under_appdata(home, env)
 
 
 def test_empty_value_means_default(tmp_path):
-    env = {'LOCALAPPDATA': str(tmp_path/'AppData'/'Local')}
-    assert validate_home('', env, REPO_ROOT) == (tmp_path/'AppData'/'Local'/'Motive_work').resolve()
+    profile, env = profile_env(tmp_path)
+    assert validate_home('', env, REPO_ROOT) == (profile/'Motive_work').resolve()
 
 
-def test_missing_localappdata_is_unresolvable():
+def test_missing_userprofile_is_unresolvable(tmp_path):
     assert code_of(None, {}) == 'home_unresolvable'
+    # LOCALAPPDATA alone no longer gives a default (the old default lay under AppData)
+    assert code_of(None, {'LOCALAPPDATA': str(tmp_path/'AppData'/'Local')}) == 'home_unresolvable'
+
+
+def test_under_appdata_marks_every_appdata_form(tmp_path):
+    profile, env = profile_env(tmp_path)
+    for home in (profile/'AppData'/'Local'/'Motive_work', profile/'AppData'/'Roaming'/'Motive_work',
+                 profile/'AppData'/'LocalLow'/'Motive_work',
+                 profile/'AppData'/'Local'/'Packages'/'Fake_pkg'/'LocalCache'/'Local'/'Motive_work'):
+        assert paths.under_appdata(home, env), home
+    for home in (profile/'Motive_work', tmp_path/'elsewhere'/'Motive_work', profile/'AppDataX'/'Motive_work'):
+        assert not paths.under_appdata(home, env), home
+    # an explicit AppData home is still a valid home (doctor reports virtualization; setup refuses it)
+    assert validate_home(str(profile/'AppData'/'Local'/'Motive_work'), env, REPO_ROOT)
 
 
 def test_explicit_home_is_returned_resolved(tmp_path):
@@ -230,10 +253,11 @@ def test_doctor_reports_valid_home_without_creating_it(workmcp_home, capsys):
 
 def test_real_default_home_passes_on_this_pc():
     env = {k: v for k, v in os.environ.items() if k != paths.HOME_ENV}
-    if not env.get('LOCALAPPDATA'):
-        pytest.skip('LOCALAPPDATA is not set (not a Windows user session)')
+    if not env.get('USERPROFILE'):
+        pytest.skip('USERPROFILE is not set (not a Windows user session)')
     home = validate_home(None, env, REPO_ROOT)
-    assert home.name == 'Motive_work'
+    assert home == Path(env['USERPROFILE']).resolve()/'Motive_work'
+    assert not paths.under_appdata(home, env)
 
 
 # ---- app virtualization (design M3 §10.3, V-1..V-3) ------------------------------------------------
@@ -344,3 +368,40 @@ def test_doctor_reports_app_virtualization(workmcp_home, monkeypatch, capsys, tm
     out = capsys.readouterr().out
     assert f'warning: app virtualization: the data home {inside} lands in package Fake_pkg ({inside})' in out
     assert 'is inside the app package folder' in out
+
+
+# ---- polluted shell (design M5 §2.7) ------------------------------------------------------------------
+
+def test_environment_lines_warn_about_pythonpath_and_a_foreign_virtual_env(tmp_path):
+    venv = str(tmp_path/'repo'/'.venv')
+    assert cli.environment_lines({}, prefix=venv, isolated=True) == [
+        'env: clean (no PYTHONPATH, no foreign VIRTUAL_ENV)']
+    assert cli.environment_lines({'VIRTUAL_ENV': venv, 'PYTHONPATH': ''}, prefix=venv, isolated=False) == [
+        'env: clean (no PYTHONPATH, no foreign VIRTUAL_ENV)']  # this venv activated, empty PYTHONPATH
+    other = str(tmp_path/'other'/'venv')
+    lines = cli.environment_lines({'PYTHONPATH': other, 'VIRTUAL_ENV': other}, prefix=venv, isolated=True)
+    assert len(lines) == 2 and all(line.startswith('warning: env: ') for line in lines)
+    assert 'PYTHONPATH is set (ignored here by python -I' in lines[0]
+    assert lines[1] == f"warning: env: VIRTUAL_ENV={other} is not this interpreter's environment ({venv})"
+    used = cli.environment_lines({'PYTHONPATH': other}, prefix=venv, isolated=False)
+    assert used[0].startswith('warning: env: PYTHONPATH is set and used by this process')
+
+
+def test_venv_label_names_this_repository(tmp_path):
+    repo = tmp_path/'repo'
+    assert cli.venv_label(str(repo/'.venv'), str(tmp_path/'py'), repo) == 'this repository'
+    assert cli.venv_label(str(tmp_path/'py'), str(tmp_path/'py'), repo) == 'none (base interpreter)'
+    assert cli.venv_label(str(tmp_path/'v'), str(tmp_path/'py'), repo) == str(tmp_path/'v')
+    assert cli.venv_label(str(tmp_path/'v'), str(tmp_path/'py'), None) == str(tmp_path/'v')
+
+
+def test_doctor_prints_the_environment_lines(workmcp_home, monkeypatch, capsys):
+    monkeypatch.setenv('PYTHONPATH', r'C:\elsewhere\site-packages')
+    monkeypatch.delenv('VIRTUAL_ENV', raising=False)
+    assert cli.main(['doctor']) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith('python: ') and '  venv: ' in lines[1]
+    assert lines[2].startswith('warning: env: PYTHONPATH is set')
+    monkeypatch.delenv('PYTHONPATH')
+    assert cli.main(['doctor']) == 0
+    assert capsys.readouterr().out.splitlines()[2] == 'env: clean (no PYTHONPATH, no foreign VIRTUAL_ENV)'

@@ -6,7 +6,8 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve [ROOT]|imports|probe|sc
   ROOT (the source folder the test scanned into the data home beforehand), ROOT is the source root of
   the source-write judgement and every open under it is counted (``source_opens``, must be 0: the tools
   read the store, never the originals; design M3 §12).
-- ``imports``: import every package module, build the server and call ``tools.status``.
+- ``imports``: import every package module, build the server, call ``tools.status`` and (M5) the
+  ``setup.plan`` dry run (``setup_plan``: its result keys, or ``not_implemented`` in stage 0).
 - ``probe``: positive control. Tries a non-loopback connect, a name lookup, a process start and a
   fixed-port loopback listener (all blocked by the hook before they happen) and one loopback
   socket pair on port 0 (allowed); then,
@@ -222,7 +223,12 @@ def imports() -> dict:
     store.open_home(home).close()
     server.build_server(home)
     assert tools.status(home)['ok']
-    return {'modules': names, 'loaded': sorted(sys.modules)}
+    from workmcp import setup  # M5: the dry run creates nothing and reaches no network (design M5 §9.3)
+    try:
+        setup_plan = sorted(setup.plan(setup.Options(home=str(home), model='none')))
+    except NotImplementedError:  # stage 0: signature only
+        setup_plan = 'not_implemented'
+    return {'modules': names, 'loaded': sorted(sys.modules), 'setup_plan': setup_plan}
 
 
 def probe() -> dict:

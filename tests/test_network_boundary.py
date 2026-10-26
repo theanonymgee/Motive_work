@@ -66,7 +66,17 @@ MODULE_IMPORTS = {
     # M4 (design M4 §10, appendix B): NFC before binding a quote and measuring text; knowledge_query.py
     # uses the common list only.
     'knowledge.py': frozenset({'unicodedata'}),
+    # M5 (design M5 §9.3): setup writes config/client files from string templates and backs up the store
+    # with ``open`` blocks, so it needs nothing beyond the common list (no ``shutil``, no ``subprocess``).
+    'setup.py': frozenset(),
 }
+# M5 (design M5 §12, model source): ``setup.download_model`` is the one caller of a models network
+# function outside models.py, and only of ``fetch``; only ``cli.py`` may import ``setup`` at all, so the
+# server and the tools never reach it. ``tools/`` lies outside the package and is not checked here;
+# ``tests/test_tools_dir.py`` keeps it to the standard library without ``workmcp``.
+MODELS_NETWORK_CALLERS = {'setup.py': frozenset({'fetch'})}
+SETUP_IMPORTERS = frozenset({'cli.py'})
+SETUP_DOTTED = 'workmcp.setup'
 # Inside function bodies only: the explicit model download, and the ONNX runtime and tokenizer
 # loaded in ``OnnxEmbedder.__init__`` (their DLLs never load on import, status or lexical search).
 FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'}),
@@ -220,10 +230,40 @@ def is_stdio_run(call: ast.Call) -> bool:
             and isinstance(call.keywords[0].value, ast.Constant) and call.keywords[0].value.value == 'stdio')
 
 
+def setup_import_violations(name: str, tree) -> list[str]:
+    """``setup`` (which reaches the model download) is imported by ``cli.py`` only, in any import form,
+    through another package module (``cli.setup``) or ``getattr(..., "setup")``."""
+    if name in SETUP_IMPORTERS:
+        return []
+    found = []
+    bound = bindings(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(a.name == SETUP_DOTTED or a.name.startswith(SETUP_DOTTED + '.') for a in node.names):
+                found.append('imports the setup module (cli only)')
+        elif isinstance(node, ast.ImportFrom):
+            names = {a.name for a in node.names}
+            package = node.level >= 1 or (node.module or '').split('.')[0] == 'workmcp'
+            module = (node.module or '') if node.level else (node.module or '').removeprefix('workmcp').lstrip('.')
+            if package and (module == 'setup' or module.startswith('setup.')
+                            or (module in ('', 'cli') and 'setup' in names)):
+                found.append('imports the setup module (cli only)')
+        elif isinstance(node, ast.Attribute) and node.attr == 'setup':
+            dotted = qualify(node, bound)
+            if dotted and is_package_name(dotted):
+                found.append(f'setup module through {dotted} (cli only)')
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'getattr' \
+                and len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and node.args[1].value == 'setup':
+            found.append('getattr on the setup module (cli only)')
+    return found
+
+
 def violations(name: str, source: str, models_network: set[str] = frozenset()) -> list[str]:
     """``name`` is the path relative to the package (``models.py``, ``parsers/__init__.py``)."""
     tree = ast.parse(source)
     found = []
+    models_network = set(models_network) - MODELS_NETWORK_CALLERS.get(name, frozenset())
+    found += setup_import_violations(name, tree)
     bound = bindings(tree)
     module_allowed = COMMON_IMPORTS | MODULE_IMPORTS.get(name, frozenset())
     function_allowed = module_allowed | FUNCTION_IMPORTS.get(name, frozenset())
@@ -335,7 +375,8 @@ def test_package_has_sources():
         '__init__.py', '__main__.py', 'cli.py', 'paths.py', 'store.py', 'locator.py', 'models.py', 'tools.py',
         'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
         'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py',
-        'config.py', 'collect.py', 'binding.py', 'chunks.py', 'embedder.py', 'index.py', 'search.py', 'snippet.py'}
+        'config.py', 'collect.py', 'binding.py', 'chunks.py', 'embedder.py', 'index.py', 'search.py', 'snippet.py',
+        'setup.py'}
 
 
 def test_package_has_no_importable_file_other_than_py():
@@ -387,7 +428,8 @@ def test_models_network_functions_are_transitive():
     assert network_functions(source) == {'download', 'fetch', 'main'}
     assert {'download_file', 'fetch', 'main'} <= models_network()
     assert not models_network() & {'entry', 'verify', 'quick_status', 'identity', 'sha256_file', 'require_verified',
-                                   'import_from', 'available', 'cli_fetch_model', 'cli_verify_model'}  # N-2
+                                   'import_from', 'available', 'cli_fetch_model', 'cli_verify_model',
+                                   'file_url', '_range_start'}  # N-2; M5 URL and header helpers stay offline
 
 
 # 3 Positive controls carried over from the first M0 version (checked as an ordinary module).
@@ -580,6 +622,59 @@ def test_models_through_other_modules_keeps_offline_functions_usable():
     assert violations('tools.py', 'from . import cli\ncli.models.fetch("m", h)\n', network)
 
 
+# M5 (design M5 §12): setup may call models.fetch and nothing else of the download path; only cli imports setup.
+SETUP_IMPORT_FORMS = [
+    'from . import setup', 'from .setup import main', 'from .setup import download_model as d',
+    'import workmcp.setup', 'import workmcp.setup as s', 'from workmcp import setup', 'from workmcp.setup import run',
+    'from .cli import setup', 'from workmcp.cli import setup as s',
+    'from . import cli\ncli.setup.main(a)', 'import workmcp\nworkmcp.setup.download_model("m", h)',
+    'from . import cli\ngetattr(cli, "setup")', 'import workmcp\ngetattr(workmcp, "setup").main(a)',
+    'def f():\n    from . import setup\n    return setup.download_model("m", h)',
+]
+
+
+@pytest.mark.parametrize('module', ['server.py', 'tools.py', 'search.py', 'models.py', 'setup.py'])
+@pytest.mark.parametrize('snippet', SETUP_IMPORT_FORMS)
+def test_only_cli_may_import_setup(module, snippet):
+    assert violations(module, snippet, {'fetch', 'download_file', 'main'})
+
+
+def test_setup_import_rule_in_a_subpackage_and_cli_is_allowed():
+    assert violations('parsers/text.py', 'from .. import setup', {'fetch'})
+    assert violations('parsers/text.py', 'from ..setup import run', {'fetch'})
+    assert violations('cli.py', 'def f(a):\n    from . import setup\n    return setup.main(a)\n', {'fetch'}) == []
+    assert violations('tools.py', 'import dataclasses\nx = dataclasses.field()\n', {'fetch'}) == []
+
+
+@pytest.mark.parametrize('snippet, flagged', [
+    ('from . import models\nmodels.fetch(name, home, log=log)', False),
+    ('from . import models\nmodels.download_file("u", t, p, 1, "x")', True),
+    ('from . import models\nmodels.main(["fetch"])', True),
+    ('from .models import download_file', True),
+    ('from . import models\ngetattr(models, "download_file")', True),
+    ('from . import cli\ncli.models.main()', True),
+])
+def test_setup_may_reach_models_fetch_only(snippet, flagged):
+    network = models_network()
+    assert bool(violations('setup.py', snippet, network)) is flagged
+    assert violations('search.py', snippet, network)  # every other module: still banned
+
+
+def test_models_network_callers_match_the_sources_exactly():
+    """Each allowed caller really uses exactly the functions it is allowed, as ``models.<name>``."""
+    network = models_network()
+    for module, allowed in MODELS_NETWORK_CALLERS.items():
+        assert allowed <= network
+        tree = ast.parse((PACKAGE/module).read_text(encoding='utf-8'))
+        aliases = models_aliases(tree)
+        used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id in aliases and n.attr in network}
+        assert used == allowed
+    importing = {rel(p) for p in package_sources() if setup_import_violations(  # judged as if not allowed
+        'server.py', ast.parse(p.read_text(encoding='utf-8')))}
+    assert importing == SETUP_IMPORTERS  # cli.py really imports setup, and nothing else does
+
+
 @pytest.mark.parametrize('snippet, banned', [
     ('from concurrent.futures import ProcessPoolExecutor', True),
     ('import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor()', True),
@@ -726,7 +821,10 @@ def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
             'workmcp.parsers.text', 'workmcp.parsers.eml', 'workmcp.parsers.docx', 'workmcp.parsers.pptx',
             'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp', 'workmcp.config', 'workmcp.collect',
             'workmcp.binding', 'workmcp.chunks', 'workmcp.embedder', 'workmcp.index',
-            'workmcp.search', 'workmcp.snippet'} <= set(report['modules'])
+            'workmcp.search', 'workmcp.snippet', 'workmcp.setup'} <= set(report['modules'])
+    # setup.plan (dry run, M5 design §9.3) ran under the hook; stage 0 has its signature only
+    from workmcp import setup
+    assert report['setup_plan'] in ('not_implemented', sorted(setup.RESULT_KEYS))
     # the parser libraries and numpy really were imported under the hook (their import side effects are audited)
     assert {'pypdf', 'olefile', 'xml.parsers.expat', 'zipfile', 'email.parser', 'numpy'} <= set(report['loaded'])
     # ... and the heavy runtimes were not: they load inside OnnxEmbedder only (design M2 §7.2)

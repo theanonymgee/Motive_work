@@ -1,8 +1,10 @@
 """Single place that decides and checks where our data lives (design §2).
 
-Data home = ``WORKMCP_HOME`` if set, else ``%LOCALAPPDATA%\\Motive_work``. The home must be
-an absolute, local path outside the repository and outside any sync folder; otherwise
-``validate_home`` raises ``DataPathError(code, message)`` and nothing is created. These
+Data home = ``WORKMCP_HOME`` if set, else ``%USERPROFILE%\\Motive_work`` (M5 design §2.4, §12 Q4:
+outside ``AppData``, so a packaged client app cannot redirect it). The home must be an absolute,
+local path outside the repository and outside any sync folder; otherwise ``validate_home`` raises
+``DataPathError(code, message)`` and nothing is created. A home under ``AppData`` stays valid here
+(``doctor`` reports app virtualization); ``workmcp setup`` refuses it (``under_appdata``). These
 rules apply to our storage only, never to the source folders we read.
 """
 from __future__ import annotations
@@ -14,6 +16,7 @@ from pathlib import Path, PurePath
 
 HOME_ENV = 'WORKMCP_HOME'
 APP_DIR = 'Motive_work'
+DEFAULT_BASE_ENV = 'USERPROFILE'  # default home = %USERPROFILE%\Motive_work (M5 design §12 Q4)
 SUBDIRS = ('db', 'models', 'logs', 'tmp')
 
 # Compared after casefold + strip, and again with inner spaces removed. Google Drive for desktop
@@ -97,9 +100,10 @@ def _sync_component(path: Path) -> str | None:
 def validate_home(raw: str | None, env: Mapping[str, str], repo_root: Path | None) -> Path:
     """Resolved data home, or ``DataPathError`` naming the first rule it breaks (design §2.2)."""
     if raw is None or raw == '':
-        base = env.get('LOCALAPPDATA')
+        base = env.get(DEFAULT_BASE_ENV)
         if not base:
-            raise DataPathError('home_unresolvable', f'{HOME_ENV} is not set and LOCALAPPDATA is missing; {FIX_HINT}')
+            raise DataPathError('home_unresolvable',
+                                f'{HOME_ENV} is not set and {DEFAULT_BASE_ENV} is missing; {FIX_HINT}')
         raw = str(Path(base)/APP_DIR)
     local = _strip_long_prefix(raw)
     if _is_unc(local):
@@ -164,6 +168,12 @@ def _appdata_parts(home: Path, env: Mapping[str, str]) -> tuple[str, ...] | None
         if _within(home, appdata):
             return home.parts[len(appdata.parts):]
     return None
+
+
+def under_appdata(home: Path, env: Mapping[str, str]) -> bool:
+    """``home`` lies in ``%LOCALAPPDATA%``, ``%APPDATA%`` or ``%USERPROFILE%\\AppData``: ``setup`` refuses it
+    (M5 design §2.3 step 1), since a packaged app may redirect writes there (design M3 §10)."""
+    return _appdata_parts(home, env) is not None
 
 
 def _packages_dir(env: Mapping[str, str]) -> Path | None:

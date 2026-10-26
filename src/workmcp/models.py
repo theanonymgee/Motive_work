@@ -13,8 +13,15 @@ only after size and hash match.
 M2: ``import_from`` copies the pinned files from a folder already on the PC (an earlier
 download or an offline bundle) with the same ``.partial`` -> SHA-256 -> ``os.replace`` rule; it
 calls no network function. ``workmcp fetch-model NAME --from FOLDER`` and ``workmcp verify-model``
-reach this module only through ``cli_fetch_model``/``cli_verify_model``. The download path stays a
-skeleton that is neither run nor tested.
+reach this module only through ``cli_fetch_model``/``cli_verify_model``.
+
+M5 (design §12, model source): the model comes from Hugging Face at the pinned revision. Each
+manifest entry carries ``base_url``; ``file_url`` builds ``<base_url>/<repo>/resolve/<revision>/<path>``
+(never a branch name) without touching the network. ``workmcp setup --model download`` reaches the
+download path only through ``setup.download_model`` -> ``fetch`` (the network boundary test allows
+exactly that one caller). ``download_file`` resumes a ``.partial`` with ``Range``, honours the standard
+proxy variables (``HTTPS_PROXY``, ``NO_PROXY``) through ``urllib.request``, and moves the file in with
+``os.replace`` only after size and SHA-256 match. ``opener`` lets a test hand in fake responses.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ DEFAULT_MODEL = 'bge-m3'
 # Face tree API at the pinned commit (LFS oid, 2026-10-19).
 MANIFEST: dict[str, dict] = {
     'bge-m3': {
-        'repo': 'BAAI/bge-m3', 'revision': '5617a9f61b028005a4858fdac845db406aefb181',
+        'repo': 'BAAI/bge-m3', 'revision': '5617a9f61b028005a4858fdac845db406aefb181', 'base_url': BASE_URL,
         'kind': 'embedding', 'license': 'MIT', 'source': 'huggingface', 'precision': 'fp32', 'pooling': 'cls',
         'query_prefix': '', 'passage_prefix': '', 'dims': 1024, 'max_tokens': 512,
         'model_file': 'model.onnx', 'tokenizer_file': 'tokenizer.json',
@@ -72,6 +79,12 @@ def local_name(spec: dict) -> str:
 
 def file_path(name: str, filename: str, home: Path) -> Path:
     return model_dir(name, home)/filename
+
+
+def file_url(name: str, spec: dict) -> str:
+    """Download URL of one manifest file at the pinned revision (string only; no network)."""
+    item = entry(name)
+    return f"{item['base_url']}/{item['repo']}/resolve/{item['revision']}/{spec['path']}"
 
 
 def sha256_file(path: Path) -> str:
@@ -226,15 +239,27 @@ def require_verified(name: str, home: Path) -> Path:
     return model_dir(name, home)
 
 
+def _range_start(content_range: str | None) -> int | None:
+    """First byte of a ``Content-Range: bytes <start>-<end>/<total>`` header, else None."""
+    unit, _, rest = (content_range or '').partition(' ')
+    start = rest.split('-', 1)[0]
+    return int(start) if unit == 'bytes' and start.isdigit() else None
+
+
 def download_file(url: str, target: Path, partial: Path, size: int, sha256: str, *, log=print,
-                  reconnects: int = 20) -> None:
+                  reconnects: int = 20, timeout: float = 60, opener=None) -> None:
     """Range-resumable download to ``partial``; atomic move to ``target`` only after size+SHA-256 match.
 
-    Uses ``urllib.request`` (standard proxy variables such as ``HTTPS_PROXY`` apply).
+    A ``partial`` left by an earlier run is resumed (``Range: bytes=<have>-``); a server that answers
+    200, or a 206 starting elsewhere, restarts the file. A longer partial is deleted. ``opener(request,
+    timeout=...)`` defaults to ``urllib.request.urlopen``, which honours the standard proxy variables
+    (``HTTPS_PROXY``, ``NO_PROXY``). Raises ``ModelFileError`` on an HTTP error, a short file after
+    ``reconnects`` retries or a SHA-256 mismatch (that partial is deleted).
     """
     import urllib.error
     import urllib.request
 
+    opener = opener or urllib.request.urlopen
     target.parent.mkdir(parents=True, exist_ok=True)
     partial.parent.mkdir(parents=True, exist_ok=True)
     if partial.exists() and partial.stat().st_size > size:
@@ -245,7 +270,11 @@ def download_file(url: str, target: Path, partial: Path, size: int, sha256: str,
             break
         request = urllib.request.Request(url, headers={'Range': f'bytes={have}-'} if have else {})
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with opener(request, timeout=timeout) as response:
+                if have and response.status == 206 and _range_start(response.headers.get('Content-Range')) != have:
+                    log(f'  unexpected Content-Range; restarting {target.name}')
+                    partial.unlink()
+                    continue
                 if response.status == 200 and have:
                     log(f'  server ignored Range; restarting {target.name}')
                     have = 0
@@ -273,19 +302,25 @@ def download_file(url: str, target: Path, partial: Path, size: int, sha256: str,
     os.replace(partial, target)
 
 
-def fetch(name: str, home: Path, *, attempts: int = 2, log=print) -> dict[str, str]:
+def fetch(name: str, home: Path, *, attempts: int = 2, log=print, opener=None) -> dict[str, str]:
+    """Download every manifest file of ``name`` that is not already verified into the data home.
+
+    Per file: ``file_url`` -> ``download_file`` into ``<home>/tmp/<name>-<file>.partial`` (resumed on the
+    next attempt or run) -> ``os.replace`` into ``model_dir``. Returns ``verify(name, home)``; raises
+    ``ModelFileError`` when a file still fails after ``attempts``. The only network path of the package.
+    """
     item = entry(name)
     for spec in item['files']:
         target = file_path(name, local_name(spec), home)
         if target.is_file() and target.stat().st_size == spec['size'] and sha256_file(target) == spec['sha256']:
             log(f'  {target.name}: already verified')
             continue
-        url = f"{BASE_URL}/{item['repo']}/resolve/{item['revision']}/{spec['path']}"
         partial = home/'tmp'/f'{name}-{target.name}.partial'
         for attempt in range(1, attempts + 1):
             try:
                 log(f'fetch {name}/{target.name} ({spec["size"]:,} bytes), attempt {attempt}')
-                download_file(url, target, partial, spec['size'], spec['sha256'], log=log)
+                download_file(file_url(name, spec), target, partial, spec['size'], spec['sha256'], log=log,
+                              opener=opener)
                 break
             except ModelFileError as exc:
                 log(f'  failed: {exc}')
