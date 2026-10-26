@@ -21,6 +21,8 @@ WorkingDirectory=/home/workmcp/app/Motive_work
 ExecStart=/home/workmcp/app/.venv/bin/python -I -m workmcp serve --http 127.0.0.1:8765
 Restart=on-failure
 RestartSec=5
+# stop within 20 s; a stalled shutdown is killed (no data loss: SQLite writes are per transaction)
+TimeoutStopSec=20
 
 # Memory: above MemoryHigh the kernel reclaims; above MemoryMax the service is killed and restarted,
 # which protects the other services on this VPS (design 7.1). Lower both if the survey shows little free memory.

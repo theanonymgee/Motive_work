@@ -530,6 +530,8 @@ STAGE1_M5 = 'not_implemented (M5 remote stage 1)'
 
 
 REMOTE_LIFE_SECONDS = 600
+REMOTE_STOP_SECONDS = 15     # after SIGTERM: then the events so far are written and the process ends (9)
+LOG_PATH: list[Path] = []    # the report file of this run (main), for a stop that stalls
 
 
 def _stop_when_asked(path: Path) -> None:
@@ -541,6 +543,14 @@ def _stop_when_asked(path: Path) -> None:
     while not path.exists() and time.monotonic() < ends:
         time.sleep(0.1)
     signal.raise_signal(signal.SIGTERM)
+    time.sleep(REMOTE_STOP_SECONDS)
+    # Still here: the graceful stop stalled (seen on Windows in the SDK's lifespan cleanup). Keep the evidence:
+    # the events so far, marked ``stalled``, then end the process.
+    SOURCE_ROOT.clear()
+    LOG_PATH[0].write_text(json.dumps({'mode': 'remote', 'completed': False, 'stalled': True,
+                                       'source_opens': _source_opens(0), 'events': list(EVENTS)},
+                                      ensure_ascii=False), encoding='utf-8')
+    os._exit(9)
 
 
 def remote_mode(argv) -> dict:
@@ -568,6 +578,7 @@ def push_mode(argv) -> dict:
 
 def main(argv) -> int:
     log, mode = Path(argv[1]), (argv[2] if len(argv) > 2 else 'serve')
+    LOG_PATH[:] = [log]
     sys.modules.setdefault('_audited_server', sys.modules[__name__])  # helpers import this very module
     sys.addaudithook(hook)
     report, code = {'mode': mode, 'completed': False}, 1
