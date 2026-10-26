@@ -12,6 +12,9 @@ another root. A root inside a sync folder is allowed with a warning.
 M2 adds ``[index]`` (``IndexSettings``) and ``[search]`` (``SearchSettings``), design M2 §1.3. The
 index model is a manifest name or ``"none"``; the test-only hash embedder cannot be chosen here.
 M3 adds ``[server]`` (``ServerSettings``), design M3 §1.
+M5 (design M5 remote §1.2, §4.1, §4.6): ``[push] url`` (``PushSettings``; the token is never here: environment
+``WORKMCP_PUSH_TOKEN`` or a token file in the data home) and the operating server's ``[server]`` keys ``http``
+(loopback ``HOST:PORT`` only), ``http_path``, ``allowed_hosts``, ``push_max_mb`` and ``model_preload``.
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import models, paths, store
+from . import models, paths, store, sync
 from .parsers import Limits
 
 CONFIG_NAME = 'config.toml'
@@ -31,7 +34,11 @@ SOURCE_KEYS = frozenset({'path', 'exclude', 'allow_network'})
 INDEX_KEYS = frozenset({'model', 'embed_batch', 'commit_every', 'threads'})
 SEARCH_KEYS = frozenset({'lexical_candidates', 'semantic_candidates', 'max_vectors_in_memory', 'threads',
                          'model_idle_seconds'})
-SERVER_KEYS = frozenset({'response_max_chars', 'unload_tick_seconds'})
+SERVER_KEYS = frozenset({'response_max_chars', 'unload_tick_seconds', 'http', 'http_path', 'allowed_hosts',
+                         'push_max_mb', 'model_preload'})
+PUSH_KEYS = frozenset({'url'})
+HTTP_HOSTS = ('127.0.0.1', '::1')             # serve --http binds loopback only; the proxy faces the network
+PUSH_MAX_MB_RANGE = (1, 64)
 RESPONSE_MAX_CHARS_RANGE = (4_000, 40_000)    # design M3 §4 (40,000 = tools.RESPONSE_MAX_CHARS)
 UNLOAD_TICK_RANGE = (1, 300)                  # design M3 §6.2
 NO_MODEL = 'none'  # [index] model = "none": chunks and FTS only (lexical search)
@@ -92,6 +99,18 @@ class ServerSettings:
     the idle-release tick of the long-lived server."""
     response_max_chars: int = 40_000
     unload_tick_seconds: int = 30
+    http: str = '127.0.0.1:8765'                # serve --http without a value binds this (loopback only)
+    http_path: str = '/workmcp'                 # prefix: <prefix>/mcp, <prefix>/push/*, <prefix>/healthz
+    allowed_hosts: tuple[str, ...] = ()         # Host header names accepted besides 127.0.0.1:* (the proxy's)
+    push_max_mb: int = sync.BATCH_MAX_BYTES // 2**20   # one push batch after decompression
+    model_preload: bool = False                 # load the model at start and never release it
+
+
+@dataclass(frozen=True)
+class PushSettings:
+    """``[push]`` (design M5 remote §1.2): the operating server's base URL, e.g.
+    ``https://<host>/workmcp``; None until configured (``push`` exits 4)."""
+    url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +130,7 @@ class Config:
     index: IndexSettings = IndexSettings()
     search: SearchSettings = SearchSettings()
     server: ServerSettings = ServerSettings()
+    push: PushSettings = PushSettings()
 
 
 @dataclass(frozen=True)
@@ -199,13 +219,58 @@ def _in_range(value, where: str, bounds: tuple[int, int]) -> int:
     return value
 
 
+def parse_http(text) -> tuple[str, int]:
+    """``(host, port)`` of ``serve --http`` / ``[server] http``: ``127.0.0.1:PORT`` or ``[::1]:PORT``.
+    ``ConfigError`` for any other host (no wildcard, no name: the reverse proxy is the only way in)."""
+    if not isinstance(text, str) or ':' not in text:
+        raise ConfigError('--http / [server] http must be 127.0.0.1:PORT or [::1]:PORT')
+    host, _, port_text = text.rpartition(':')
+    host = host[1:-1] if host.startswith('[') and host.endswith(']') else host
+    if host not in HTTP_HOSTS:
+        raise ConfigError(f'--http / [server] http host must be one of {", ".join(HTTP_HOSTS)} (loopback only)')
+    if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        raise ConfigError('--http / [server] http port must be 1-65535')
+    return host, int(port_text)
+
+
+def _host_names(value) -> tuple[str, ...]:
+    names = _strings(value, '[server] allowed_hosts')
+    for name in names:
+        if any(ch.isspace() or ch in '/@?#' for ch in name):
+            raise ConfigError('[server] allowed_hosts entries are host names (optionally :port), not URLs')
+    return names
+
+
 def _server_settings(table: dict) -> ServerSettings:
     d = ServerSettings()
+    http = table.get('http', d.http)
+    parse_http(http)
+    path = table.get('http_path', d.http_path)
+    if not isinstance(path, str) or not path.startswith('/') or path.endswith('/') or len(path) < 2 \
+            or any(ch.isspace() or ch in '?#' for ch in path):
+        raise ConfigError("[server] http_path must look like '/workmcp' (leading slash, no trailing slash)")
+    preload = table.get('model_preload', d.model_preload)
+    if not isinstance(preload, bool):
+        raise ConfigError('[server] model_preload must be true or false')
     return ServerSettings(
         response_max_chars=_in_range(table.get('response_max_chars', d.response_max_chars),
                                      '[server] response_max_chars', RESPONSE_MAX_CHARS_RANGE),
         unload_tick_seconds=_in_range(table.get('unload_tick_seconds', d.unload_tick_seconds),
-                                      '[server] unload_tick_seconds', UNLOAD_TICK_RANGE))
+                                      '[server] unload_tick_seconds', UNLOAD_TICK_RANGE),
+        http=http, http_path=path,
+        allowed_hosts=_host_names(table.get('allowed_hosts', list(d.allowed_hosts))),
+        push_max_mb=_in_range(table.get('push_max_mb', d.push_max_mb), '[server] push_max_mb', PUSH_MAX_MB_RANGE),
+        model_preload=preload)
+
+
+def _push_settings(table: dict) -> PushSettings:
+    url = table.get('url')
+    if url is None:
+        return PushSettings()
+    # http:// to a loopback host passes here; push itself still asks for --allow-insecure-loopback.
+    if not isinstance(url, str) or (problem := sync.url_problem(url, allow_insecure_loopback=True)):
+        raise ConfigError(f'[push] url: {problem if isinstance(url, str) else "must be a string"}')
+    return PushSettings(url=url)
 
 
 def parse_config(text: str, file: Path) -> Config:
@@ -213,7 +278,7 @@ def parse_config(text: str, file: Path) -> Config:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f'{file} is not valid TOML ({exc})') from None
-    if unknown := set(data) - {'scan', 'sources', 'index', 'search', 'server'}:
+    if unknown := set(data) - {'scan', 'sources', 'index', 'search', 'server', 'push'}:
         raise ConfigError(f'{file}: unknown table or key {sorted(unknown)}')
     scan = data.get('scan', {})
     if not isinstance(scan, dict):
@@ -248,7 +313,8 @@ def parse_config(text: str, file: Path) -> Config:
         entries.append(SourceEntry(item['path'], _strings(item.get('exclude', []), f'{where} exclude'), allow))
     return Config(file, True, settings, tuple(entries), _index_settings(_table(data, 'index', INDEX_KEYS, file), file),
                   _search_settings(_table(data, 'search', SEARCH_KEYS, file)),
-                  _server_settings(_table(data, 'server', SERVER_KEYS, file)))
+                  _server_settings(_table(data, 'server', SERVER_KEYS, file)),
+                  _push_settings(_table(data, 'push', PUSH_KEYS, file)))
 
 
 def load(home: Path) -> Config:

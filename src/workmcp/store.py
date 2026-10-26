@@ -10,7 +10,8 @@ Schema v1 was edited in place through M2 (design M1 §10.1); a development store
 earlier v1 is refused by the checksum check (delete it and scan again). From M3 on v1 is frozen
 and every change is a new migration: v2 adds the tool call log, ``deliveries.call_id`` and
 ``document_events`` (design M3 §3.4); v3 adds the knowledge columns, ``assertion_events`` and the
-entity/link guards (design M4 §2.3).
+entity/link guards (design M4 §2.3); v4 the unit lookup index; v5 the operating server's collectors, tokens
+(SHA-256 only), push records and collector id maps (design M5 remote §2.2).
 """
 from __future__ import annotations
 
@@ -294,9 +295,61 @@ SCHEMA_V4 = """
 CREATE INDEX units_locator ON units(version_id, locator_json);
 """
 
+# M5 (design M5 remote §2.2): the operating server mirrors what collectors push. Additive only; a collector
+# home gets the same tables and leaves them empty. Tokens keep only their SHA-256 (the plain token is shown
+# once by ``token issue``); a token row never changes except ``last_used_at`` and one ``revoked_at``, and its
+# two unique keys (id, token_sha256) are guarded against REPLACE like versions. ``source_roots.collector_id``
+# names the collector that owns a root on the server (NULL on a collector or a local home). ``pushes`` is one
+# row per push run (with its server ``scans`` row), ``push_batches`` the idempotency record per batch id,
+# ``push_parts`` the parts of a split version until the last one arrives; ``collector_documents`` and
+# ``collector_versions`` map a collector's own rowids to the server's.
+SCHEMA_V5 = """
+CREATE TABLE collectors(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL, last_push_at TEXT, retired_at TEXT, note TEXT);
+
+CREATE TABLE tokens(id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('mcp','push')),
+  name TEXT NOT NULL, token_sha256 TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
+  collector_id INTEGER REFERENCES collectors(id),
+  created_at TEXT NOT NULL, revoked_at TEXT, last_used_at TEXT,
+  CHECK((kind = 'push') = (collector_id IS NOT NULL)));
+CREATE TRIGGER tokens_update_guard BEFORE UPDATE ON tokens
+  WHEN NEW.id <> OLD.id OR NEW.kind <> OLD.kind OR NEW.name <> OLD.name OR NEW.token_sha256 <> OLD.token_sha256
+    OR NEW.prefix <> OLD.prefix OR NEW.collector_id IS NOT OLD.collector_id OR NEW.created_at <> OLD.created_at
+    OR (OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS NOT OLD.revoked_at)
+  BEGIN SELECT RAISE(ABORT, 'token is append-only (revoke once, last_used_at only)'); END;
+CREATE TRIGGER tokens_no_delete BEFORE DELETE ON tokens BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER tokens_no_replace BEFORE INSERT ON tokens
+  WHEN EXISTS(SELECT 1 FROM tokens WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER tokens_no_replace_sha BEFORE INSERT ON tokens
+  WHEN EXISTS(SELECT 1 FROM tokens WHERE token_sha256 = NEW.token_sha256)
+  BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+
+ALTER TABLE source_roots ADD COLUMN collector_id INTEGER REFERENCES collectors(id);
+
+CREATE TABLE pushes(id INTEGER PRIMARY KEY, collector_id INTEGER NOT NULL REFERENCES collectors(id),
+  scan_id INTEGER REFERENCES scans(id), started_at TEXT NOT NULL, finished_at TEXT,
+  status TEXT NOT NULL CHECK(status IN ('running','done','aborted')),
+  batches INTEGER NOT NULL DEFAULT 0, bytes_in INTEGER NOT NULL DEFAULT 0,
+  counts_json TEXT NOT NULL DEFAULT '{}', client_version TEXT, note TEXT);
+CREATE TABLE push_batches(batch_id TEXT PRIMARY KEY, push_id INTEGER NOT NULL REFERENCES pushes(id),
+  kind TEXT NOT NULL, applied_at TEXT NOT NULL, bytes_in INTEGER NOT NULL, response_json TEXT NOT NULL);
+CREATE TABLE push_parts(push_id INTEGER NOT NULL REFERENCES pushes(id), local_version_id INTEGER NOT NULL,
+  part INTEGER NOT NULL, parts INTEGER NOT NULL, body_json TEXT NOT NULL, received_at TEXT NOT NULL,
+  PRIMARY KEY(push_id, local_version_id, part));
+
+CREATE TABLE collector_documents(collector_id INTEGER NOT NULL REFERENCES collectors(id),
+  local_document_id INTEGER NOT NULL, document_id INTEGER NOT NULL UNIQUE REFERENCES documents(id),
+  PRIMARY KEY(collector_id, local_document_id));
+CREATE TABLE collector_versions(collector_id INTEGER NOT NULL REFERENCES collectors(id),
+  local_version_id INTEGER NOT NULL, version_id INTEGER NOT NULL UNIQUE REFERENCES versions(id),
+  units_sha256 TEXT,
+  PRIMARY KEY(collector_id, local_version_id));
+"""
+
 # (version, name, sql). Never edit an applied entry; append a new one.
 MIGRATIONS = [(1, 'initial_schema_v1', SCHEMA_V1), (2, 'tool_calls_events_v2', SCHEMA_V2),
-              (3, 'knowledge_v3', SCHEMA_V3), (4, 'units_locator_v4', SCHEMA_V4)]
+              (3, 'knowledge_v3', SCHEMA_V3), (4, 'units_locator_v4', SCHEMA_V4), (5, 'remote_sync_v5', SCHEMA_V5)]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 EVENT_KINDS = ('added', 'changed', 'restored', 'deleted', 'reparsed')
 # Knowledge (design M4 §2): the kinds M4 writes ('term' stays in the v1 CHECK, unused), task states,
@@ -548,6 +601,30 @@ def last_index(db: sqlite3.Connection) -> dict | None:
     counts = json.loads(row[2] or '{}')
     return {'at': row[0], 'chunks': counts.get('chunks_total', 0), 'embedded': counts.get('embedded', 0),
             'reused': counts.get('reused_vectors', 0), 'model': counts.get('model'), 'model_key': row[1]}
+
+
+COLLECTOR_STATUS_KEYS = ('name', 'roots', 'documents', 'last_push_at')     # design M5 remote §4.7
+LAST_PUSH_KEYS = ('collector', 'at', 'documents', 'units', 'vectors')
+
+
+def collector_status(db: sqlite3.Connection) -> list[dict]:
+    """``status.collectors`` on the operating server (v5 tables): one row per collector, counts only."""
+    rows = db.execute(
+        'SELECT c.name, (SELECT COUNT(*) FROM source_roots r WHERE r.collector_id = c.id), '
+        '(SELECT COUNT(*) FROM collector_documents m WHERE m.collector_id = c.id), c.last_push_at '
+        'FROM collectors c ORDER BY c.id').fetchall()
+    return [dict(zip(COLLECTOR_STATUS_KEYS, row)) for row in rows]
+
+
+def last_push(db: sqlite3.Connection) -> dict | None:
+    """``status.last_push``: the last finished push ``{collector, at, documents, units, vectors}`` or None
+    (``pushes.counts_json`` holds the sent counts under those names)."""
+    row = db.execute("SELECT c.name, p.finished_at, p.counts_json FROM pushes p JOIN collectors c "
+                     "ON c.id = p.collector_id WHERE p.status = 'done' ORDER BY p.id DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    counts = json.loads(row[2] or '{}')
+    return {'collector': row[0], 'at': row[1], **{key: counts.get(key, 0) for key in ('documents', 'units', 'vectors')}}
 
 
 # -- chunks and the FTS index (design M2 §4.3, L-8) ------------------------------------------

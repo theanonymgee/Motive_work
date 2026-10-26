@@ -279,3 +279,31 @@ def db_path(home: Path) -> Path:
 
 def models_dir(home: Path) -> Path:
     return home/'models'
+
+
+PUSH_TOKEN_ENV = 'WORKMCP_PUSH_TOKEN'
+PUSH_TOKEN_FILE = 'push.token'
+
+
+class TokenFileError(Exception):
+    """The push token file is outside the data home, missing, unreadable or empty (push exit 4)."""
+
+
+def read_token(home: Path, path: str | os.PathLike | None = None) -> str:
+    """The collector's push token from ``path`` (default ``<home>/push.token``), stripped (design M5 remote
+    §4.2, §6.4). The file must lie inside the data home (outside the repository and sync folders by the home
+    rules), so ``push`` never reads any other file; the token itself is never printed or logged."""
+    home = Path(home).resolve()
+    file = Path(path) if path is not None else home/PUSH_TOKEN_FILE
+    file = (file if file.is_absolute() else home/file).resolve()
+    if not _within(file, home) or file == home:
+        raise TokenFileError(f'the push token file must be inside the data home {home}')
+    try:
+        token = file.read_text(encoding='utf-8-sig').strip()
+    except FileNotFoundError:
+        raise TokenFileError(f'push token file not found: {file}') from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TokenFileError(f'cannot read the push token file {file} ({type(exc).__name__})') from None
+    if not token or any(ch.isspace() for ch in token):
+        raise TokenFileError(f'the push token file {file} must hold one token on one line')
+    return token

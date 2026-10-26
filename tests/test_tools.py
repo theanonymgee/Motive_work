@@ -125,7 +125,7 @@ def test_status_has_engine_virtualization_calls_and_process(home):
     engine = search.Engine(home, config.SearchSettings(model_idle_seconds=60),
                            embedder_factory=lambda: embedder.HashEmbedder(64), clock=clock)
     result = tools.status(home, engine, started_at='2026-10-24T09:00:00+09:00', unloads=2)['result']
-    assert set(result) == tools.STATUS_KEYS and result['schema_version'] == store.SCHEMA_VERSION == 4
+    assert set(result) == tools.STATUS_KEYS and result['schema_version'] == store.SCHEMA_VERSION == 5
     assert result['knowledge'] == {'entities': 0, 'assertions': {'active': 0, 'conflict': 0, 'withdrawn': 0,
                                                                  'superseded': 0},
                                    'tasks_open': 0, 'evidence': 0, 'events': 0}

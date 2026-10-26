@@ -21,6 +21,11 @@ M5: ``setup`` (design M5 §2.3, §12; body in ``setup.py``, imported only here a
 exit 0 done, 1 a step failed, 2 data home refused (an AppData home without ``--yes`` too), 3 a store,
 scan or index lock is held (``--upgrade``), 4 arguments. ``doctor`` also reports the venv in use and a
 polluted shell (``PYTHONPATH`` set, a foreign ``VIRTUAL_ENV``; design M5 §2.7).
+
+M5 remote (design M5 remote §4.6; stage 0 fixes the arguments, the bodies come in stage 1 and a stage-0 body
+answers exit 1 with "not implemented"): ``serve --http [HOST:PORT]`` (``remote.main``; loopback host only, else
+exit 4; 5 port in use), ``push`` (``push.main``: 0, 1, 2, 4, 6), ``token issue|list|revoke|rotate`` and
+``collectors [retire NAME]`` (``remote``; 0/4), ``verify --stored`` (stored text only, no original file).
 """
 from __future__ import annotations
 
@@ -330,6 +335,13 @@ def verify(args) -> int:
     db, code = _open_store(home)
     if code:
         return code
+    if args.stored:  # design M5 remote §5.2: binding.verify(..., stored_only=True) in stage 1
+        db.close()
+        if args.root:
+            print('--stored checks the stored text only; --root needs the original files', file=sys.stderr)
+            return 4
+        print('verify --stored: not implemented yet (M5 stage 1)', file=sys.stderr)
+        return 1
     try:
         root_ids = None
         if args.root:
@@ -601,11 +613,38 @@ def sources(args) -> int:
     return 0
 
 
+def serve_http(args) -> int:
+    """``serve --http [HOST:PORT]``: the operating server (``remote.main``); without a value ``[server] http``."""
+    from . import config
+    home, code = _home()
+    if code:
+        return code
+    try:
+        cfg = config.load(home)
+        host, port = config.parse_http(args.http or cfg.server.http)
+    except config.ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 4
+    from . import remote  # the MCP SDK's HTTP parts load only when serving over HTTP
+    return remote.main(home, host, port, cfg)
+
+
+def _stage1(function, args) -> int:
+    """Run a command body; a stage-0 body (``NotImplementedError``) answers exit 1 with its message."""
+    try:
+        return function(args)
+    except NotImplementedError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog='workmcp')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('doctor', help='check data home, Python, SQLite/FTS5, mcp, model files and source roots')
-    sub.add_parser('serve', help='run the stdio MCP server')
+    serve_parser = sub.add_parser('serve', help='run the stdio MCP server (or, with --http, the operating server)')
+    serve_parser.add_argument('--http', nargs='?', const='', metavar='HOST:PORT',
+                              help='Streamable HTTP on a loopback address (default: config [server] http)')
     scan_parser = sub.add_parser('scan', help='collect the source roots incrementally')
     scan_parser.add_argument('--root', action='append', metavar='PATH', help='scan this folder instead of config.toml')
     scan_parser.add_argument('--retry-failed', action='store_true', help='parse failed files again')
@@ -614,6 +653,31 @@ def main(argv=None) -> int:
     verify_parser = sub.add_parser('verify', help='check that stored units re-derive from the current files')
     verify_parser.add_argument('--root', action='append', metavar='PATH')
     verify_parser.add_argument('--doc', action='append', type=int, metavar='ID')
+    verify_parser.add_argument('--stored', action='store_true',
+                               help='check the stored text only (operating server: no original files)')
+    push_parser = sub.add_parser('push', help='send the changes of this collector to the operating server')
+    push_parser.add_argument('--max-mb', type=int, metavar='N', help='send at most N MiB in this run')
+    push_parser.add_argument('--limit-docs', type=int, metavar='N', help='at most N changed documents in this run')
+    push_parser.add_argument('--token-file', metavar='PATH', help='push token file inside the data home '
+                                                                  '(default push.token; or WORKMCP_PUSH_TOKEN)')
+    push_parser.add_argument('--dry-run', action='store_true', help='compare with the server, send nothing')
+    push_parser.add_argument('--require-vectors', action='store_true',
+                             help='exit 1 while a chunk has no vector yet')
+    push_parser.add_argument('--allow-insecure-loopback', action='store_true',
+                             help='allow an http:// [push] url to a loopback test server')
+    token_parser = sub.add_parser('token', help='operating server: issue, list, revoke or rotate access tokens')
+    token_sub = token_parser.add_subparsers(dest='token_command', required=True)
+    issue_parser = token_sub.add_parser('issue', help='new token, printed once')
+    issue_parser.add_argument('--kind', required=True, metavar='mcp|push')
+    issue_parser.add_argument('--name', required=True, metavar='NAME')
+    issue_parser.add_argument('--collector', metavar='NAME', help='push: the collector (default: --name)')
+    token_sub.add_parser('list', help='tokens without their secret')
+    for action in ('revoke', 'rotate'):
+        token_sub.add_parser(action).add_argument('id', type=int, metavar='ID')
+    collectors_parser = sub.add_parser('collectors', help='operating server: list collectors or retire one')
+    collectors_sub = collectors_parser.add_subparsers(dest='collectors_command')
+    collectors_sub.add_parser('retire', help='revoke its push tokens; its data stays').add_argument('name',
+                                                                                                    metavar='NAME')
     sub.add_parser('sources', help='list the configured source roots and their state')
     index_parser = sub.add_parser('index', help='chunk and embed the collected versions incrementally')
     index_parser.add_argument('--model', metavar='NAME', help='manifest model or "none" (default: config [index] model)')
@@ -673,5 +737,13 @@ def main(argv=None) -> int:
     if args.command == 'setup':
         from . import setup  # the only importer of setup (network boundary test)
         return setup.main(args)
+    if args.command == 'push':
+        from . import push
+        return _stage1(push.main, args)
+    if args.command in ('token', 'collectors'):
+        from . import remote
+        return _stage1(remote.token_command if args.command == 'token' else remote.collectors_command, args)
+    if args.command == 'serve' and args.http is not None:
+        return _stage1(serve_http, args)
     from . import server  # imports the MCP SDK only when serving
     return server.main()

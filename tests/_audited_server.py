@@ -1,6 +1,7 @@
 """Test-only wrapper: install an audit hook, then run the package (design M0 §7.2, M1 §4.3).
 
-Usage: ``python tests/_audited_server.py LOG_JSON [serve [ROOT]|imports|probe|scan ROOT|index ROOT|search ROOT|embed]``
+Usage: ``python tests/_audited_server.py LOG_JSON [serve [ROOT]|imports|probe|scan ROOT|index ROOT|search ROOT|embed|
+remote ...|push ...]``
 
 - ``serve [ROOT]`` (default): ``workmcp.server.main()``; stdin/stdout are the MCP stdio transport. With
   ROOT (the source folder the test scanned into the data home beforehand), ROOT is the source root of
@@ -26,6 +27,12 @@ Usage: ``python tests/_audited_server.py LOG_JSON [serve [ROOT]|imports|probe|sc
 - ``embed`` (M2): the real model from the data home, only when it is there: ``mode_embed`` delegates to
   ``tests/_embed_mode.py`` ``run(home)``; otherwise ``skipped: model_missing``.
   A mode whose package function is still a stage-0 stub reports ``skipped`` (the test skips).
+- ``remote`` (M5 remote §6.2): ``workmcp serve --http 127.0.0.1:<port>`` under ``judge_remote`` (its own
+  listener on that port and numeric loopback lookups allowed; no egress, no name resolution, no process).
+- ``push`` (M5 remote §6.3): ``workmcp push`` under ``judge_push`` with a ``PushTarget`` (the configured
+  server's host, port, resolved addresses and URL prefix only; ``source_opens`` must be 0). Its body is
+  ``tests/_audit_push.py`` ``run(argv)`` (stage 1, design §11.2); without that file, ``skipped``.
+  Stage 0 has the judges and the mode names; both modes report ``skipped`` until stage 1.
 
 Runtime boundary: no socket connect/bind/send to an address other than loopback (127.0.0.1,
 ::1), no name resolution and no process creation. Loopback is allowed only because the
@@ -43,6 +50,7 @@ log is written to LOG_JSON (never stdout, which belongs to JSON-RPC in ``serve``
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote  # string handling only; no network
 
@@ -96,6 +104,80 @@ def judge(event: str, args: tuple) -> str | None:
     if event.startswith(NETWORK_EVENTS):
         return f'network library {event}'
     return None
+
+
+def _host_text(host) -> str | None:
+    if isinstance(host, bytes):
+        try:
+            return host.decode('ascii')
+        except UnicodeDecodeError:
+            return None
+    return host if isinstance(host, str) else None
+
+
+def judge_remote(event: str, args: tuple, port: int) -> str | None:
+    """The operating server (mode ``remote``, design M5 remote §6.2): ``judge`` plus its own listener on a
+    loopback address at ``port`` and a lookup of a numeric loopback host (uvicorn may resolve the bind
+    address). Any other bind, any name, any non-loopback address, HTTP client or process stays a violation:
+    the server has no egress."""
+    if event == 'socket.bind':
+        address = args[1] if len(args) > 1 else None
+        if is_loopback(address) and address[1] == port:
+            return None
+    if event == 'socket.getaddrinfo' and args and _host_text(args[0]) in LOOPBACK:
+        return None
+    return judge(event, args)
+
+
+@dataclass(frozen=True)
+class PushTarget:
+    """The configured server of a push run: host as written in ``[push] url``, port, the addresses that host
+    resolves to, and the URL prefix every request must start with (ending in ``/``)."""
+    host: str
+    port: int
+    addresses: frozenset
+    url_prefix: str
+
+
+def _port_number(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode('ascii', 'replace')
+    return int(value) if isinstance(value, str) and value.isdigit() else None
+
+
+def judge_push(event: str, args: tuple, target: PushTarget) -> str | None:
+    """A collector's push (mode ``push``, design M5 remote §6.3): only the configured server. Name lookup of
+    its host and port, connects to its addresses at its port, ``http.client`` connections to it (and sends on
+    them) and ``urllib`` requests under its URL prefix; everything else as ``judge`` except that a loopback
+    connect elsewhere is a violation too (a collector has no event-loop socket pair)."""
+    if event == 'socket.getaddrinfo':
+        host, port = (tuple(args) + (None, None))[:2]
+        if _host_text(host) == target.host and _port_number(port) == target.port:
+            return None
+        return f'name resolution of {host!r}:{port!r} (only the configured server)'
+    if event == 'socket.connect':
+        address = args[1] if len(args) > 1 else None
+        if isinstance(address, tuple) and len(address) >= 2 and address[0] in target.addresses \
+                and address[1] == target.port:
+            return None
+        return f'socket.connect to {address!r} (only the configured server)'
+    if event == 'http.client.connect':
+        host, port = (tuple(args) + (None, None, None))[1:3]
+        if host == target.host and port == target.port:
+            return None
+        return f'http.client.connect to {host!r}:{port!r} (only the configured server)'
+    if event == 'http.client.send':
+        return None  # on a connection http.client.connect allowed above
+    if event == 'urllib.Request':
+        url = args[0] if args else None
+        if isinstance(url, str) and url.startswith(target.url_prefix):
+            return None
+        return f'urllib.Request {url!r} (only under the configured server URL)'
+    return judge(event, args)
 
 
 def _plain(text: str) -> str:
@@ -228,7 +310,11 @@ def imports() -> dict:
         setup_plan = sorted(setup.plan(setup.Options(home=str(home), model='none')))
     except NotImplementedError:  # stage 0: signature only
         setup_plan = 'not_implemented'
-    return {'modules': names, 'loaded': sorted(sys.modules), 'setup_plan': setup_plan}
+    from workmcp import remote  # M5 remote §6.6: the pure token check runs under the hook
+    token, digest, _ = remote.new_token()
+    token_check = remote.verify_token_sha(digest, token) and not remote.verify_token_sha(digest, token + 'x')
+    return {'modules': names, 'loaded': sorted(sys.modules), 'setup_plan': setup_plan,
+            'remote_token_check': token_check}
 
 
 def probe() -> dict:
@@ -428,6 +514,24 @@ def embed() -> dict:
         return {'skipped': NOT_IMPLEMENTED}
 
 
+STAGE1_M5 = 'not_implemented (M5 remote stage 1)'
+
+
+def remote_mode(argv) -> dict:
+    """``remote PORT [ROOT]``: stage 1 runs ``cli.main(['serve', '--http', f'127.0.0.1:{PORT}'])`` with
+    ``judge_remote`` (design §6.2; the test terminates the process and reads the appended log)."""
+    return {'skipped': STAGE1_M5}
+
+
+def push_mode(argv) -> dict:
+    """``push ...``: delegates to ``tests/_audit_push.py`` ``run(argv)`` (B's file, stage 1) under
+    ``judge_push``; without it, skipped."""
+    if not (Path(__file__).resolve().parent/'_audit_push.py').is_file():
+        return {'skipped': STAGE1_M5}
+    import _audit_push
+    return _audit_push.run(argv)
+
+
 def main(argv) -> int:
     log, mode = Path(argv[1]), (argv[2] if len(argv) > 2 else 'serve')
     sys.addaudithook(hook)
@@ -452,6 +556,9 @@ def main(argv) -> int:
             code = 0
         elif mode == 'embed':
             report.update(embed())
+            code = 0
+        elif mode in ('remote', 'push'):
+            report.update((remote_mode if mode == 'remote' else push_mode)(argv[3:]))
             code = 0
         else:
             raise SystemExit(f'unknown mode {mode!r}')

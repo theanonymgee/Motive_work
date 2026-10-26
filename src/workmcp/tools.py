@@ -79,7 +79,11 @@ CHANGE_KEYS = frozenset({'id', 'at', 'kind', 'doc', 'version_id', 'seq', 'sha256
 CHANGE_DOC_KEYS = frozenset({'id', 'path', 'ext', 'status'})
 CHANGES_RESULT_KEYS = frozenset({'changes', 'total', 'limit', 'offset', 'has_more', 'since', 'until'})
 STATUS_KEYS = frozenset({'home', 'schema_version', 'db', 'model', 'fts5', 'last_scan', 'index', 'delivery_log_count',
-                         'engine', 'home_virtualization', 'calls', 'process', 'knowledge'})
+                         'engine', 'home_virtualization', 'calls', 'process', 'knowledge', 'role', 'collectors',
+                         'last_push'})
+# M5 (design M5 remote §4.7): 'local' (stdio server or collector home: collectors [], last_push None) or
+# 'server' (the operating server: store.collector_status, store.last_push).
+ROLES = ('local', 'server')
 KNOWLEDGE_STATUS_KEYS = frozenset({'entities', 'assertions', 'tasks_open', 'evidence', 'events'})  # store.knowledge_counts
 ENGINE_STATUS_EXTRA_KEYS = frozenset({'idle_seconds', 'model_idle_seconds', 'loads', 'unloads'})  # + Engine.status()
 
@@ -652,10 +656,14 @@ def engine_status(engine, unloads: int = 0) -> dict | None:
             'model_idle_seconds': engine.settings.model_idle_seconds, 'loads': engine.loads, 'unloads': unloads}
 
 
-def status(home: Path, engine=None, *, started_at: str | None = None, unloads: int = 0, pending: int = 0) -> dict:
+def status(home: Path, engine=None, *, started_at: str | None = None, unloads: int = 0, pending: int = 0,
+           role: str = 'local') -> dict:
     """Data home, store counts, last finished scan and index run, model availability, FTS5 support,
     the FTS index state, the search engine of this process, app virtualization of the home, tool
-    calls per client and this process (design M3 §2.6), knowledge counts (design M4 §6.4); no source text."""
+    calls per client and this process (design M3 §2.6), knowledge counts (design M4 §6.4), the role of this
+    server with its collectors and last push (design M5 remote §4.7); no source text."""
+    if role not in ROLES:
+        raise ValueError(f'role must be one of {ROLES}')
     try:
         db = store.open_read(home)
     except FileNotFoundError as exc:
@@ -668,6 +676,8 @@ def status(home: Path, engine=None, *, started_at: str | None = None, unloads: i
         index = _index_status(db)
         calls = store.call_counts(db)
         knowledge_counts = store.knowledge_counts(db)
+        collectors = store.collector_status(db) if role == 'server' else []
+        last_push = store.last_push(db) if role == 'server' else None
     finally:
         db.close()
     result = {
@@ -685,6 +695,9 @@ def status(home: Path, engine=None, *, started_at: str | None = None, unloads: i
         'calls': {**calls, 'pending': pending},  # pending: calls this server could not log yet
         'process': {'pid': os.getpid(), 'started_at': started_at, 'python': list(sys.version_info[:3])},
         'knowledge': knowledge_counts,
+        'role': role,
+        'collectors': collectors,
+        'last_push': last_push,
     }
     notice = ['아직 수집(scan)한 적이 없습니다.'] if result['last_scan'] is None else []
     fts = index['fts']

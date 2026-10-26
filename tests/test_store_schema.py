@@ -1,6 +1,7 @@
 """Empty schema v1, migration ledger and append-only triggers (design §3.2), the M2 schema edits and the
 chunk/FTS functions (design M2 §1.4, §4.3), migration v2 (design M3 §3.4): tool call log, delivery rows,
-document events and their queries. Synthetic rows only."""
+document events and their queries; migrations v3/v4 (design M4) and v5 (design M5 remote §2.2): collectors,
+tokens (SHA-256 only, append-only), push records and collector id maps. Synthetic rows only."""
 import json
 import os
 import re
@@ -15,7 +16,8 @@ from workmcp import paths, store, tools
 
 TABLES = {'schema_migrations', 'source_roots', 'documents', 'versions', 'units', 'chunks', 'chunk_vectors',
           'entities', 'assertions', 'evidence', 'links', 'deliveries', 'scans', 'meta', 'index_runs',
-          'tool_calls', 'document_events', 'assertion_events'}
+          'tool_calls', 'document_events', 'assertion_events', 'collectors', 'tokens', 'pushes', 'push_batches',
+          'push_parts', 'collector_documents', 'collector_versions'}
 TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_status_guard', 'assertions_no_delete',
             'assertions_no_replace', 'evidence_no_update', 'evidence_no_delete', 'evidence_no_replace',
             'versions_update_guard', 'versions_no_delete', 'versions_no_replace', 'versions_no_replace_seq',
@@ -25,7 +27,8 @@ TRIGGERS = {'assertions_closed_guard', 'assertions_update_guard', 'assertions_st
             'assertions_v3_update_guard', 'assertions_v3_dates', 'assertions_v3_shape', 'entities_update_guard',
             'entities_no_delete', 'entities_no_replace', 'entities_no_replace_name', 'links_update_guard',
             'links_no_delete', 'links_no_replace', 'assertion_events_no_update', 'assertion_events_no_delete',
-            'assertion_events_no_replace'}
+            'assertion_events_no_replace', 'tokens_update_guard', 'tokens_no_delete', 'tokens_no_replace',
+            'tokens_no_replace_sha'}
 INDEXES = {'versions_sha256', 'versions_by_sha256', 'chunks_text', 'tool_calls_at', 'deliveries_call',
            'document_events_at', 'document_events_doc', 'assertions_subject', 'assertions_object',
            'assertions_supersedes', 'links_from', 'links_to', 'assertion_events_assertion', 'units_locator'}
@@ -53,8 +56,9 @@ def test_empty_db_has_schema_v1_v2_and_v3(db):
     assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
     assert db.execute('PRAGMA foreign_keys').fetchone()[0] == 1
     rows = db.execute('SELECT version, name FROM schema_migrations').fetchall()
-    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2'), (3, 'knowledge_v3'), (4, 'units_locator_v4')]
-    assert store.SCHEMA_VERSION == 4
+    assert rows == [(1, 'initial_schema_v1'), (2, 'tool_calls_events_v2'), (3, 'knowledge_v3'), (4, 'units_locator_v4'),
+                    (5, 'remote_sync_v5')]
+    assert store.SCHEMA_VERSION == 5
     assert all(db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] == 0 for t in TABLES - {'schema_migrations'})
     if store.fts5_available():
         assert 'chunks_fts' in names(db, 'table')
@@ -65,7 +69,7 @@ def test_migrate_is_idempotent_and_detects_edited_migration(db, monkeypatch):
     monkeypatch.setattr(store, 'MIGRATIONS', [(1, 'initial_schema_v1', store.SCHEMA_V1 + '\n-- edited\n')])
     with pytest.raises(RuntimeError, match='checksum changed'):
         store.migrate(db)
-    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 4
+    assert db.execute('SELECT COUNT(*) FROM schema_migrations').fetchone()[0] == 5
 
 
 def test_statement_splitter_keeps_trigger_bodies():
@@ -331,7 +335,7 @@ def test_status_tool_reads_without_migrating(tmp_path):
     response = tools.status(home)
     assert response['ok'] and response['delivered_sources'] == []
     result = response['result']
-    assert result['schema_version'] == 4
+    assert result['schema_version'] == 5
     assert result['db'] == {'documents': 0, 'versions': 0, 'chunks': 0, 'vectors': 0}
     assert result['model']['name'] == 'bge-m3' and result['model']['available'] is False
 
@@ -712,7 +716,7 @@ def test_migration_v2_upgrades_a_v1_store_in_place(tmp_path, monkeypatch):
     monkeypatch.undo()
     upgraded = store.open_home(home)
     try:
-        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4]
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4, 5]
         assert upgraded.execute('SELECT chars, call_id FROM deliveries').fetchall() == [(3, '')]
         assert store.migrate(upgraded) == []
     finally:
@@ -732,10 +736,11 @@ def test_migrations_apply_once_under_two_processes(tmp_path):
                              text=True, env=env) for _ in range(2)]
     outputs = [run.communicate(timeout=120) for run in runs]
     assert [run.returncode for run in runs] == [0, 0], outputs
-    assert [out.strip() for out, _ in outputs] == ['4', '4']
+    assert [out.strip() for out, _ in outputs] == ['5', '5']
     check = sqlite3.connect(paths.db_path(home))
     try:
-        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]
+        assert check.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [
+            (1,), (2,), (3,), (4,), (5,)]
     finally:
         check.close()
 
@@ -948,7 +953,7 @@ def knowledge_rows(db):
 
 
 def test_migration_v3_adds_knowledge_columns_tables_triggers_indexes(db):
-    assert store.SCHEMA_VERSION == 4 and store.MIGRATIONS[2][:2] == (3, 'knowledge_v3')
+    assert store.SCHEMA_VERSION == 5 and store.MIGRATIONS[2][:2] == (3, 'knowledge_v3')
     assert columns(db, 'assertions')[-2:] == ['predicate', 'object_entity_id']
     assert columns(db, 'assertion_events') == ['id', 'assertion_id', 'at', 'kind', 'reason', 'related_id',
                                                'recorded_by', 'call_id']
@@ -974,7 +979,7 @@ def test_migration_v3_upgrades_a_v2_store_in_place(tmp_path, monkeypatch):
     monkeypatch.undo()
     upgraded = store.open_home(home)
     try:
-        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4]
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4, 5]
         assert upgraded.execute('SELECT predicate, object_entity_id FROM assertions WHERE id=?', (before,)).fetchone() \
             == (None, None)
         # a row from before v3 can still be closed (the shape trigger checks inserts only)
@@ -1136,7 +1141,155 @@ def test_migration_v4_upgrades_a_v3_store_in_place(tmp_path, monkeypatch):
     monkeypatch.undo()
     upgraded = store.open_home(home)
     try:
-        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4]
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4, 5]
         assert 'units_locator' in names(upgraded, 'index') and store.migrate(upgraded) == []
+    finally:
+        upgraded.close()
+
+
+# ---- migration v5: the operating server's collectors, tokens and push records (design M5 remote §2.2) -------
+
+# Applied migrations never change (a real home holds these checksums): v1-v4 as they were before M5, v5 as added.
+CHECKSUMS = {1: '8af56d4806389a3c203106e716761371491aec393673bb8d5b52164c5858feec',
+             2: '4f4a3f6ca60a895ec9f4080123af85936df83caf63ffb07123b437dc158d1c0b',
+             3: '8a5fb855fa097a080861523499f83f6a8ba0ae862a1fa08f8217e971d15c6592',
+             4: '548f45f16d520dbfea0b3ccf4f8f0ffbbd1e55e78322c823865c0311bcd99bc0',
+             5: '31c6f2f87383b1b39a0c1d0fa1b52ac3dd7af15dfe91eef2fca57668d9074a8c'}
+
+
+def test_migration_checksums_are_pinned():
+    assert {version: store.migration_checksum(version) for version, _, _ in store.MIGRATIONS} == CHECKSUMS
+
+
+def test_migration_v5_tables_columns_and_keys(db):
+    assert store.MIGRATIONS[4][:2] == (5, 'remote_sync_v5')
+    assert columns(db, 'collectors') == ['id', 'name', 'created_at', 'last_push_at', 'retired_at', 'note']
+    assert columns(db, 'tokens') == ['id', 'kind', 'name', 'token_sha256', 'prefix', 'collector_id', 'created_at',
+                                     'revoked_at', 'last_used_at']
+    assert columns(db, 'source_roots')[-1] == 'collector_id'
+    assert columns(db, 'pushes') == ['id', 'collector_id', 'scan_id', 'started_at', 'finished_at', 'status', 'batches',
+                                     'bytes_in', 'counts_json', 'client_version', 'note']
+    assert columns(db, 'push_batches') == ['batch_id', 'push_id', 'kind', 'applied_at', 'bytes_in', 'response_json']
+    assert columns(db, 'push_parts') == ['push_id', 'local_version_id', 'part', 'parts', 'body_json', 'received_at']
+    assert columns(db, 'collector_documents') == ['collector_id', 'local_document_id', 'document_id']
+    assert columns(db, 'collector_versions') == ['collector_id', 'local_version_id', 'version_id', 'units_sha256']
+    unique = {table: sorted([c[2] for c in db.execute(f'PRAGMA index_info({r[1]})')]
+                            for r in db.execute(f'PRAGMA index_list({table})') if r[2])
+              for table in ('collectors', 'tokens', 'collector_documents', 'collector_versions', 'push_batches')}
+    assert unique == {'collectors': [['name']], 'tokens': [['token_sha256']],
+                      'collector_documents': [['collector_id', 'local_document_id'], ['document_id']],
+                      'collector_versions': [['collector_id', 'local_version_id'], ['version_id']],
+                      'push_batches': [['batch_id']]}
+    keys = {(r[3], r[2]) for r in db.execute('PRAGMA foreign_key_list(source_roots)')}
+    assert keys == {('collector_id', 'collectors')}
+
+
+def add_collector(db, name='합성-수집기'):
+    return db.execute('INSERT INTO collectors(name, created_at) VALUES(?, ?)', (name, NOW)).lastrowid
+
+
+def add_token(db, kind='mcp', sha='1' * 64, collector=None, name='합성-토큰'):
+    return db.execute('INSERT INTO tokens(kind, name, token_sha256, prefix, collector_id, created_at) '
+                      'VALUES(?, ?, ?, ?, ?, ?)', (kind, name, sha, sha[:6], collector, NOW)).lastrowid
+
+
+def test_tokens_store_only_a_hash_and_push_tokens_name_their_collector(db):
+    collector = add_collector(db)
+    assert add_token(db, 'mcp') and add_token(db, 'push', '2' * 64, collector)
+    for kind, owner in (('push', None), ('mcp', collector), ('other', None)):
+        with pytest.raises(sqlite3.IntegrityError):
+            add_token(db, kind, '3' * 64, owner)
+    with pytest.raises(sqlite3.IntegrityError):
+        add_token(db, 'push', '4' * 64, 999)  # foreign key
+
+
+@pytest.mark.parametrize('assignment', ["kind='push'", "name='other'", "token_sha256='" + '9' * 64 + "'",
+                                        "prefix='zzzzzz'", 'collector_id=1', "created_at='2000-01-01'", 'id=77'])
+def test_token_identity_cannot_change(db, assignment):
+    add_collector(db)
+    token = add_token(db)
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute(f'UPDATE tokens SET {assignment} WHERE id=?', (token,))
+
+
+def test_token_is_revoked_once_and_may_record_use(db):
+    token = add_token(db)
+    db.execute('UPDATE tokens SET last_used_at=? WHERE id=?', (NOW, token))
+    db.execute('UPDATE tokens SET revoked_at=? WHERE id=?', (LATER, token))
+    db.execute('UPDATE tokens SET last_used_at=? WHERE id=?', (LATER, token))
+    for value in (None, NOW):
+        with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+            db.execute('UPDATE tokens SET revoked_at=? WHERE id=?', (value, token))
+    assert db.execute('SELECT revoked_at, last_used_at FROM tokens').fetchone() == (LATER, LATER)
+
+
+@pytest.mark.parametrize('sql', [
+    'DELETE FROM tokens',
+    "INSERT OR REPLACE INTO tokens(id, kind, name, token_sha256, prefix, created_at) "
+    "VALUES(1, 'mcp', 'x', '" + '8' * 64 + "', '888888', '2026-10-26')",
+    "INSERT OR REPLACE INTO tokens(kind, name, token_sha256, prefix, created_at) "
+    "VALUES('mcp', 'x', '" + '1' * 64 + "', '111111', '2026-10-26')",
+    "REPLACE INTO tokens(kind, name, token_sha256, prefix, created_at) "
+    "VALUES('mcp', 'x', '" + '1' * 64 + "', '111111', '2026-10-26')",
+])
+def test_tokens_cannot_be_deleted_or_replaced(db, sql):
+    add_token(db)
+    before = db.execute('SELECT * FROM tokens').fetchall()
+    with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+        db.execute(sql)
+    assert db.execute('SELECT * FROM tokens').fetchall() == before
+
+
+def test_collector_maps_and_push_records(db):
+    collector = add_collector(db)
+    doc = add_document(db)
+    version = add_version(db, doc, 1, H)
+    db.execute('INSERT INTO collector_documents VALUES(?, 7, ?)', (collector, doc))
+    db.execute('INSERT INTO collector_versions(collector_id, local_version_id, version_id) VALUES(?, 9, ?)',
+               (collector, version))
+    with pytest.raises(sqlite3.IntegrityError):  # one server document belongs to one collector id
+        db.execute('INSERT INTO collector_documents VALUES(?, 8, ?)', (collector, doc))
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute('INSERT INTO collector_versions(collector_id, local_version_id, version_id) VALUES(?, 9, ?)',
+                   (collector, version))
+    push = db.execute("INSERT INTO pushes(collector_id, started_at, status) VALUES(?, ?, 'running')",
+                      (collector, NOW)).lastrowid
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO pushes(collector_id, started_at, status) VALUES(?, ?, 'other')", (collector, NOW))
+    db.execute("INSERT INTO push_batches VALUES(?, ?, 'documents', ?, 10, '{}')", (H, push, NOW))
+    with pytest.raises(sqlite3.IntegrityError):  # a batch id is applied once
+        db.execute("INSERT INTO push_batches VALUES(?, ?, 'documents', ?, 10, '{}')", (H, push, NOW))
+    db.execute("INSERT INTO push_parts VALUES(?, 9, 1, 2, '{}', ?)", (push, NOW))
+    db.execute("UPDATE pushes SET status='done', finished_at=?, counts_json=? WHERE id=?",
+               (LATER, json.dumps({'documents': 1, 'units': 3, 'vectors': 2}), push))
+    db.execute('UPDATE source_roots SET collector_id=?', (collector,))
+    assert store.collector_status(db) == [{'name': '합성-수집기', 'roots': 1, 'documents': 1, 'last_push_at': None}]
+    assert store.last_push(db) == {'collector': '합성-수집기', 'at': LATER, 'documents': 1, 'units': 3, 'vectors': 2}
+
+
+def test_status_reports_role_collectors_and_last_push(tmp_path):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    store.open_home(home).close()
+    local = tools.status(home)['result']
+    assert (local['role'], local['collectors'], local['last_push']) == ('local', [], None)
+    server = tools.status(home, role='server')['result']
+    assert (server['role'], server['collectors'], server['last_push']) == ('server', [], None)
+    with pytest.raises(ValueError):
+        tools.status(home, role='other')
+
+
+def test_migration_v5_upgrades_a_v4_store_in_place(tmp_path, monkeypatch):
+    home = paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+    monkeypatch.setattr(store, 'MIGRATIONS', store.MIGRATIONS[:4])
+    old = store.open_home(home)
+    root = old.execute(r"INSERT INTO source_roots(path, added_at) VALUES('C:\synthetic', ?)", (NOW,)).lastrowid
+    assert 'tokens' not in names(old, 'table')
+    old.close()
+    monkeypatch.undo()
+    upgraded = store.open_home(home)
+    try:
+        assert [r[0] for r in upgraded.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2, 3, 4, 5]
+        assert upgraded.execute('SELECT id, collector_id FROM source_roots').fetchall() == [(root, None)]
+        assert {'tokens', 'collectors', 'pushes'} <= names(upgraded, 'table') and store.migrate(upgraded) == []
     finally:
         upgraded.close()

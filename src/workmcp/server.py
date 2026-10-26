@@ -86,6 +86,7 @@ class ServerState:
     log_dropped: int = 0
     client: str = UNKNOWN_CLIENT
     call_id: str | None = None
+    role: str = 'local'      # 'server' on the operating server (remote.py, design M5 remote §4.7)
 
 
 def make_state(home: Path, *, engine: search.Engine | None = None, write_db: sqlite3.Connection | None = None,
@@ -137,7 +138,7 @@ TOOLS = {
     'list_documents': lambda st, **args: tools.list_documents(st.home, **args),
     'recent_changes': lambda st, **args: tools.recent_changes(st.home, **args),
     'status': lambda st, **args: tools.status(st.home, st.engine, started_at=st.started_at,
-                                              unloads=st.unloads, pending=len(st.pending)),
+                                              unloads=st.unloads, pending=len(st.pending), role=st.role),
     'record_entity': _writer('record_entity', tools.record_entity),
     'record_fact': _writer('record_fact', tools.record_fact),
     'record_decision': _writer('record_decision', tools.record_decision),
@@ -324,10 +325,15 @@ def _lifespan(state: ServerState):
     return lifespan
 
 
-def build_server(home: Path, *, engine: search.Engine | None = None, state: ServerState | None = None) -> MCPServer:
-    """The MCP server with the fifteen tools; ``server.workmcp_state`` is its ``ServerState``."""
+def build_server(home: Path, *, engine: search.Engine | None = None, state: ServerState | None = None,
+                 instructions: str = INSTRUCTIONS, auth=None, token_verifier=None) -> MCPServer:
+    """The MCP server with the fifteen tools; ``server.workmcp_state`` is its ``ServerState``.
+
+    The operating server (``remote.py``, design M5 remote §4.2, §4.7) passes its own ``instructions`` and the
+    SDK's ``auth`` (``AuthSettings``) with a ``token_verifier``; the stdio server passes neither."""
     state = state or make_state(home, engine=engine)
-    server = MCPServer('workmcp', version=__version__, instructions=INSTRUCTIONS, lifespan=_lifespan(state))
+    server = MCPServer('workmcp', version=__version__, instructions=instructions, lifespan=_lifespan(state),
+                       auth=auth, token_verifier=token_verifier)
 
     @server.tool(name='search', structured_output=False)
     async def search_tool(query: str, mode: str = 'hybrid', limit: StrictInt = 10, path_prefix: str | None = None,

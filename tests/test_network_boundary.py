@@ -11,6 +11,14 @@ no socket connect/bind/send to an address other than loopback (127.0.0.1, ::1), 
 resolution and no process creation; loopback is allowed only for the asyncio event loop's
 internal socket pair.
 
+M5 remote (design M5 remote §6): each module has its own allowed transport (``ALLOWED_RUN``): ``server.py``
+stdio, ``remote.py`` Streamable HTTP on a loopback literal host, nothing elsewhere. ``push.py`` may import
+``urllib`` inside functions (like ``models.py``), never ``ssl``, holds no URL literal, opens no file and does
+not import the collector, parsers or binding check; ``receive.py`` and ``sync.py`` stay offline and apart
+from ``push``/``remote``. The runtime modes ``remote`` (server: no egress, its own loopback listener) and
+``push`` (collector: the configured server only) have their judges here (``_audited_server.judge_remote``,
+``judge_push``); their runs come in stage 1.
+
 Ported in part from Motive_vari ``services/kakao_evidence/tests/test_kakao_isolation.py``
 (tag kakao-p1-complete-20261022).
 """
@@ -69,7 +77,21 @@ MODULE_IMPORTS = {
     # M5 (design M5 §9.3): setup writes config/client files from string templates and backs up the store
     # with ``open`` blocks, so it needs nothing beyond the common list (no ``shutil``, no ``subprocess``).
     'setup.py': frozenset(),
+    # M5 remote (design M5 remote §6.1): the operating server's HTTP adapter receives through the SDK only
+    # (auth settings, access token, Host/Origin checks, starlette request/response of the push routes) and
+    # makes tokens (secrets, hmac); no uvicorn, socket, ssl or http import. gzip/base64 live in sync.py
+    # (narrower than the design table, which also listed them here and in push.py).
+    'remote.py': frozenset({'mcp.server.auth.settings.AuthSettings', 'mcp.server.auth.provider.AccessToken',
+                            'mcp.server.transport_security.TransportSecuritySettings', 'starlette.requests.Request',
+                            'starlette.responses.Response', 'starlette.responses.JSONResponse', 'secrets', 'hmac',
+                            'time', 'logging'}),
+    'push.py': frozenset({'time', 'logging'}),   # retry delays and the push log; urllib inside functions only
+    'sync.py': frozenset({'gzip', 'base64'}),    # batch bodies and vector blobs, both sides
 }
+# Entries the stage-0 shells do not import yet (design M5 remote §11.1): exempt from the exactness test while
+# unused; the test fails as soon as one is used, so stage 1 moves it out of here (and drops what stays unused).
+STAGE1_PENDING = frozenset({('remote.py', 'starlette.responses.JSONResponse'), ('remote.py', 'time'),
+                            ('push.py', 'time'), ('push.py', 'urllib.request'), ('push.py', 'urllib.error')})
 # M5 (design M5 §12, model source): ``setup.download_model`` is the one caller of a models network
 # function outside models.py, and only of ``fetch``; only ``cli.py`` may import ``setup`` at all, so the
 # server and the tools never reach it. ``tools/`` lies outside the package and is not checked here;
@@ -80,7 +102,29 @@ SETUP_DOTTED = 'workmcp.setup'
 # Inside function bodies only: the explicit model download, and the ONNX runtime and tokenizer
 # loaded in ``OnnxEmbedder.__init__`` (their DLLs never load on import, status or lexical search).
 FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'}),
-                    'embedder.py': frozenset({'onnxruntime', 'tokenizers.Tokenizer'})}
+                    'embedder.py': frozenset({'onnxruntime', 'tokenizers.Tokenizer'}),
+                    'push.py': frozenset({'urllib.error', 'urllib.request'})}   # M5 remote §6.1
+# Per-module transport of ``<x>.run(...)`` (design M5 remote §6.1): stdio in server.py, Streamable HTTP in
+# remote.py with a loopback literal host and keywords from HTTP_RUN_KEYWORDS; no run call anywhere else.
+ALLOWED_RUN = {'server.py': 'stdio', 'remote.py': 'streamable-http'}
+HTTP_RUN_HOSTS = frozenset({'127.0.0.1', '::1'})
+HTTP_RUN_KEYWORDS = frozenset({'transport', 'host', 'port', 'streamable_http_path', 'json_response', 'stateless_http',
+                               'max_sessions', 'session_idle_timeout', 'transport_security', 'max_request_body_size'})
+# Package modules each M5 module may not import (design M5 remote §6.1, §6.4): push never reaches code that
+# reads originals; the server side and the wire schema stay apart from the collector's sender.
+PACKAGE_IMPORT_BANS = {
+    'push.py': frozenset({'collect', 'parsers', 'binding', 'receive', 'remote', 'server', 'tools', 'setup'}),
+    'receive.py': frozenset({'push', 'remote', 'collect', 'parsers', 'binding', 'server', 'tools', 'setup'}),
+    'sync.py': frozenset({'push', 'receive', 'remote', 'collect', 'parsers', 'binding', 'server', 'tools', 'setup',
+                          'config'}),
+    'remote.py': frozenset({'push', 'collect', 'parsers', 'setup'}),
+}
+# push.py: destinations come from config only (no URL literal) and no file is opened (the token comes through
+# paths.read_token, the store through store.open_read).
+URL_LITERAL_MODULES = frozenset({'push.py'})
+URL_SCHEMES = ('http://', 'https://')
+NO_FILE_MODULES = frozenset({'push.py'})
+FILE_CALLS = frozenset({'open', 'read_text', 'read_bytes', 'fdopen', 'FileIO'})
 
 MODELS_DOTTED = 'workmcp.models'
 BANNED_NAMES = frozenset({'exec', 'eval', 'compile', '__import__', '__builtins__', 'globals', 'locals', 'vars',
@@ -224,10 +268,64 @@ def banned_qualified(dotted: str) -> str | None:
     return None
 
 
-def is_stdio_run(call: ast.Call) -> bool:
-    """Only ``<x>.run(transport="stdio")``: no positional, no ``**``, exactly that literal keyword."""
-    return (not call.args and len(call.keywords) == 1 and call.keywords[0].arg == 'transport'
-            and isinstance(call.keywords[0].value, ast.Constant) and call.keywords[0].value.value == 'stdio')
+def allowed_run(module: str, call: ast.Call) -> bool:
+    """``<x>.run(...)`` with this module's transport only (``ALLOWED_RUN``): no positional, no ``**``, the
+    literal ``transport``; stdio has no other keyword; Streamable HTTP needs a literal loopback ``host`` and
+    takes keywords from ``HTTP_RUN_KEYWORDS`` only."""
+    transport = ALLOWED_RUN.get(module)
+    if transport is None or call.args or any(k.arg is None for k in call.keywords):
+        return False
+    keywords = {k.arg: k.value for k in call.keywords}
+    value = keywords.get('transport')
+    if not (isinstance(value, ast.Constant) and value.value == transport):
+        return False
+    if transport == 'stdio':
+        return set(keywords) == {'transport'}
+    host = keywords.get('host')
+    return isinstance(host, ast.Constant) and host.value in HTTP_RUN_HOSTS and set(keywords) <= HTTP_RUN_KEYWORDS
+
+
+def package_modules_imported(tree) -> set[str]:
+    """First component of every package module a source imports (``from . import push``, ``from .parsers.pdf
+    import x``, ``import workmcp.collect``, ``from workmcp import binding``) or reaches as ``workmcp.<name>``."""
+    found = set()
+    bound = bindings(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found |= {a.name.split('.')[1] for a in node.names if a.name.startswith('workmcp.')}
+        elif isinstance(node, ast.ImportFrom):
+            package = node.level >= 1 or (node.module or '').split('.')[0] == 'workmcp'
+            if not package:
+                continue
+            module = (node.module or '') if node.level else (node.module or '').removeprefix('workmcp').lstrip('.')
+            if module:
+                found.add(module.split('.')[0])
+            else:
+                found |= {a.name for a in node.names}
+        elif isinstance(node, ast.Attribute):
+            dotted = qualify(node, bound)
+            if dotted and dotted.startswith('workmcp.'):
+                found.add(dotted.split('.')[1])
+    return found
+
+
+def module_rule_violations(name: str, tree) -> list[str]:
+    """The M5 per-module rules: banned package imports, URL literals and file access in push.py."""
+    found = [f'imports package module {m} (not allowed in {name})'
+             for m in sorted(package_modules_imported(tree) & PACKAGE_IMPORT_BANS.get(name, frozenset()))]
+    bound = bindings(tree)
+    for node in ast.walk(tree):
+        if name in URL_LITERAL_MODULES and isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and any(scheme in node.value.lower() for scheme in URL_SCHEMES):
+            found.append('URL literal (destinations come from config [push] url)')
+        if name in NO_FILE_MODULES:
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in FILE_CALLS:
+                found.append(f'file access {node.func.id}(...)')
+            elif isinstance(node, ast.Attribute) and node.attr in FILE_CALLS:
+                found.append(f'file access .{node.attr}')
+            elif isinstance(node, ast.Attribute) and qualify(node, bound) == 'os.open':
+                found.append('file access os.open')
+    return found
 
 
 def setup_import_violations(name: str, tree) -> list[str]:
@@ -264,6 +362,7 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
     found = []
     models_network = set(models_network) - MODELS_NETWORK_CALLERS.get(name, frozenset())
     found += setup_import_violations(name, tree)
+    found += module_rule_violations(name, tree)
     bound = bindings(tree)
     module_allowed = COMMON_IMPORTS | MODULE_IMPORTS.get(name, frozenset())
     function_allowed = module_allowed | FUNCTION_IMPORTS.get(name, frozenset())
@@ -336,8 +435,8 @@ def violations(name: str, source: str, models_network: set[str] = frozenset()) -
         elif isinstance(node, ast.Call):
             func = node.func
             if (isinstance(func, ast.Attribute) and func.attr == 'run') or (isinstance(func, ast.Name) and func.id == 'run'):
-                if not is_stdio_run(node):
-                    found.append('run(...) other than run(transport="stdio")')
+                if not allowed_run(name, node):
+                    found.append('run(...) other than the transport of this module (ALLOWED_RUN)')
             if isinstance(func, ast.Name) and func.id in {'getattr', 'setattr'}:
                 key = node.args[1] if len(node.args) > 1 else None
                 if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
@@ -376,7 +475,7 @@ def test_package_has_sources():
         'server.py', 'parsers/__init__.py', 'parsers/_container.py', 'parsers/text.py', 'parsers/eml.py',
         'parsers/docx.py', 'parsers/pptx.py', 'parsers/xlsx.py', 'parsers/pdf.py', 'parsers/hwp.py',
         'config.py', 'collect.py', 'binding.py', 'chunks.py', 'embedder.py', 'index.py', 'search.py', 'snippet.py',
-        'setup.py'}
+        'setup.py', 'remote.py', 'push.py', 'receive.py', 'sync.py'}
 
 
 def test_package_has_no_importable_file_other_than_py():
@@ -405,13 +504,17 @@ def test_allowlists_match_the_sources_exactly():
     common_used = {e for imports in used.values() for dotted, _, _ in imports for e in COMMON_IMPORTS if covered(dotted, {e})}
     assert common_used == COMMON_IMPORTS
     for module, extra in MODULE_IMPORTS.items():
+        pending = {entry for owner, entry in STAGE1_PENDING if owner == module}
         names = {dotted for dotted, _, in_function in used[module] if not covered(dotted, COMMON_IMPORTS)
                  and not (in_function and covered(dotted, FUNCTION_IMPORTS.get(module, frozenset())))}
-        assert names == extra
+        assert not names & pending, f'{module}: now used, remove from STAGE1_PENDING: {sorted(names & pending)}'
+        assert names == extra - pending, module
     for module, extra in FUNCTION_IMPORTS.items():
+        pending = {entry for owner, entry in STAGE1_PENDING if owner == module}
         module_level = COMMON_IMPORTS | MODULE_IMPORTS.get(module, frozenset())
         names = {dotted for dotted, _, _ in used[module] if not covered(dotted, module_level)}
-        assert names == extra
+        assert not names & pending, f'{module}: now used, remove from STAGE1_PENDING: {sorted(names & pending)}'
+        assert names == extra - pending, module
         assert all(in_function for dotted, _, in_function in used[module] if covered(dotted, extra))
     special = {e for extras in (*MODULE_IMPORTS.values(), *FUNCTION_IMPORTS.values()) for e in extras}
     for module, imports in used.items():
@@ -793,6 +896,145 @@ def test_checks_flag_m3_snippets(module, snippet):
     assert violations(module, snippet, {'fetch', 'download_file', 'main'})
 
 
+# M5 remote (design M5 remote §6.1): the thirteen positive controls of the design, then further forms.
+M5_REMOTE_DESIGN_CONTROLS = [
+    ('tools.py', 'from starlette.responses import JSONResponse'),
+    ('remote.py', 'import uvicorn'),
+    ('remote.py', 'server.run(transport="streamable-http", host="0.0.0.0")'),
+    ('remote.py', 'server.run(transport="sse")'),
+    ('server.py', 'server.run(transport="streamable-http")'),
+    ('push.py', 'import urllib.request'),
+    ('push.py', 'import ssl'),
+    ('push.py', 'URL = "https://example.invalid"'),
+    ('receive.py', 'from . import push'),
+    ('push.py', 'from . import collect'),
+    ('push.py', 'open(path, "rb")'),
+    ('remote.py', 'import socket'),
+    ('remote.py', 'from anyio import to_thread'),
+]
+M5_REMOTE_MORE_CONTROLS = [
+    ('remote.py', 'server.run(transport="streamable-http")'),                        # no host
+    ('remote.py', 'server.run(transport="streamable-http", host=host)'),             # host not a literal
+    ('remote.py', 'server.run(transport="streamable-http", host="localhost")'),
+    ('remote.py', 'server.run(transport="streamable-http", host="127.0.0.1", event_store=s)'),
+    ('remote.py', 'server.run(transport="streamable-http", host="127.0.0.1", **extra)'),
+    ('remote.py', 'server.run("streamable-http", host="127.0.0.1")'),
+    ('remote.py', 'server.run(transport="stdio")'),
+    ('remote.py', 'server.streamable_http_app()'),
+    ('remote.py', 'server.run_streamable_http_async(host="127.0.0.1")'),
+    ('remote.py', 'import ssl'),
+    ('remote.py', 'import http.server'),
+    ('remote.py', 'import threading'),
+    ('remote.py', 'import httpx2'),
+    ('remote.py', 'from starlette.applications import Starlette'),
+    ('remote.py', 'from . import push'),
+    ('remote.py', 'import anyio'),
+    ('search.py', 'server.run(transport="stdio")'),                                   # stdio in server.py only
+    ('tools.py', 'server.run(transport="streamable-http", host="127.0.0.1")'),
+    ('server.py', 'server.run(transport="streamable-http", host="127.0.0.1")'),
+    ('push.py', 'import urllib.parse'),
+    ('push.py', 'def f():\n    import ssl'),
+    ('push.py', 'def f():\n    import http.client'),
+    ('push.py', 'def f():\n    import socket'),
+    ('push.py', 'import gzip'),                                                       # in sync.py, not here
+    ('push.py', 'def f():\n    return "http://127.0.0.1:8765/workmcp"'),
+    ('push.py', 'def f(host):\n    return f"https://{host}/workmcp"'),
+    ('push.py', '"""Sends to HTTPS://example.invalid."""'),
+    ('push.py', 'from pathlib import Path\nPath(p).read_text()'),
+    ('push.py', 'p.read_bytes()'),
+    ('push.py', 'import os\nos.open(p, os.O_RDONLY)'),
+    ('push.py', 'import io\nio.open(p)'),
+    ('push.py', 'from . import parsers'),
+    ('push.py', 'from .parsers import pdf'),
+    ('push.py', 'from . import binding'),
+    ('push.py', 'import workmcp.collect'),
+    ('push.py', 'from workmcp import collect'),
+    ('push.py', 'import workmcp\nworkmcp.collect.scan(db, r, s)'),
+    ('push.py', 'from . import receive'),
+    ('push.py', 'from . import remote'),
+    ('receive.py', 'from .push import main'),
+    ('receive.py', 'from . import remote'),
+    ('receive.py', 'import gzip'),
+    ('receive.py', 'def f():\n    import urllib.request'),
+    ('sync.py', 'from . import push'),
+    ('sync.py', 'from . import config'),
+    ('sync.py', 'def f():\n    import urllib.request'),
+    ('sync.py', 'import socket'),
+    ('models.py', 'import gzip'),
+]
+
+
+def test_m5_remote_design_control_list_is_complete():
+    assert len(M5_REMOTE_DESIGN_CONTROLS) == 13 and len(set(M5_REMOTE_DESIGN_CONTROLS)) == 13
+
+
+@pytest.mark.parametrize('module, snippet', M5_REMOTE_DESIGN_CONTROLS + M5_REMOTE_MORE_CONTROLS)
+def test_checks_flag_m5_remote_snippets(module, snippet):
+    assert violations(module, snippet, {'fetch', 'download_file', 'main'})
+
+
+def test_m5_remote_modules_may_use_what_their_role_needs():
+    """Negative controls: the forms the stage-1 code is meant to use pass."""
+    remote = ('from mcp.server.auth.settings import AuthSettings\n'
+              'from mcp.server.auth.provider import AccessToken\n'
+              'from mcp.server.transport_security import TransportSecuritySettings\n'
+              'from starlette.requests import Request\nfrom starlette.responses import JSONResponse, Response\n'
+              'import secrets\nimport hmac\nimport time\nimport logging\nfrom . import receive, server, sync\n'
+              'def main(built, port, path, security):\n'
+              '    built.run(transport="streamable-http", host="127.0.0.1", port=port, streamable_http_path=path,\n'
+              '              json_response=True, stateless_http=False, max_sessions=16, session_idle_timeout=1800,\n'
+              '              transport_security=security)\n'
+              '    built.run(transport="streamable-http", host="::1", port=port)\n')
+    assert violations('remote.py', remote) == []
+    push = ('import logging\nimport time\nfrom . import config, paths, store, sync\n'
+            'def send(url, data, token):\n'
+            '    import urllib.error\n    import urllib.request\n'
+            '    request = urllib.request.Request(sync.endpoint(url, "batch"), data=data, method="POST")\n'
+            '    return urllib.request.urlopen(request, timeout=300)\n'
+            'token = paths.read_token(home)\ndb = store.open_read(home)\n')
+    assert violations('push.py', push) == []
+    assert violations('sync.py', 'import gzip\nimport base64\nfrom . import chunks, store\n') == []
+    assert violations('receive.py', 'from . import index, store, sync\n') == []
+    assert violations('server.py', 'server.run(transport="stdio")') == []
+    # the M5 rules are per module: models.py keeps its URLs, other modules may import collect as before
+    assert violations('models.py', 'BASE = "https://huggingface.co"\n') == []
+    assert violations('cli.py', 'from . import collect\n') == []
+
+
+def test_package_import_detection_sees_every_form():
+    forms = {'from . import push': {'push'}, 'from .parsers.pdf import x': {'parsers'},
+             'import workmcp.collect': {'collect'}, 'from workmcp import binding, store': {'binding', 'store'},
+             'from workmcp.receive import apply': {'receive'}, 'import workmcp\nworkmcp.remote.main()': {'remote'},
+             'import json': set(), 'from mcp.server import MCPServer': set()}
+    for source, expected in forms.items():
+        assert package_modules_imported(ast.parse(source)) == expected, source
+
+
+def test_allowed_run_follows_the_transport_table():
+    call = lambda text: ast.parse(text).body[0].value  # noqa: E731
+    assert allowed_run('server.py', call('s.run(transport="stdio")'))
+    assert not allowed_run('remote.py', call('s.run(transport="stdio")'))
+    assert allowed_run('remote.py', call('s.run(transport="streamable-http", host="127.0.0.1", port=p)'))
+    assert allowed_run('remote.py', call('s.run(transport="streamable-http", host="::1")'))
+    assert not allowed_run('remote.py', call('s.run(transport="streamable-http", host="0.0.0.0")'))
+    assert not allowed_run('remote.py', call('s.run(transport="streamable-http", host="127.0.0.1", stray=1)'))
+    assert not allowed_run('search.py', call('s.run(transport="stdio")'))
+    assert set(ALLOWED_RUN) == {'server.py', 'remote.py'}
+
+
+def test_run_calls_in_the_sources_are_the_allowed_ones():
+    """server.py calls run(transport="stdio"), remote.py run(transport="streamable-http", loopback literal);
+    no other source calls run at all."""
+    calls = {}
+    for path in package_sources():
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        found = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == 'run']
+        if found:
+            calls[rel(path)] = {next(k.value.value for k in n.keywords if k.arg == 'transport') for n in found}
+    assert calls == {'server.py': {'stdio'}, 'remote.py': {'streamable-http'}}
+
+
 # 4
 def test_checks_accept_clean_snippet():
     clean = ('import os\nfrom . import models\nfrom . import models as md\nfrom .paths import home\nx = os.environ.get("A")\n'
@@ -821,7 +1063,9 @@ def test_import_all_modules_stays_inside_the_runtime_boundary(tmp_path):
             'workmcp.parsers.text', 'workmcp.parsers.eml', 'workmcp.parsers.docx', 'workmcp.parsers.pptx',
             'workmcp.parsers.xlsx', 'workmcp.parsers.pdf', 'workmcp.parsers.hwp', 'workmcp.config', 'workmcp.collect',
             'workmcp.binding', 'workmcp.chunks', 'workmcp.embedder', 'workmcp.index',
-            'workmcp.search', 'workmcp.snippet', 'workmcp.setup'} <= set(report['modules'])
+            'workmcp.search', 'workmcp.snippet', 'workmcp.setup', 'workmcp.remote', 'workmcp.push',
+            'workmcp.receive', 'workmcp.sync'} <= set(report['modules'])
+    assert report['remote_token_check'] is True  # remote.verify_token_sha ran under the hook (pure, offline)
     # setup.plan (dry run, M5 design §9.3) ran under the hook; stage 0 has its signature only
     from workmcp import setup
     assert report['setup_plan'] in ('not_implemented', sorted(setup.RESULT_KEYS))
@@ -1157,7 +1401,8 @@ def test_serve_path_stays_inside_the_runtime_boundary(tmp_path):
     for number in set(called) - set(errors):
         assert envelopes[number]['ok'] is True, (number, envelopes[number])
     status = envelopes[3]['result']
-    assert status['schema_version'] == 4 and set(status) == STATUS_RESULT_KEYS
+    assert status['schema_version'] == 5 and set(status) == STATUS_RESULT_KEYS
+    assert (status['role'], status['collectors'], status['last_push']) == ('local', [], None)
     assert status['home'] == str(home) and status['db']['chunks'] > 0
     assert set(status['home_virtualization']) == {'checked', 'under_appdata', 'redirected_to', 'package'}
     hits = envelopes[4]['result']['hits']
@@ -1290,6 +1535,65 @@ def test_runtime_judge_separates_loopback_from_everything_else(event, args, outs
     assert (_audited_server.judge(event, args) is not None) is outside
 
 
+SERVER_PORT = 48765
+TARGET = _audited_server.PushTarget(host='127.0.0.1', port=SERVER_PORT, addresses=frozenset({'127.0.0.1'}),
+                                    url_prefix=f'http://127.0.0.1:{SERVER_PORT}/workmcp/')
+
+
+@pytest.mark.parametrize('event, args, outside', [
+    ('socket.bind', (None, ('127.0.0.1', SERVER_PORT)), False),       # its own listener
+    ('socket.bind', (None, ('::1', SERVER_PORT, 0, 0)), False),
+    ('socket.bind', (None, ('127.0.0.1', 0)), False),                 # the event loop's socket pair
+    ('socket.bind', (None, ('127.0.0.1', SERVER_PORT + 1)), True),    # another fixed port
+    ('socket.bind', (None, ('0.0.0.0', SERVER_PORT)), True),
+    ('socket.bind', (None, ('', SERVER_PORT)), True),
+    ('socket.getaddrinfo', ('127.0.0.1', SERVER_PORT, 0, 1, 6, 0), False),
+    ('socket.getaddrinfo', (b'::1', SERVER_PORT, 0, 1, 6, 0), False),
+    ('socket.getaddrinfo', ('localhost', SERVER_PORT, 0, 1, 6, 0), True),   # a name: resolution
+    ('socket.getaddrinfo', ('huggingface.co', 443, 0, 1, 6, 0), True),
+    ('socket.connect', (None, ('127.0.0.1', 50000)), False),
+    ('socket.connect', (None, ('203.0.113.1', 443)), True),           # egress
+    ('http.client.connect', (None, 'example.invalid', 443), True),
+    ('urllib.Request', ('https://example.invalid', None, {}, 'GET'), True),
+    ('subprocess.Popen', ('curl', ['curl'], None, None), True),
+    ('open', ('x', 'r', 0), False),
+])
+def test_remote_judge_allows_its_listener_and_nothing_outside(event, args, outside):
+    assert (_audited_server.judge_remote(event, args, SERVER_PORT) is not None) is outside
+
+
+@pytest.mark.parametrize('event, args, outside', [
+    ('socket.getaddrinfo', ('127.0.0.1', SERVER_PORT, 0, 1, 6, 0), False),
+    ('socket.getaddrinfo', ('127.0.0.1', str(SERVER_PORT), 0, 1, 6, 0), False),
+    ('socket.getaddrinfo', ('127.0.0.1', 443, 0, 1, 6, 0), True),     # another port
+    ('socket.getaddrinfo', ('example.invalid', SERVER_PORT, 0, 1, 6, 0), True),
+    ('socket.connect', (None, ('127.0.0.1', SERVER_PORT)), False),
+    ('socket.connect', (None, ('127.0.0.1', 50000)), True),           # loopback, but not the server
+    ('socket.connect', (None, ('203.0.113.1', SERVER_PORT)), True),
+    ('socket.bind', (None, ('127.0.0.1', SERVER_PORT)), True),        # a collector listens on nothing fixed
+    ('http.client.connect', (None, '127.0.0.1', SERVER_PORT), False),
+    ('http.client.connect', (None, 'example.invalid', SERVER_PORT), True),
+    ('http.client.connect', (None, '127.0.0.1', 80), True),
+    ('http.client.send', (None, b'POST /workmcp/push/batch'), False),  # on the checked connection
+    ('urllib.Request', (f'http://127.0.0.1:{SERVER_PORT}/workmcp/push/state', None, {}, 'GET'), False),
+    ('urllib.Request', (f'http://127.0.0.1:{SERVER_PORT}/workmcpx/push/state', None, {}, 'GET'), True),
+    ('urllib.Request', ('https://example.invalid/workmcp/push/state', None, {}, 'GET'), True),
+    ('socket.gethostbyname', ('example.invalid',), True),
+    ('subprocess.Popen', ('curl', ['curl'], None, None), True),
+    ('open', ('x', 'r', 0), False),
+])
+def test_push_judge_allows_the_configured_server_only(event, args, outside):
+    assert (_audited_server.judge_push(event, args, TARGET) is not None) is outside
+
+
+@pytest.mark.parametrize('mode', ['remote', 'push'])
+def test_m5_audit_modes_are_stage_1(tmp_path, mode):
+    """Stage 0 has the judges; the remote and push runs report skipped until stage 1 fills them in."""
+    _, report = run_wrapper(tmp_path, mode)
+    assert report['skipped'].startswith('not_implemented')
+    assert [e for e in report['events'] if e['violation']] == []
+
+
 def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
     """Positive control through the real hook: outside attempts are recorded and blocked before they happen."""
     _, report = run_wrapper(tmp_path, 'probe')
@@ -1315,7 +1619,8 @@ def test_audit_wrapper_detects_and_blocks_outside_events(tmp_path):
 
 # 6
 STATUS_RESULT_KEYS = {'home', 'schema_version', 'db', 'model', 'fts5', 'last_scan', 'index', 'delivery_log_count',
-                      'engine', 'home_virtualization', 'calls', 'process', 'knowledge'}
+                      'engine', 'home_virtualization', 'calls', 'process', 'knowledge', 'role', 'collectors',
+                      'last_push'}
 
 
 def requirement_name(spec: str) -> str:
