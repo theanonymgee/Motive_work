@@ -1,5 +1,13 @@
 # 진행·재개 기록
 
+### 2026-10-29 — M5 완료 (원격 운영 서버 전환)
+
+- VPS 배포(피터 단계별 승인): C — 최신 코드 재배포, VPS 테스트 2108 passed·22 skipped, BGE-M3 SHA-256 4/4, `config.toml`, 토큰 2개(평문은 이 PC 저장소 밖 파일로만, 첫 시도 경로 오류로 버려진 2개는 폐기) → D — systemd 유닛(loopback, `IPAddressDeny` 실효 확인), certbot(webroot, 이메일 없이 약관 동의 — 피터), workshop 80 설정에 ACME include 1줄, 443 새 서버 블록 → E — 백업 타이머 1회 ok → F — 합성 수집기 51문서 push(두 번째 전송 0, 추가 1 증분), `workmcp-remote` 사용자 범위 등록.
+- 원격 호출: 피터가 시작한 새 Code 탭 세션에서 status·search·get_snippet·record_entity·record_fact·get_entity 성공, 서버 `tool_calls`·`deliveries`와 대조 — `doc/validation/2026-10-29_M5-원격연결확인_v1.md`.
+- 보안 점검 17/17 통과 — `doc/validation/2026-10-27_M5-보안점검결과_v1.md`. 15번: 첫 의미 질의 83 s(모델 첫 로드) → `model_preload = true`로 167 ms. 17번(회사 규정) 피터 "확인함".
+- 결과: 이 PC 2130 passed, 도구·원격 테스트 156 passed, 검토 v3 통과.
+- 남은 것(M6): 검토 v3 낮음 7(특히 V3-3 거부 문서가 sweep에 쓸림, V3-5 push.lock 교체 경쟁 — 회사 자료 전), `workmcp setup` 구현, 저장소 공개 전환, 회사 PC 설치·Codex, 서버의 합성 수집기 retire와 합성 지식 행 정리, 배포용 SSH 키 정리(피터), 443 기본 서버 블록(낮음).
+
 ### 2026-10-27 — M5 진행 (원격 운영 서버 전환) — 단계 C 승인 대기
 
 - 구조 변경(피터 2026-10-26): 회사 PC 수집기가 파싱·청크·임베딩(BGE-M3) 후 변경분을 Hostinger KVM 2의 운영 서버로 push, 서버가 같은 모델로 질의를 임베딩하고 MCP를 HTTPS+토큰으로 제공. 설계 `M5-원격구조설계_v1`(반영 기록 1–32번이 본문보다 우선).
