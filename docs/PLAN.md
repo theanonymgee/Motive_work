@@ -128,7 +128,7 @@
   - ⑥ 전체 테스트 이 PC **2130 passed**, VPS 2108 passed·22 skipped(Windows 전용·실모델).
   - ⑦ 검토 v1 조건부(중간 2) → v2 조건부(중간 2) → **v3 통과, 미해결 높음·중간 0** — `doc/validation/2026-10-26_M5-원격검토_v1~v3.md`.
   - 커밋: `8f3e5fe`·`7526dee`·`ee407d2`·`2a24eb6`·`1c00dbe`·`562faac`·`199547f`·`44e7f07`·`3b9b00e`·`47b31d1`·`3f29c27`·`23d6110`·`7c7003e` 외 이 완료 기록.
-- 운영 값: `https://srv1782254.hstgr.cloud/workmcp/`, 서비스 `workmcp`(127.0.0.1:8765, MemoryMax 3G, `model_preload = true` 상주 약 1.9 GiB), 인증서 2027-01-24 만료·certbot 자동 갱신, 백업 매일 04:00 UTC 7개.
+- 운영 값: `https://<VPS_HOST>/workmcp/`, 서비스 `workmcp`(127.0.0.1:8765, MemoryMax 3G, `model_preload = true` 상주 약 1.9 GiB), 인증서 2027-01-24 만료·certbot 자동 갱신, 백업 매일 04:00 UTC 7개.
 - 남은 한계(M6): 검토 v3 낮음 7(V3-3 거부 문서 sweep, V3-5 push.lock 6시간 교체 경쟁은 회사 자료 전 필수), 수집기 `unit_parts` 메모리, 443 기본 서버 블록 없음(Host 검사로 421), 서버에 합성 수집기·합성 지식 행 남음, 배포용 SSH 키 `workmcp_vps` 정리(피터).
 
 ### M6

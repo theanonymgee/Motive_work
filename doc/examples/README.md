@@ -58,7 +58,7 @@ Codex가 프로젝트 `.codex/config.toml`의 `mcp_servers`를 읽지 않으면 
 2. **사용자 범위(어느 폴더에서나, 설계 §9.6의 기본):** 피터가 자기 터미널에서 실행한다(에이전트는 토큰을 보지 않는다).
 
    ```
-   claude mcp add --scope user --transport http workmcp https://srv1782254.hstgr.cloud/workmcp/mcp --header "Authorization: Bearer <MCP_TOKEN>"
+   claude mcp add --scope user --transport http workmcp https://<VPS_HOST>/workmcp/mcp --header "Authorization: Bearer <MCP_TOKEN>"
    claude mcp list
    ```
 
@@ -67,7 +67,7 @@ Codex가 프로젝트 `.codex/config.toml`의 `mcp_servers`를 읽지 않으면 
 
 ### Codex
 
-- **[추정]** `codex mcp add workmcp --url https://srv1782254.hstgr.cloud/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN`. 이 PC에는 `codex` 명령도 없고 Codex 원격 연결은 M6 범위(회사 PC)라서 지금은 확인하지 않는다. 옵션 이름은 그때 `codex mcp add --help`로 맞춘다.
+- **[추정]** `codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN`. 이 PC에는 `codex` 명령도 없고 Codex 원격 연결은 M6 범위(회사 PC)라서 지금은 확인하지 않는다. 옵션 이름은 그때 `codex mcp add --help`로 맞춘다.
 
 ### 로컬 stdio와 헷갈리지 않기
 

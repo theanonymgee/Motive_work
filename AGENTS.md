@@ -22,6 +22,7 @@ Personal work-knowledge MCP server. `Motive_work` is a working title (folder nam
 - **Read-only to sources.** The server never modifies, moves or deletes the user's original files.
 - **Evidence binding.** Every returned fact or snippet carries an exact source locator (file, version hash, page/sheet/line or character range). Structured knowledge written through MCP must cite a source locator or be explicitly marked as the user's own note.
 - Secrets (server tokens, VPS credentials) live only outside the repository: the server stores token SHA-256 hashes only; the collector's push token in its data home token file or an environment variable; the MCP token in the client's own configuration (user scope) or an environment variable; SSH keys in the user's `.ssh` folder. Never print (except the one-time display at issue), log or commit them.
+- The repository may be public (MIT, `LICENSE`). Never write the operating server's host name or IP address in tracked files; use the placeholders `<VPS_HOST>` and `<VPS_IP>` and keep the real values outside the repository.
 
 ## Stack (initial, may change by plan)
 
