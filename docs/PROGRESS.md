@@ -36,7 +36,7 @@
 
 ### 2026-10-24 — M3 완료 (MCP 서버 v1)
 
-- 1단계(A `83926b5`, B `e4bb9e9`, C `2b475d1`) → 2단계 통합 `c40775a`(hit `units[]` 압축으로 응답 최대 약 31,700자, 없는 정보 신호 R5 채택, 실모델 시험 홈 `C:\Users\jangm\Motive_work_m3test`) → 검토 v1 조건부(중간 4) → `bbcf2c7` → v2 조건부(중간 1) → `6d92726` → **v3 통과**(`87cec83`).
+- 1단계(A `83926b5`, B `e4bb9e9`, C `2b475d1`) → 2단계 통합 `c40775a`(hit `units[]` 압축으로 응답 최대 약 31,700자, 없는 정보 신호 R5 채택, 실모델 시험 홈 `C:\Users\<USER>\Motive_work_m3test`) → 검토 v1 조건부(중간 4) → `bbcf2c7` → v2 조건부(중간 1) → `6d92726` → **v3 통과**(`87cec83`).
 - 실연결: 피터가 Code 탭에서 `.mcp.json` 서버 승인 → 이 세션에서 도구 5개 호출 성공, `tool_calls.client='claude-code' 2.1.299`, 전달 조각·`deliveries` 일치, 질의 기록 0, `verify` 893/893 (`2835e92`, `doc/validation/2026-10-24_M3-연결확인_v1.md`).
 - Codex: 신뢰 전 프로젝트 설정 미인식, 번들 CLI 우회 실패(모델 거부·code-mode host 없음) → 피터 결정 "codex 일단보류하고 넘어가자" → M5.
 - 피터 결정(설치·실행 형태): 회사 PC의 Claude/Codex에 일반 MCP처럼 설치, 설치 출처만 외부, 서버(로컬 stdio)·데이터는 회사 PC. PLAN §5 M5·§6에 기록.

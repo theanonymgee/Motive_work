@@ -100,7 +100,7 @@
   - ② `workmcp serve`(stdio) 도구 5개 `search`·`get_snippet`·`list_documents`·`recent_changes`·`status`(모두 `async def`, compact JSON 문자열, `structured_output=False`), 응답 상한 40,000자(hit `units[]` 압축 후 기본 limit 10 최대 약 31,700자), lifespan ticker 유휴 해제, 호출 기록 v2(`tool_calls`·`deliveries`·`document_events`, 질의·본문 기록 안 함, 잠금 시 메모리 대기열), 청크 id 재사용 금지(`meta.chunk_id_high`), 없는 정보 신호 R5(`doc/validation/2026-10-24_M3-신호측정_v1.md`).
   - ③ 결속 재도출·`delivered_sources` == 실린 조각(D-1~D-5, 크기 맞춤 포함), 검토 탐침으로도 재확인.
   - ④ serve 감사(`_audited_server.py serve ROOT`): loopback 외 0·이름 해석 0·프로세스 0·원본 open 0, stdout JSON-RPC만.
-  - ⑤ **Claude Code(Code 탭, claude.exe 2.1.299)**에서 합성 홈 `C:\Users\jangm\Motive_work_m3test`로 도구 5개 호출 성공, `tool_calls.client='claude-code'`, search 3조각·get_snippet 3조각이 `deliveries` 행·글자 수와 일치, 질의 문구 기록 0, `verify` 893/893 — `doc/validation/2026-10-24_M3-연결확인_v1.md`. 설정 예시 `doc/examples/`(args `-I`, `WORKMCP_HOME`은 AppData 밖). **Codex는 피터 결정(2026-10-24 "codex 일단보류하고 넘어가자")으로 보류 → M5.**
+  - ⑤ **Claude Code(Code 탭, claude.exe 2.1.299)**에서 합성 홈 `C:\Users\<USER>\Motive_work_m3test`로 도구 5개 호출 성공, `tool_calls.client='claude-code'`, search 3조각·get_snippet 3조각이 `deliveries` 행·글자 수와 일치, 질의 문구 기록 0, `verify` 893/893 — `doc/validation/2026-10-24_M3-연결확인_v1.md`. 설정 예시 `doc/examples/`(args `-I`, `WORKMCP_HOME`은 AppData 밖). **Codex는 피터 결정(2026-10-24 "codex 일단보류하고 넘어가자")으로 보류 → M5.**
   - ⑥ `uv run pytest -q` **1395 passed**, `uv lock --check` 통과.
   - ⑦ 검토 v1 조건부(중간 4) → v2 조건부(중간 1) → **v3 통과, 미해결 높음·중간 0** — `doc/validation/2026-10-24_M3-검토_v1~v3.md`.
   - 커밋: `ccb6fd9`·`b7217cb`·`2b475d1`·`83926b5`·`e4bb9e9`·`c40775a`·`bbcf2c7`·`6d92726`·`87cec83`·`2835e92`.
@@ -112,7 +112,7 @@
   - ② 쓰기 도구(`record_entity`·`record_fact`·`record_decision`·`record_task`·`retract`·`supersede`)와 조회 도구(`find_entity`·`get_entity`·`list_knowledge`·`get_history`) — 서버 도구 15개, 스키마 v3·v4 마이그레이션.
   - ③ 출처는 인용을 저장된 원문에서 다시 찾아 정확한 locator로 저장(어긋나면 거부), 출처 없는 쓰기는 "내 메모"로만; ④ 철회·대체 append-only, 유효 시점·기록 시점 질의, 충돌 표시·해소, 대체 그래프(`continued_by_ids`·`branches`).
   - ⑤ serve 감사가 쓰기 도구 포함 15개 도구에서 외부 주소·이름 해석·프로세스 0, 원본 쓰기 0.
-  - ⑥ **Claude Code(Code 탭, 2.1.299) 실제 호출**(2026-10-26, 시험 홈 `C:\Users\jangm\Motive_work_m3test`): 쓰기→조회→충돌→철회→유효 기간을 끊은 대체→이력→시점 조회→할 일 완료, 17호출 모두 `client='claude-code'`, `deliveries` 41→51(실린 조각 10과 일치), 인자 기록에 본문 0, `verify` evidence 3 binding ok, 원본 해시 전후 동일 — `doc/validation/2026-10-25_M4-연결확인_v1.md`.
+  - ⑥ **Claude Code(Code 탭, 2.1.299) 실제 호출**(2026-10-26, 시험 홈 `C:\Users\<USER>\Motive_work_m3test`): 쓰기→조회→충돌→철회→유효 기간을 끊은 대체→이력→시점 조회→할 일 완료, 17호출 모두 `client='claude-code'`, `deliveries` 41→51(실린 조각 10과 일치), 인자 기록에 본문 0, `verify` evidence 3 binding ok, 원본 해시 전후 동일 — `doc/validation/2026-10-25_M4-연결확인_v1.md`.
   - ⑦ `uv run pytest -q` **1660 passed**, `uv lock --check` 통과.
   - ⑧ 검토 v1 조건부(중간 2) → v2 조건부(중간 2) → **v3 통과, 미해결 높음·중간 0** — `doc/validation/2026-10-25_M4-검토_v1~v3.md`.
   - 커밋: `4005b60`·`35f1d7d`·`8b91551`·`a3e3097`·`a6b016b`·`55ec13f`·`7464ac6`·`6c705b8`·`93bd351`·`43a1e30`·`ff78a68`·`97920b3`.
@@ -140,7 +140,7 @@
 
 | 항목 | 범위 |
 |---|---|
-| 프로젝트 출범 | 새 폴더 `C:\Users\jangm\Project\Motive_work` + 새 비공개 GitHub 저장소, `Motive_vari`에서 필요한 것만 이식 |
+| 프로젝트 출범 | 새 폴더 `C:\Users\<USER>\Project\Motive_work` + 새 비공개 GitHub 저장소, `Motive_vari`에서 필요한 것만 이식 |
 | 분기점 | `Motive_vari` 태그 `g0-freeze-20261017`(G0), `kakao-p1-complete-20261022`(카톡 P1 완료). 카톡 개발은 `Motive_vari` 개발 세션에서 계속 |
 | 사용 형태 | 회사 PC의 Claude Code·Codex에 MCP로 붙여 개인용으로 사용. 다른 MCP 클라이언트도 표준 MCP로 지원 |
 | 데이터 처리 | 저장·임베딩은 PC 로컬. 서버의 외부 AI/API 호출 없음. 피터가 쓰는 MCP 클라이언트(Claude Code·Codex)에는 요청한 조각만 전달 |

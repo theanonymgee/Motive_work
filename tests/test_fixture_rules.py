@@ -87,7 +87,6 @@ PERSONAL_PATTERNS = {
     'Windows user path with a real name': re.compile(r'(?i)[A-Z]:\\Users\\(?!<USER>|Public\b|Default\b)[^\\\s<]+'),
     'macOS user path': re.compile(r'/Users/[^/\s<]+'),
     'Linux home of another user': re.compile(r'/home/(?!workmcp\b|<)[A-Za-z0-9_.-]+'),
-    'owner name': re.compile(r'(?i)jangm|peterjang'),
 }
 EMAIL_ANY = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+')
 IPV4 = re.compile(r'(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])')
@@ -144,6 +143,96 @@ def test_shipped_pieces_hold_no_personal_path_mail_or_foreign_address():
             if match.group(1) not in IPV4_ALLOWED:
                 found.setdefault(path.name, []).append('IPv4 ' + match.group(1))
     assert found == {}
+
+
+# ---- public text (design M6 §8.2): README, AGENTS/CLAUDE, doc/ and docs/ may be published; no personal path or mail ----
+
+PUBLIC_TEXT_FILES = sorted({REPO/'README.md', REPO/'AGENTS.md', REPO/'CLAUDE.md'}
+                           | {p for folder in ('doc', 'docs') for p in (REPO/folder).rglob('*') if p.is_file()})
+# a user folder name after `Users\` (also `\\`, `/` and Git Bash `/c/Users/`); a placeholder starts with `<`, `%`, `$`
+# or `{`, so it never matches the name class; the generic profile folders and one-letter synthetic names (`C:\Users\a`)
+# are allowed
+USER_PATH = re.compile(r'(?i)(?:\b[A-Z]:|(?<![A-Za-z0-9])/[A-Z]|(?<![A-Za-z0-9:]))(?:\\{1,2}|/)Users(?:\\{1,2}|/)'
+                       r'([A-Za-z0-9._-]+)')
+USER_PATH_ALLOWED = frozenset({'public', 'default', 'all', 'shared'})
+MAIL_ALLOWED_DOMAINS = frozenset(fixtures.RESERVED_DOMAINS) | {'users.noreply.github.com'}
+# well-known public resolver named in the server survey; everything else must be private, loopback or documentation
+PUBLIC_IPV4_ALLOWED = frozenset({'1.1.1.1'})
+# profile folder names that say nothing about a person
+GENERIC_PROFILE_NAMES = frozenset({'user', 'users', 'admin', 'administrator', 'owner', 'public', 'default', 'runner',
+                                   'test', 'tester', 'workmcp', 'root', 'home', 'vagrant', 'ubuntu', 'developer'})
+
+
+def personal_findings(text: str) -> list[str]:
+    """Labels (never values) of personal data in a public text."""
+    import ipaddress
+    found = []
+    if any(len(m.group(1)) > 1 and m.group(1).lower() not in USER_PATH_ALLOWED for m in USER_PATH.finditer(text)):
+        found.append('user folder path with a real name')
+    if PERSONAL_PATTERNS['Linux home of another user'].search(text):
+        found.append('Linux home of another user')
+    for match in EMAIL_ANY.finditer(text):
+        local, domain = match.group(0).rsplit('@', 1)
+        domain = domain.lower()
+        if not (domain in MAIL_ALLOWED_DOMAINS or domain.endswith(fixtures.RESERVED_TLD) or local.lower() == 'noreply'):
+            found.append('mail address')
+            break
+    for match in IPV4.finditer(text):
+        try:
+            address = ipaddress.IPv4Address(match.group(1))
+        except ValueError:
+            continue
+        if address.is_global and match.group(1) not in PUBLIC_IPV4_ALLOWED:
+            found.append('public IPv4')
+            break
+    return found
+
+
+def test_public_text_holds_no_personal_path_mail_or_public_address():
+    assert REPO/'README.md' in PUBLIC_TEXT_FILES and any(p.parent.name == 'validation' for p in PUBLIC_TEXT_FILES)
+    found = {}
+    for path in PUBLIC_TEXT_FILES:
+        try:
+            text = _text(path)
+        except UnicodeDecodeError:
+            found[path.relative_to(REPO).as_posix()] = ['not UTF-8 text']
+            continue
+        if labels := personal_findings(text):
+            found[path.relative_to(REPO).as_posix()] = labels
+    assert found == {}
+
+
+def test_public_text_and_sources_hold_not_the_profile_folder_name():
+    """The name of the profile folder this runs under (read at run time, never written here) appears in no public
+    text, deployment piece or source: it would be a user name or part of a mail handle."""
+    name = Path.home().name.lower()
+    if len(name) < 5 or name in GENERIC_PROFILE_NAMES:
+        pytest.skip('profile folder name too short or generic to search for')
+    sources = [p for folder in ('src', 'tools', 'tests') for p in (REPO/folder).rglob('*')
+               if p.is_file() and p.suffix in ('.py', '.sh', '.toml', '.json', '.md', '.txt', '.conf', '.service',
+                                               '.timer', '.example') and '__pycache__' not in p.parts]
+    offenders = sorted({p.relative_to(REPO).as_posix() for p in set(PUBLIC_TEXT_FILES) | set(SHIPPED_FILES) | set(sources)
+                        if name in p.read_text(encoding='utf-8', errors='replace').lower()})
+    assert offenders == []
+
+
+def test_public_text_rules_catch_known_bad_values():
+    """Positive and negative controls for ``personal_findings`` (values built here, not real ones)."""
+    someone = 'kim' + 'chulsoo'
+    assert personal_findings('C:\\Users\\' + someone + '\\Motive_work') == ['user folder path with a real name']
+    assert personal_findings('C:\\\\Users\\\\' + someone + '\\\\x') == ['user folder path with a real name']
+    assert personal_findings('/c/Users/' + someone + '/Project') == ['user folder path with a real name']
+    assert personal_findings('C:/Users/' + someone + '/Project') == ['user folder path with a real name']
+    for placeholder in ('C:\\Users\\<USER>\\Motive_work', 'C:\\Users\\<user>\\x', 'c:\\users\\<사용자명>\\project',
+                        'C:\\Users\\%USERNAME%\\x', 'C:\\Users\\Public\\Documents', '`C:\\Users\\`, `/c/Users/`'):
+        assert personal_findings(placeholder) == [], placeholder
+    assert personal_findings(someone + '@' + 'corp-mail.co.kr') == ['mail address']
+    allowed = 'owner.gap@example.com ' + 'noreply' + '@' + 'anthropic.com 1+acct' + '@' + 'users.noreply.github.com'
+    assert personal_findings(allowed) == []
+    assert personal_findings('server ' + '.'.join(['8', '8', '4', '4'])) == ['public IPv4']
+    assert personal_findings('127.0.0.1 10.0.0.2 192.168.1.1 203.0.113.9 1.1.1.1 <VPS_IP>') == []
+    assert personal_findings('/home/' + someone + '/app') == ['Linux home of another user']
+    assert personal_findings('/home/workmcp/app /home/<user>/x') == []
 
 
 def test_secret_checks_catch_known_bad_values():
