@@ -17,9 +17,11 @@ every file is in place, 1 otherwise, 4 without ``--from``; ``verify-model`` 0/1.
 ``search`` prints snippets to the console on purpose (the user reads them locally); the index log
 has counts and fixed codes only, never document text or queries.
 
-M5: ``setup`` (design M5 §2.3, §12; body in ``setup.py``, imported only here and only when it runs):
+M5: ``setup`` (design M5 §2.3, §12, M6 §2; body in ``setup.py``, imported only here and only when it runs):
 exit 0 done, 1 a step failed, 2 data home refused (an AppData home without ``--yes`` too), 3 a store,
-scan or index lock is held (``--upgrade``), 4 arguments. ``doctor`` also reports the venv in use and a
+scan, index or push lock is held (``--upgrade``), 4 arguments, source folders or settings. ``setup`` gets
+``doctor``/``scan``/``index`` from here as arguments (``setup_commands``; they take the data home ``setup``
+validated instead of ``WORKMCP_HOME``). ``doctor`` also reports the venv in use and a
 polluted shell (``PYTHONPATH`` set, a foreign ``VIRTUAL_ENV``; design M5 §2.7).
 
 M5 remote (design M5 remote §4.6): ``serve --http [HOST:PORT]`` (``remote.main``; loopback host only, else
@@ -55,8 +57,11 @@ def _tolerant(stream) -> None:
         pass
 
 
-def _home():
-    """``(home, None)`` or ``(None, exit code 2)`` after printing the rule broken."""
+def _home(home=None):
+    """``(home, None)`` or ``(None, exit code 2)`` after printing the rule broken. ``home``: a data home
+    ``setup`` already validated (its ``--home``), used as it is."""
+    if home is not None:
+        return home, None
     try:
         return paths.resolve_home(), None
     except paths.DataPathError as exc:
@@ -111,8 +116,8 @@ def environment_lines(env, *, prefix: str, isolated: bool) -> list[str]:
     return lines or ['env: clean (no PYTHONPATH, no foreign VIRTUAL_ENV)']
 
 
-def doctor() -> int:
-    home, code = _home()
+def doctor(home=None) -> int:
+    home, code = _home(home)
     if code:
         return code
     db_file = paths.db_path(home)
@@ -279,9 +284,9 @@ def _entries(args, cfg):
     return list(cfg.sources), True
 
 
-def scan(args) -> int:
+def scan(args, home=None) -> int:
     from . import collect, config
-    home, code = _home()
+    home, code = _home(home)
     if code:
         return code
     paths.ensure_home(home)
@@ -304,7 +309,8 @@ def scan(args) -> int:
     try:
         warnings = [warning for spec in specs for warning in spec.warnings]
         try:
-            lock, stale = store.acquire_scan_lock(home)
+            nonce = store.new_lock_nonce()        # release only this run's lock (review M5 remote v3 V3-5)
+            lock, stale = store.acquire_scan_lock(home, nonce=nonce)
         except store.ScanLocked as exc:
             print(exc, file=sys.stderr)
             logger.info(f'refused | {home} |  | locked | scan_lock_held')
@@ -337,7 +343,7 @@ def scan(args) -> int:
             finally:
                 db.close()
         finally:
-            store.release_scan_lock(lock)
+            store.release_scan_lock(lock, nonce)
         logger.info(f"done | scan #{result['scan_id']} |  | done | {result['mode']}")
         print('\n'.join(summary_lines(result, log_file)))
         return 0
@@ -353,7 +359,8 @@ def verify_lines(report: dict) -> list[str]:
         f"verify {report['checked_at']}  versions {v['total']} checked {v['checked']} ok {v['ok']} "
         f"failed {v['failed']}  unverifiable {sum(un.values())} (stale {un['stale']}, missing {un['missing']}, "
         f"locked {un['locked']}, unstable {un['unstable']}, parser {un['parser_version_mismatch']}, "
-        f"not_ok {un['skipped_not_ok']}, placeholder {un['placeholder']}, timeout {un['timeout']})",
+        f"not_ok {un['skipped_not_ok']}, placeholder {un['placeholder']}, timeout {un['timeout']}, "
+        f"in_progress {un['in_progress']})",
         f"units {u['bound']}/{u['total']} bound ({u['rate'] * 100:.1f}%)  chunks {report['chunks_checked']}  "
         f"evidence {report['evidence_checked']}"
         + (f" (stale after reparse {stale})" if (stale := report.get('evidence_stale_after_reparse')) else ''),
@@ -493,9 +500,9 @@ def _log_index_event(logger, event: dict) -> None:
     logger.info(' | '.join(str(event.get(key) or '') for key in ('event', 'path', 'sha12', 'chunks', 'note')))
 
 
-def index_command(args) -> int:
+def index_command(args, home=None) -> int:
     from . import config
-    home, code = _home()
+    home, code = _home(home)
     if code:
         return code
     paths.ensure_home(home)
@@ -514,7 +521,8 @@ def index_command(args) -> int:
     logger, handler, log_file = _file_logger(home, 'index')
     try:
         try:
-            lock, stale = store.acquire_lock(home, store.INDEX_LOCK_NAME)
+            nonce = store.new_lock_nonce()        # release only this run's lock (review M5 remote v3 V3-5)
+            lock, stale = store.acquire_lock(home, store.INDEX_LOCK_NAME, nonce=nonce)
         except store.Locked as exc:
             print(exc, file=sys.stderr)
             logger.info(f'refused | {home} |  |  | index_lock_held')
@@ -546,7 +554,7 @@ def index_command(args) -> int:
             finally:
                 db.close()
         finally:
-            store.release_lock(lock)
+            store.release_lock(lock, nonce)
         logger.info(f"done | index #{result['index_id']} |  |  | done")
         print('\n'.join(index_summary_lines(result, log_file)))
         return 0
@@ -681,6 +689,17 @@ def serve_http(args) -> int:
     return remote.main(home, host, port, cfg)
 
 
+def setup_commands() -> dict:
+    """The command bodies ``workmcp setup`` runs on its data home (design M6 §2.6-9): handed to ``setup`` as
+    arguments, so ``setup`` never imports ``cli``. ``scan`` reads the configured sources, ``index`` the
+    configured model; both with their default options."""
+    scan_args = argparse.Namespace(root=None, retry_failed=False, reparse=False, rehash=False)
+    index_args = argparse.Namespace(model=None, doc=None, limit=None, rebuild_fts=False, gc=False, keep_history=False)
+    return {'doctor': lambda home: doctor(home),
+            'scan': lambda home: scan(scan_args, home),
+            'index': lambda home: index_command(index_args, home)}
+
+
 def _stage1(function, args) -> int:
     """Run a command body; a stage-0 body (``NotImplementedError``) answers exit 1 with its message."""
     try:
@@ -751,9 +770,12 @@ def main(argv=None) -> int:
                                                 '(idempotent)')
     setup_parser.add_argument('--home', metavar='PATH', help=r'data home (e.g. %%USERPROFILE%%\Motive_work)')
     setup_parser.add_argument('--source', action='append', metavar='PATH', help='source root for a new config.toml')
-    setup_parser.add_argument('--model', metavar='download|none', help='download the pinned model, or none (lexical)')
-    setup_parser.add_argument('--model-from', metavar='DIR', help='copy the model from a folder on this PC')
-    setup_parser.add_argument('--clients', default='claude,codex', metavar='claude,codex')
+    setup_parser.add_argument('--model', metavar='download|none',
+                              help='download the pinned model (the only network step), or none (lexical search)')
+    setup_parser.add_argument('--model-from', metavar='DIR', help='copy the model from a folder on this PC (no network)')
+    setup_parser.add_argument('--push-url', metavar='URL',
+                              help='collector role: the operating server, e.g. https://<host>/workmcp')
+    setup_parser.add_argument('--clients', default='claude,codex', metavar='claude,codex|none')
     setup_parser.add_argument('--scope', default='user', metavar='user|project',
                               help='user: print the registration commands; project: write files in --project')
     setup_parser.add_argument('--project', metavar='DIR', help='project folder for --scope project')
@@ -761,6 +783,7 @@ def main(argv=None) -> int:
     setup_parser.add_argument('--index', action='store_true', help='index afterwards')
     setup_parser.add_argument('--upgrade', action='store_true', help='back up and migrate the store, then doctor')
     setup_parser.add_argument('--yes', action='store_true', help='accept an AppData home or overwrite project files')
+    setup_parser.add_argument('--dry-run', action='store_true', help='show what would be done; write nothing')
     fetch_parser = sub.add_parser('fetch-model', help='copy and verify model files from a folder on this PC')
     fetch_parser.add_argument('name', metavar='NAME')
     fetch_parser.add_argument('--from', dest='source', metavar='FOLDER')
@@ -788,7 +811,7 @@ def main(argv=None) -> int:
         return verify_model_command(args)
     if args.command == 'setup':
         from . import setup  # the only importer of setup (network boundary test)
-        return setup.main(args)
+        return setup.main(args, setup_commands())
     if args.command == 'push':
         from . import push
         return _stage1(push.main, args)

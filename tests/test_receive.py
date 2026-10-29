@@ -8,8 +8,9 @@ import pytest
 
 from fixtures import LINES_KO, SENTINEL
 from test_collect import scan
-from test_push import Collector, Server, TOKEN
+from test_push import Collector, Server, TOKEN, converges, mirrored
 from workmcp import binding, chunks, index, parsers, push, receive, store, sync
+from workmcp import search as search_module
 
 H = '0' * 64
 
@@ -61,10 +62,10 @@ def units_item(local=11, units=UNITS, part=1, parts=1, units_sha256=None):
             'parts': parts, 'units': [dict(unit) for unit in units]}
 
 
-def begun(server, collector, root='C:\\synthetic', model_key=H):
+def begun(server, collector, root='C:\\synthetic', model_key=H, started_at=None):
     answer = receive.apply(server.db, collector, body(collector, 'begin', [{
         'roots': [{'local_root_id': 1, 'path': root, 'enabled': 1}], 'counts_expected': {},
-        'started_at': store.now(), 'model_key': model_key}]), raw_bytes=10)
+        'started_at': started_at or store.now(), 'model_key': model_key}]), raw_bytes=10)
     assert answer['ok'], answer
     return answer['result']['push_id']
 
@@ -542,3 +543,107 @@ def test_long_unit_streaming_on_random_texts(seed):
         at += size
     out += receive.long_unit_pieces(state, long, 1, '', final=True)
     assert out == expected
+
+
+# ---- review v3: a document refused in a complete push is not swept (V3-3), the older SQLite path (V3-7) ------
+
+def statuses(db) -> dict[str, str]:
+    return {key.rsplit('\\', 1)[-1]: status for key, status in db.execute('SELECT path_key, status FROM documents')}
+
+
+@pytest.mark.parametrize('names', ['abc', 'abcd'])
+def test_a_document_refused_in_a_complete_push_is_not_swept(tmp_path, monkeypatch, names):
+    """Review v3 V3-3 (probe S-D): a.txt is deleted and the store rebuilt, so c.txt loses its old local id (to
+    d.txt in ``abcd``; in ``abc`` its old id is simply gone and is forgotten). The server's lowered limit refuses
+    c.txt in the complete push that follows. c.txt stays ``active`` with its old content; a.txt, really gone, is
+    ``deleted``; once the limit is back the next push converges."""
+    server = Server(tmp_path)
+    collector = server.collector('합성-거부')
+    col = Collector(tmp_path)
+    for name in names:
+        lines = LINES_KO * (4 if name == 'c' else 1)                  # c.txt is the big one
+        (col.src/f'{name}.txt').write_text(f'{name} 합성 고유어{name * 3}\n' + '\n'.join(lines), encoding='utf-8')
+    col.collect()
+    fresh = None
+    try:
+        assert col.push(server, collector)['converged']
+        (col.src/'a.txt').unlink()
+        fresh = Collector(tmp_path, 'rebuilt', src=col.src)
+        fresh.collect()
+        big = fresh.db.execute("SELECT v.unit_count FROM versions v JOIN documents d ON d.id = v.document_id "
+                               "WHERE d.path_key LIKE '%c.txt'").fetchone()[0]
+        limit = sync.VERSION_MAX_UNITS
+        monkeypatch.setattr(sync, 'VERSION_MAX_UNITS', big - 1)       # the server takes less than the collector
+        report = fresh.push(server, collector)
+        assert report['exit_code'] == 1
+        assert [(entry['path'].rsplit('\\', 1)[-1], entry['code']) for entry in report['refused']] == \
+            [('c.txt', 'version_too_large')]
+        assert statuses(server.db) == {'a.txt': 'deleted', **{f'{name}.txt': 'active' for name in names[1:]}}
+        events = store.document_events_query(server.db, {'kinds': ['deleted']}, 10, 0)[0]
+        assert [event['doc']['path'].rsplit('\\', 1)[-1] for event in events] == ['a.txt']
+        assert json.loads(server.db.execute('SELECT note FROM pushes ORDER BY id DESC').fetchone()[0])[
+            'refused_keys'] == [sync.windows_normcase(str(col.src/'c.txt'))]
+        hits = search_module.Engine(server.home).search('고유어ccc', mode='lexical')['hits']
+        assert hits and all(hit['doc']['path'].endswith('c.txt') for hit in hits)   # still served, old content
+        monkeypatch.setattr(sync, 'VERSION_MAX_UNITS', limit)
+        converges(fresh, server, collector)
+        assert statuses(server.db) == statuses(fresh.db) | {'a.txt': 'deleted'}
+    finally:
+        col.close()
+        if fresh:
+            fresh.close()
+        server.close()
+
+
+def test_without_refusals_a_complete_push_sweeps_as_before(server):
+    """V3-3 changes nothing else: with nothing refused, or with another document refused, a complete end sweeps
+    the document the collector no longer maps; a cut end sweeps nothing."""
+    collector = server.collector('합성')
+    push_id = begun(server, collector)
+    ok(server, collector, 'documents', [document(), document(local=2, path='C:\\synthetic\\b.txt',
+                                                             versions=[version(local=21)])], push_id)
+    assert ok(server, collector, 'end', [{'counts': {}, 'bytes_sent': 0, 'complete': True}], push_id)['swept'] == 0
+    # a rebuilt store: b.txt now has id 1, a.txt is gone; a refused document elsewhere shields only itself
+    push_id = begun(server, collector, started_at='2026-10-29T09:00:00.000002+09:00')
+    result = ok(server, collector, 'documents', [
+        document(local=1, path='C:\\synthetic\\b.txt', versions=[version(local=21)]),
+        document(local=2, path='C:\\synthetic\\big.txt',
+                 versions=[version(local=22, unit_count=sync.VERSION_MAX_UNITS + 1)])], push_id)
+    assert result['refused'] == [{'local_document_id': 2, 'code': 'version_too_large'}]
+    assert ok(server, collector, 'end', [{'counts': {}, 'bytes_sent': 0, 'complete': True}], push_id)['swept'] == 1
+    assert statuses(server.db) == {'a.txt': 'deleted', 'b.txt': 'active'}
+    # a cut push sweeps nothing
+    push_id = begun(server, collector, started_at='2026-10-29T09:00:00.000003+09:00')
+    ok(server, collector, 'documents', [document(local=3, path='C:\\synthetic\\c.txt', versions=[version(local=31)])],
+       push_id)
+    server.db.execute('DELETE FROM collector_documents WHERE local_document_id = 1')
+    assert ok(server, collector, 'end', [{'counts': {}, 'bytes_sent': 0}], push_id)['swept'] == 0
+    assert statuses(server.db)['b.txt'] == 'active'
+
+
+def test_a_long_unit_joins_the_same_on_an_older_sqlite(tmp_path, monkeypatch):
+    """Review v3 V3-7 (probe FB): with ``sqlite_version()`` below 3.44 the waiting unit's pieces are joined in
+    Python (``''.join``) instead of ``group_concat(... ORDER BY part)``; the server store mirrors the collector."""
+    server = Server(tmp_path)
+    collector = server.collector('합성-옛')
+    server.db.create_function('sqlite_version', 0, lambda: '3.37.2')
+    assert server.db.execute('SELECT sqlite_version()').fetchone()[0] == '3.37.2'
+    monkeypatch.setattr(sync, 'UNIT_PIECE_CHARS', 2000)
+    col = Collector(tmp_path)
+    (col.src/'line.txt').write_text(('합성 긴 한 줄 문장입니다. ' * 1000)[:15_000] + '\n' + '\n'.join(LINES_KO),
+                                    encoding='utf-8')
+    col.collect()
+    statements = []
+    server.db.set_trace_callback(statements.append)
+    try:
+        report = col.push(server, collector)
+        server.db.set_trace_callback(None)
+        assert report['exit_code'] == 0 and report['converged'], report
+        assert sum(1 for body in server.bodies if body['kind'] == 'units') >= 8      # the long unit in pieces
+        assert not any('group_concat' in sql for sql in statements)                 # joined in Python instead
+        assert sum('SELECT sqlite_version()' in sql for sql in statements) == 1      # one waiting unit, one join
+        mirrored(col, server, collector)
+        assert binding.verify(server.db, stored_only=True)['ok']
+    finally:
+        col.close()
+        server.close()

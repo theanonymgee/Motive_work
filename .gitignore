@@ -33,3 +33,13 @@ inbox/
 # MCP client project configs: absolute paths and PC values (templates in doc/examples/, design M3 §11.2)
 /.mcp.json
 /.codex/
+
+# Offline install bundles (built outside the repository by tools/make_bundle.py; never commit wheels or models)
+/bundles/
+workmcp-bundle-*/
+workmcp-model-*/
+*.whl
+
+# Token files (the push token lives in the data home, outside the repository; this only stops a stray copy)
+push.token
+*.token

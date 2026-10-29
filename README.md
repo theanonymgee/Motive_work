@@ -1,6 +1,6 @@
 # workmcp (Motive_work)
 
-A personal work-knowledge MCP server: a collector parses and embeds your own documents locally, and an MCP server answers Claude Code, Codex and other MCP clients with snippets that carry exact source locators. Single user, no external AI/API calls. Documentation is mainly in Korean.
+A personal work-knowledge MCP server: a collector parses and embeds your own documents locally and pushes the changes to your own server, which answers Claude Code, Codex and other MCP clients with snippets that carry exact source locators. Single user, no external AI/API calls. Documentation is mainly in Korean.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -20,11 +20,18 @@ A personal work-knowledge MCP server: a collector parses and embeds your own doc
              데이터 홈(SQLite)    HTTPS+토큰   질의 임베딩, MCP 제공)
 ```
 
-- **수집기**: 문서 폴더를 증분 수집하고 파싱·청크·임베딩한 뒤 바뀐 것만 운영 서버로 올립니다. 원본 파일은 그 PC를 떠나지 않습니다. 수집기의 네트워크는 운영 서버와 명시적인 모델 다운로드뿐입니다.
-- **운영 서버**: 같은 모델로 질의를 임베딩하고 MCP(Streamable HTTP)를 TLS와 토큰으로 제공합니다. 토큰은 SHA-256 해시로만 저장합니다.
+- **수집기**: 문서 폴더를 증분 수집하고 파싱·청크·임베딩한 뒤 바뀐 것만 운영 서버로 올립니다(`push`). 수집기가 쓰는 네트워크는 운영 서버(HTTPS)와, 명시적으로 실행하는 모델 다운로드뿐입니다.
+- **운영 서버**: 같은 모델로 질의를 임베딩하고 MCP(Streamable HTTP)를 TLS와 토큰으로 제공합니다. 토큰은 SHA-256 해시로만 저장합니다. 토큰 없는 요청은 받지 않습니다.
 - **로컬만 쓰기**: 서버 없이 한 PC에서 `workmcp serve`(stdio)로 바로 붙여 쓸 수도 있습니다.
 
 지원 형식: TXT, Markdown, CSV, PDF, DOCX, PPTX, XLSX, EML/MSG, HWP/HWPX.
+
+## 데이터와 보안 원칙
+
+- 실제 업무 자료와 비밀값(토큰, 서버 주소, 계정)은 저장소에 넣지 않습니다. 개발과 테스트에는 합성·공개 문서만 씁니다. 문서의 `<VPS_HOST>`, `<MCP_TOKEN>` 같은 자리표시자는 자기 값으로 바꿔 쓰세요.
+- 원본 파일은 수집기 PC에만 있습니다. 추출 텍스트·벡터·지식은 수집기 데이터 홈과 내 운영 서버 두 곳에만 저장됩니다.
+- MCP 클라이언트가 요청한 조각만 그 클라이언트로 나갑니다. 그 뒤 클라이언트 제공사(Anthropic, OpenAI 등)로 가는 것은 사용자의 선택입니다.
+- 회사 자료에 쓸 때 회사의 AI 사용 규정을 지키는 것은 사용자의 책임입니다.
 
 ## MCP 도구 (15개)
 
@@ -34,71 +41,132 @@ A personal work-knowledge MCP server: a collector parses and embeds your own doc
 | 구조화 지식 | `record_entity`, `record_fact`, `record_decision`, `record_task`, `supersede`, `retract` |
 | 지식 조회 | `find_entity`, `get_entity`, `list_knowledge`, `get_history` |
 
-쓰기 도구는 근거 출처(문서 조각의 인용) 또는 "내 메모" 표시를 반드시 요구합니다. 사실·결정·할 일은 유효 시점과 기록 시점 두 축으로 이력이 남고, 철회·대체돼도 지워지지 않습니다. 같은 대상의 어긋난 사실은 충돌로 표시됩니다.
-
 응답마다 `delivered_sources`에 이번 응답으로 나간 조각의 출처가 모두 적힙니다.
+
+쓰기 도구는 근거 출처(문서 조각의 인용) 또는 "내 메모" 표시를 반드시 요구합니다. 사실·결정·할 일은 유효 시점과 기록 시점 두 축으로 이력이 남고, 철회·대체돼도 지워지지 않습니다. 같은 대상의 어긋난 사실은 충돌로 표시됩니다.
 
 ## 요구 사항
 
-- Windows(수집기, 먼저 지원) 또는 Linux(운영 서버, Ubuntu 24.04에서 확인)
-- Python 3.12
-- 관리자 권한은 필요 없습니다(사용자 수준 venv).
-- BGE-M3 ONNX 모델 파일(약 2.3 GB). 명시적인 다운로드 명령이나 오프라인 묶음으로만 받습니다.
+- 수집기: Windows 10/11 x64, Python 3.12(python.org 사용자 단위 설치기로 충분), 디스크 약 3 GB(모델 약 2.3 GB), 색인 중 메모리 약 2 GiB. **관리자 권한은 필요 없습니다.**
+- 운영 서버: Ubuntu 24.04 VPS 한 대(배포 절차는 [doc/guides/](doc/guides/)).
+- BGE-M3 ONNX 모델 파일은 명시적인 다운로드 명령이나 오프라인 묶음으로만 받습니다.
 
-## 설치
+## 수집기 설치
 
-[uv](https://docs.astral.sh/uv/)를 쓰는 경우:
+아래는 PowerShell 기준입니다. 상세한 단계와 막혔을 때의 대처는 [회사 PC 설치 안내서](doc/guides/2026-10-29_회사PC-설치안내서_v1.md)에 있습니다. 데이터 홈은 `WORKMCP_HOME`(기본 `%USERPROFILE%\Motive_work`)이며, 저장소 안, 동기화 폴더(OneDrive 등), UNC 경로, 상대 경로, AppData 아래는 거부됩니다(Claude·Codex 데스크톱 앱과 함께 쓸 때 AppData 밖에 두는 이유: [doc/examples/README.md](doc/examples/README.md)).
 
-```bash
-uv venv --python 3.12
-uv sync --frozen
-uv run workmcp doctor
-```
+### 온라인 (주 경로)
 
-uv 없이 pip만 쓰는 경우(해시 고정 설치):
-
-```bash
-python -m venv .venv
+```powershell
+git clone <저장소 URL> workmcp ; cd workmcp
+py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock.txt
-.venv\Scripts\python.exe -m pip install --no-deps -e .
+.venv\Scripts\python.exe -I -m pip install --no-deps .
+.venv\Scripts\python.exe -I -m workmcp setup --home "$env:USERPROFILE\Motive_work" --model download --push-url https://<VPS_HOST>/workmcp
 ```
 
-데이터 홈은 `WORKMCP_HOME`(기본 `%LOCALAPPDATA%\Motive_work`)입니다. 저장소 안, 동기화 폴더, UNC 경로, 상대 경로는 거부됩니다. Claude·Codex 데스크톱 앱과 함께 쓸 때는 AppData 밖에 두세요(이유: [doc/examples/README.md](doc/examples/README.md)).
+### 오프라인 묶음 (예비 경로)
 
-## 사용
+회사 네트워크가 저장소·PyPI·모델 다운로드를 막을 때 씁니다. 묶음은 다른 PC에서 `tools/make_bundle.py`로 만듭니다(휠, `requirements.lock.txt` 사본, `SHA256SUMS`, 검증 스크립트, 모델은 별도 폴더). 묶음 폴더 안의 `INSTALL.txt`가 설치 명령 전부입니다. 요지는 다음과 같습니다.
 
-| 명령 | 하는 일 |
-|---|---|
-| `workmcp setup` | 데이터 홈, `config.toml`, 모델, 클라이언트 등록 준비 |
-| `workmcp doctor` | 데이터 홈 규칙, Python, SQLite/FTS5, mcp, 모델 파일, 수집 폴더 점검 |
-| `workmcp fetch-model` / `verify-model` | 모델 파일을 복사·검증(SHA-256 매니페스트) |
-| `workmcp scan [--root PATH]` | 수집 폴더 증분 수집 |
-| `workmcp index` | 수집된 버전을 청크·임베딩 |
-| `workmcp search "질의"` | 터미널에서 출처가 붙은 혼합 검색 |
-| `workmcp verify` | 저장된 단위가 현재 파일에서 다시 나오는지 결속 검사 |
-| `workmcp sources` | 수집 폴더와 상태 |
-| `workmcp serve` | stdio MCP 서버 (`--http`면 운영 서버) |
-| `workmcp push` | 수집기의 변경분을 운영 서버로 전송 |
-| `workmcp token` / `collectors` | 운영 서버: 토큰 발급·폐기·교체, 수집기 목록·은퇴 |
+```powershell
+python -I verify_bundle.py .                      # ok N mismatch 0 missing 0 unlisted 0 이어야 함
+py -3.12 -m venv "$env:USERPROFILE\workmcp\.venv"
+$py = "$env:USERPROFILE\workmcp\.venv\Scripts\python.exe"
+& $py -I -m pip install --no-index --find-links wheels --require-hashes -r requirements.lock.txt
+& $py -I -m pip install --no-index --find-links wheels --no-deps workmcp==0.0.1
+& $py -I -m workmcp setup --home "$env:USERPROFILE\Motive_work" --model-from <모델 묶음 폴더> --push-url https://<VPS_HOST>/workmcp
+```
 
-각 명령의 옵션은 `workmcp <명령> --help`로 봅니다.
+해시 검사(`--require-hashes`, `verify_bundle.py`)는 끄지 않습니다.
 
-MCP 클라이언트 설정 템플릿(로컬 stdio, 원격 HTTP)은 [doc/examples/](doc/examples/)에 있습니다. 운영 서버 배포 절차는 [doc/guides/](doc/guides/)에 있습니다. 문서의 `<VPS_HOST>`, `<VPS_IP>`, `<MCP_TOKEN>` 같은 자리표시자는 자기 값으로 바꿔 쓰세요.
+### setup
+
+`setup`은 묻지 않고 인자로만 동작하며, 토큰을 읽거나 만들거나 출력하지 않고, 클라이언트 등록은 명령줄만 출력합니다(사용자가 직접 실행).
+
+```
+workmcp setup --home PATH
+     (--model download | --model none | --model-from DIR)       # --upgrade 때는 생략 가능
+     [--source PATH ...] [--push-url https://<VPS_HOST>/workmcp]
+     [--clients claude,codex | --clients codex | --clients none] [--scope user|project] [--project DIR]
+     [--scan] [--index] [--upgrade] [--yes] [--dry-run]
+```
+
+`--dry-run`으로 무엇을 할지 먼저 봅니다. `--push-url`은 https만 받고, MCP 주소는 `<push-url>/mcp`입니다. push 토큰은 서버에서 한 번 발급받아 `<데이터 홈>\push.token`에 한 줄로 적거나 환경변수 `WORKMCP_PUSH_TOKEN`에 둡니다.
+
+## 사용 (수집기)
+
+```powershell
+$wm = ".venv\Scripts\python.exe"
+& $wm -I -m workmcp doctor                 # 환경 점검
+& $wm -I -m workmcp scan                   # config.toml의 [[sources]] 폴더를 증분 수집
+& $wm -I -m workmcp index                  # 청크·임베딩
+& $wm -I -m workmcp verify                 # 저장된 단위가 현재 파일에서 다시 나오는지 확인
+& $wm -I -m workmcp push --dry-run         # 서버와 비교만 (무엇이 나갈지 확인)
+& $wm -I -m workmcp push                   # 변경분 전송
+```
+
+| 명령 | 하는 일 | 종료 코드 |
+|---|---|---|
+| `setup` | 데이터 홈, `config.toml`, 모델, 클라이언트 등록 명령, 업그레이드 | 0 완료, 1 단계 실패, 2 홈 거부·스키마 체크섬 변경, 3 잠금, 4 인자·소스·설정 |
+| `doctor` | 데이터 홈 규칙, Python, SQLite/FTS5, mcp, 모델 파일, 수집 폴더, 역할 점검 | 0, 2 |
+| `scan [--root PATH] [--retry-failed] [--reparse] [--rehash]` | 수집 폴더 증분 수집 | 0, 2, 3 스캔 잠금, 4 |
+| `index [--limit N] [--gc]` | 수집된 버전을 청크·임베딩 | 0, 2, 3, 4 |
+| `push [--dry-run] [--max-mb N] [--limit-docs N]` | 변경분을 운영 서버로 전송 | 0, 1, 2, 3, 4 스키마 불일치 포함, 6 서버 연결 불가, 7 TLS 인증서 검증 실패 |
+| `verify [--root PATH] [--doc ID]` | 저장된 단위와 현재 파일의 결속 검사 | 0, 1 불일치, 2, 4 |
+| `search "질의"` | 터미널에서 출처가 붙은 혼합 검색 | 0, 2, 4 |
+| `serve` | 한 PC에서 쓰는 stdio MCP 서버 (`--http`면 운영 서버) | 0, 2, 3, 4 |
+| `sources` | 수집 폴더와 상태 | 0, 2 |
+| `fetch-model` / `verify-model` | 모델 파일 복사·검증(SHA-256 매니페스트) | 0, 1 |
+
+운영 서버 쪽 명령: `serve --http 127.0.0.1:8765`(loopback만; nginx/Caddy 뒤), `token issue|list|revoke|rotate`, `collectors [retire NAME]`, `verify --stored`. 각 명령의 옵션은 `workmcp <명령> --help`로 봅니다.
+
+## 클라이언트 연결
+
+운영 서버의 **mcp 토큰**을 씁니다(push 토큰은 MCP 경로에서 거부됩니다). `setup`이 아래와 같은 명령을 출력하면 사용자가 자기 터미널에서 실행합니다.
+
+```powershell
+# Claude Code (토큰이 입력한 명령줄에 남으므로, 등록 뒤 셸 기록을 정리하세요)
+claude mcp add --transport http --scope user workmcp https://<VPS_HOST>/workmcp/mcp --header "Authorization: Bearer <MCP_TOKEN>"
+
+# Codex (토큰은 사용자 환경변수 WORKMCP_MCP_TOKEN 에만 둡니다)
+codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN
+# 그리고 %USERPROFILE%\.codex\config.toml 의 [mcp_servers.workmcp] 에 startup_timeout_sec = 30, tool_timeout_sec = 120 추가
+```
+
+설정 템플릿(로컬 stdio, 원격 HTTP, Codex)은 [doc/examples/](doc/examples/)에 있습니다. 연결한 뒤 각 클라이언트에서 `status` 도구를 불러 `role: server`를 확인합니다.
+
+## 업데이트
+
+**서버 먼저, 수집기 나중.** 프로토콜·스키마·청크 버전이 다르면 `push`가 안전하게 거절됩니다(종료 코드 4, "update the server first").
+
+1. 서버: 새 코드 반입 → `pip install --no-deps` → `systemctl stop workmcp` → `workmcp setup --home <홈> --upgrade`(백업·마이그레이션·doctor) → `systemctl start workmcp`. 절차는 [VPS 배포 절차서](doc/guides/2026-10-26_VPS-배포절차서_v1.md).
+2. 수집기: `scan`·`index`·`push`가 돌고 있지 않은지 확인 → `git pull` 또는 새 묶음 → 의존성이 바뀌었으면 `pip install --require-hashes -r requirements.lock.txt` → `pip install --no-deps` → `workmcp setup --home <홈> --upgrade` → `push --dry-run`.
+3. 서버를 재시작했으면 MCP 클라이언트 세션을 새로 엽니다(도구 목록은 세션 시작 때 정해집니다).
 
 ## 테스트
 
-```bash
-uv run pytest -q
+```powershell
+.venv\Scripts\python.exe -I -m pytest -q
 ```
 
-테스트는 합성 문서만 씁니다. 네트워크 경계(외부 연결 없음), 데이터 홈 규칙, 저장소에 비밀값이 없는지도 테스트로 고정돼 있습니다.
+`requirements.lock.txt`에 `pytest`가 들어 있어 설치한 PC에서 같은 테스트를 진단으로 돌릴 수 있습니다. 테스트는 합성 문서만 쓰며, 네트워크 경계(수집기는 운영 서버와 모델 다운로드 모듈 외 연결 없음), 데이터 홈 규칙, 저장소에 비밀값·개인 경로가 없는지도 테스트로 고정돼 있습니다. 개발 환경(uv)은 [CLAUDE.md](CLAUDE.md)를 보세요.
 
-## 데이터와 보안 원칙
+## 문서
 
-- 실제 업무 자료와 비밀값(토큰, 서버 주소, 계정)은 저장소에 넣지 않습니다. 개발과 테스트에는 합성·공개 문서만 씁니다.
-- 원본 파일은 수집기 PC에만 있습니다. 추출 텍스트·벡터·지식은 수집기 데이터 홈과 내 운영 서버 두 곳에만 저장됩니다.
-- MCP 클라이언트가 요청한 조각만 그 클라이언트로 나갑니다. 그 뒤 클라이언트 제공사(Anthropic, OpenAI 등)로 가는 것은 사용자의 선택입니다.
-- 회사 자료에 쓸 때 회사의 AI 사용 규정을 지키는 것은 사용자의 책임입니다.
+- [AGENTS.md](AGENTS.md): 프로젝트 맥락과 경계 원칙(Codex와 Claude Code 공통)
+- [docs/PLAN.md](docs/PLAN.md), [docs/PROGRESS.md](docs/PROGRESS.md): 계획과 진행
+- `doc/`: 설계, 검토, 안내서(`doc/guides/`), 클라이언트 설정 예시(`doc/examples/`)
+
+## AI 에이전트에게 설치를 맡길 때
+
+에이전트에게 이 README와 [설치 안내서](doc/guides/2026-10-29_회사PC-설치안내서_v1.md)를 읽히고 아래 지점에서 반드시 멈추게 하세요.
+
+- 데이터 홈 위치와 `[[sources]]` 폴더를 정하기 전.
+- 토큰을 만들거나 파일·환경변수에 적기 전(에이전트는 토큰 값을 읽지도 쓰지도 않습니다).
+- `claude mcp add`, `codex mcp add`, 환경변수 설정, 전역 설정 파일 수정 같은 등록 명령을 실행하기 전(명령은 출력만 하고 사용자가 실행).
+- 첫 `push`(그 전 `push --dry-run`의 문서 수를 사용자가 확인).
+- 해시 불일치, 보안 소프트웨어의 차단, 프록시 필요 같은 오류를 만났을 때(우회하지 말고 멈춰서 알림).
 
 ## 상태
 

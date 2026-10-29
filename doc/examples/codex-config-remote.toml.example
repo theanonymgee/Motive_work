@@ -1,0 +1,11 @@
+# Codex -> workmcp operating server (remote MCP over HTTPS).
+# Copy this block into %USERPROFILE%\.codex\config.toml (user scope), or let
+#   codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN
+# write the first two keys and add the two timeouts by hand.
+# The token value is never in this file: put it in the user environment variable WORKMCP_MCP_TOKEN
+# (Windows settings > "계정의 환경 변수 편집" > new variable), then restart Codex.
+[mcp_servers.workmcp]
+url = "https://<VPS_HOST>/workmcp/mcp"
+bearer_token_env_var = "WORKMCP_MCP_TOKEN"
+startup_timeout_sec = 30
+tool_timeout_sec = 120

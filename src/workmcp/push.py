@@ -52,6 +52,7 @@ LOG_FORMAT = '%(asctime)s | %(message)s'
 EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_LOCKED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_TLS = 0, 1, 2, 3, 4, 6, 7
 PUSH_LOCK = 'push.lock'                    # one push at a time per data home (store.acquire_lock)
 PUSH_LOCK_STALE = timedelta(hours=6)       # a lock left by a killed push stops blocking after this long
+PUSH_LOCK_HEARTBEAT = timedelta(minutes=5)  # a live push writes heartbeat_at this often (never looks stale)
 CERTIFICATE_ERRORS = ('SSLCertVerificationError',)   # by class name: this module does not import ssl
 RETRY_DELAYS = (1, 2, 4, 8, 16)            # seconds before each resend of the same batch
 REQUEST_TIMEOUT_SECONDS = 300
@@ -66,6 +67,7 @@ SENT_KEYS = ('documents', 'versions', 'units', 'chars', 'vectors', 'vector_bytes
              'forgotten')
 SERVER_KEYS = ('documents_sha256', 'vectors_sha256', 'vectors_missing')
 REFUSED_KEYS = ('path', 'code')
+TOO_MANY_PARTS = 'too_many_parts'          # refused here: a version needs more than sync.MAX_PARTS parts
 
 # A transport sends one request and returns (HTTP status, response body bytes); it raises Unreachable when
 # no answer came. The default is ``http_transport``; tests pass an in-memory one.
@@ -117,9 +119,10 @@ class CertificateFailed(Exception):
 class Stop(Exception):
     """The run ends here: ``exit_code`` and one line for the report (codes and counts, no text)."""
 
-    def __init__(self, exit_code: int, message: str):
+    def __init__(self, exit_code: int, message: str, code: str | None = None):
         super().__init__(message)
         self.exit_code = exit_code
+        self.code = code                           # the server's refusal code, if a refusal ended the run
 
 
 def http_transport(token: str, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Transport:
@@ -169,6 +172,28 @@ class _Run:
     budget: int | None = None                       # --max-mb in bytes
     stopped: str | None = None                      # why sending stopped early (--max-mb)
     note: str | None = None                         # what this run left for the next one (--limit-docs)
+    lock: Path | None = None                        # push.lock held by this run, its nonce and last heartbeat
+    nonce: str | None = None
+    beat_at: datetime | None = None
+
+    def heartbeat(self) -> None:
+        """Write ``heartbeat_at`` into ``push.lock`` when ``PUSH_LOCK_HEARTBEAT`` has passed since the last time
+        (before each request), so a live push never looks stale to another run (review M5 remote v3 V3-5).
+        A lock that holds another run's nonce ends this run (exit 3); a write that fails now is tried again at
+        the next request."""
+        if self.lock is None:
+            return
+        at = store.lock_now()
+        if self.beat_at is not None and at - self.beat_at < PUSH_LOCK_HEARTBEAT:
+            return
+        try:
+            held = store.touch_lock(self.lock, self.nonce, at)
+        except OSError as exc:
+            self.logger.info(f'warning | push lock heartbeat not written ({type(exc).__name__}); trying again')
+            return
+        if not held:
+            raise Stop(EXIT_LOCKED, f'another push took over {self.lock}; this run stops')
+        self.beat_at = at
 
     def get(self, name: str, query: dict | None = None) -> dict:
         self.report['state_requests'] += 1
@@ -192,6 +217,7 @@ class _Run:
             if attempt:
                 self.report['retries'] += 1
                 self.sleep(RETRY_DELAYS[attempt - 1])
+            self.heartbeat()
             if data is not None:
                 self.report['bytes_sent'] += len(data)
             try:
@@ -217,7 +243,7 @@ class _Run:
             if not retryable:
                 exit_code = EXIT_USAGE if code in ('schema_version_mismatch', 'chunk_version_mismatch') else EXIT_FAILED
                 message = error.get('message') if isinstance(error, dict) else ''
-                raise Stop(exit_code, f'refused: {reason}' + (f' ({message})' if message else ''))
+                raise Stop(exit_code, f'refused: {reason}' + (f' ({message})' if message else ''), code)
         unreachable = reason.startswith('server unreachable')
         raise Stop(EXIT_UNREACHABLE if unreachable else EXIT_FAILED, f'{reason} after {len(RETRY_DELAYS)} retries')
 
@@ -257,10 +283,12 @@ def document_item(db, document_id: int) -> tuple[dict, str]:
     return item, row['path']
 
 
-def unit_parts(db, version_id: int) -> list[list[dict]]:
+def unit_parts(db, version_id: int) -> list[list[dict]] | None:
     """The wire units of one version cut into parts that each fit one batch (``UNITS_PER_BATCH`` entries,
     ``UNIT_CHARS_PER_BATCH`` characters, ``BATCH_MAX_BYTES`` less the envelope reserve); a part ends after each
-    piece of a long unit that continues, so the server applies a long unit one piece at a time."""
+    piece of a long unit that continues, so the server applies a long unit one piece at a time. None when the
+    version needs more than ``sync.MAX_PARTS`` parts (the server would refuse it: ``_send_units`` refuses that
+    version alone, review M5 remote v3 V3-6)."""
     budget = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE
     parts, current, chars, size = [], [], 0, 0
     for ordinal, kind, locator_json, text, text_sha256 in db.execute(
@@ -282,9 +310,7 @@ def unit_parts(db, version_id: int) -> list[list[dict]]:
                 current, chars, size = [], 0, 0
     if current:
         parts.append(current)
-    if len(parts) > sync.MAX_PARTS:
-        raise Stop(EXIT_FAILED, f'version {version_id} needs {len(parts)} parts (at most {sync.MAX_PARTS})')
-    return parts
+    return None if len(parts) > sync.MAX_PARTS else parts
 
 
 def _batches(items, *, count: int, budget: int = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE):
@@ -352,25 +378,31 @@ def execute(home: Path, settings: config.Config, token: str, options: Options, *
     report = new_report(url)
     report['dry_run'] = options.dry_run
     paths.ensure_home(home)
+    nonce, taken_at = store.new_lock_nonce(), store.lock_now()   # this run's lock (review M5 remote v3 V3-5)
     try:
-        lock, report['warning'] = store.acquire_lock(home, PUSH_LOCK, stale_after=PUSH_LOCK_STALE)
+        lock, report['warning'] = store.acquire_lock(home, PUSH_LOCK, taken_at, stale_after=PUSH_LOCK_STALE,
+                                                     nonce=nonce)
     except store.Locked as exc:
         report.update(exit_code=EXIT_LOCKED, error=str(exc), elapsed=round(time.monotonic() - begin, 3))
         return report
     try:
-        return _locked_run(home, url, token, options, report, begin, transport, sleep)
+        return _locked_run(home, url, token, options, report, begin, transport, sleep, (lock, nonce, taken_at))
     finally:
-        store.release_lock(lock)                   # whatever happened after the lock was taken (review v2 L-d)
+        # whatever happened after the lock was taken (review v2 L-d); a lock another run took over stays
+        store.release_lock(lock, nonce)
 
 
 def _locked_run(home: Path, url: str, token: str, options: Options, report: dict, begin: float,
-                transport: Transport | None, sleep: Callable[[float], None]) -> dict:
+                transport: Transport | None, sleep: Callable[[float], None],
+                held: tuple[Path, str, datetime] | None = None) -> dict:
     logger, handler, log_file = _file_logger(home)
     report['log'] = str(log_file)
     if report['warning']:
         logger.info(report['warning'])
     run = _Run(url, transport or http_transport(token), sleep, logger, report,
                budget=None if options.max_mb is None else options.max_mb * 2**20)
+    if held is not None:
+        run.lock, run.nonce, run.beat_at = held
     db = None
     try:
         db = store.open_read(home)
@@ -543,16 +575,35 @@ def _server_missing(run: _Run, model_key: str) -> list[str]:
 
 
 def _send_units(db, run: _Run, need: list[int], versions_by_local: dict) -> None:
+    """The units of the versions in ``need``. A version is refused alone and the next one goes on (review M5
+    remote v3 V3-6) when it needs more than ``sync.MAX_PARTS`` parts (``too_many_parts``, nothing sent) or the
+    server refuses a units batch of it as ``version_too_large`` (a unit longer than the server takes that the
+    documents step did not see; the server removes what it holds of the version). A refused batch of several
+    short versions refuses them all; a collector that reports ``unit_chars_max`` never sends one."""
     report, logger = run.report, run.logger
     batch, entries, units, chars, size = [], 0, 0, 0, 0
     budget = sync.BATCH_MAX_BYTES - sync.ENVELOPE_RESERVE
+    refused: set[int] = set()
+
+    def refuse(local: int, code: str) -> None:
+        refused.add(local)
+        path, version = versions_by_local[local]
+        report['refused'].append({'path': path, 'code': code})
+        logger.info(f"refused | {path} | {version['sha256'][:12]} | {code}")
 
     def flush():
         nonlocal batch, entries, units, chars, size
         if batch:
-            run.post('units', batch)
-            report['sent']['units'] += units
-            report['sent']['chars'] += chars
+            try:
+                run.post('units', batch)
+            except Stop as exc:
+                if exc.code != 'version_too_large':
+                    raise
+                for local in dict.fromkeys(item['local_version_id'] for item in batch):
+                    refuse(local, exc.code)
+            else:
+                report['sent']['units'] += units
+                report['sent']['chars'] += chars
         batch, entries, units, chars, size = [], 0, 0, 0, 0
 
     for local in need:
@@ -560,6 +611,9 @@ def _send_units(db, run: _Run, need: list[int], versions_by_local: dict) -> None
             break
         path, version = versions_by_local[local]
         parts = unit_parts(db, local)
+        if parts is None:
+            refuse(local, TOO_MANY_PARTS)
+            continue
         for number, part in enumerate(parts, start=1):
             item = {'local_version_id': local, 'units_sha256': version['units_sha256'], 'part': number,
                     'parts': len(parts), 'units': part}
@@ -568,14 +622,19 @@ def _send_units(db, run: _Run, need: list[int], versions_by_local: dict) -> None
             if batch and (entries + len(part) > sync.UNITS_PER_BATCH or chars + part_chars > sync.UNIT_CHARS_PER_BATCH
                           or size + item_size > budget or len(parts) > 1):
                 flush()                     # each part of a split version is a batch of its own (a short step)
+            if local in refused:            # the server refused an earlier part of it: no more parts
+                break
             batch.append(item)
             entries += len(part)
             units += len({unit['ordinal'] for unit in part}
                          - ({parts[number - 2][-1]['ordinal']} if number > 1 else set()))
             chars += part_chars
             size += item_size
-        logger.info(f"pushed | {path} | {version['sha256'][:12]} | units {version['unit_count']} "
-                    f"| chars {version['text_chars']}")
+        if len(parts) > 1:
+            flush()                         # its last part too: a refusal of it names this version only
+        if local not in refused:
+            logger.info(f"pushed | {path} | {version['sha256'][:12]} | units {version['unit_count']} "
+                        f"| chars {version['text_chars']}")
     flush()
 
 

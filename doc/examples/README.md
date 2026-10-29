@@ -7,6 +7,7 @@
 | `mcp.json.example` | `.mcp.json` | Claude Code (터미널·데스크톱 Code 탭) |
 | `codex-config.toml.example` | `.codex/config.toml` | Codex (CLI·데스크톱 앱) |
 | `mcp-remote.json.example` | `.mcp.json` (원격 운영 서버에 붙일 때. 위 로컬 stdio 템플릿과 **둘 중 하나**) | Claude Code — 아래 "원격 연결" 절 |
+| `codex-config-remote.toml.example` | `%USERPROFILE%\.codex\config.toml`에 블록을 덧붙임(사용자 범위) | Codex — 아래 "Codex" 절 |
 
 ## 사용법
 
@@ -62,12 +63,16 @@ Codex가 프로젝트 `.codex/config.toml`의 `mcp_servers`를 읽지 않으면 
    claude mcp list
    ```
 
-   **[추정]** `--transport http`, `--header`, `--scope user` 옵션 이름과 헤더 형식은 설계의 추정이다. 이 PC에는 `claude` 명령이 PATH에 없어(확인 2026-10-26) `claude mcp add --help`로 확인하지 못했다. 실행하기 전에 피터가 `claude mcp add --help`로 옵션 이름을 확인하고, 다르면 그 이름을 따른다. 토큰이 셸 기록에 남는 것이 싫으면 위 1번의 환경변수 방식을 쓴다.
+   **[사실]** 이 명령형은 M5 F-1(2026-10-29)에서 실제로 동작했다(`doc/validation/2026-10-29_M5-원격연결확인_v1.md`). `claude`가 PATH에 없는 PC에서는 Claude 앱에 동봉된 `claude.exe`의 전체 경로로 실행한다. 토큰이 입력한 명령줄에 들어가므로 PowerShell 기록에 남는다. 등록이 끝나면 기록을 지우되, 아래 주의를 읽는다.
+
+   > **주의:** `Remove-Item (Get-PSReadLineOption).HistorySavePath`는 그 한 줄이 아니라 **PowerShell 명령 기록 파일 전체**를 지운다(이전에 쓴 명령도 모두 사라짐). 토큰이 남는 것이 싫으면 위 1번의 환경변수 방식(`${WORKMCP_MCP_TOKEN}`)을 쓴다.
 3. 확인: `claude mcp list`에서 `workmcp`가 연결 상태인지, Code 탭에서 `status` 도구가 `role: server`를 돌려주는지 본다. 첫 의미 검색은 서버가 모델을 읽느라 수십 초 걸릴 수 있다.
 
 ### Codex
 
-- **[추정]** `codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN`. 이 PC에는 `codex` 명령도 없고 Codex 원격 연결은 M6 범위(회사 PC)라서 지금은 확인하지 않는다. 옵션 이름은 그때 `codex mcp add --help`로 맞춘다.
+- **[사실]** `codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN`. 옵션 `--url`, `--bearer-token-env-var`(streamable HTTP 서버에만 유효)는 `codex-cli 0.160.0`의 `codex mcp add --help`와 공식 문서로 확인했다(접근 2026-10-29: https://learn.chatgpt.com/docs/extend/mcp?surface=cli , https://learn.chatgpt.com/docs/config-file/config-reference ). 토큰은 명령줄에도 파일에도 없고 사용자 환경변수 `WORKMCP_MCP_TOKEN`에만 있다.
+- `codex-config-remote.toml.example`의 `[mcp_servers.workmcp]` 블록을 `%USERPROFILE%\.codex\config.toml`에 넣는다. 명령으로 만든 블록에는 `startup_timeout_sec = 30`, `tool_timeout_sec = 120` 두 줄을 손으로 더한다(기본 10초·60초는 첫 의미 검색에 빠듯하다).
+- 프로젝트 범위 `.codex/config.toml`은 신뢰한 프로젝트에서만 읽히므로 사용자 범위를 기본으로 한다. 환경변수를 새로 만들거나 바꾼 뒤에는 Codex를 다시 시작한다.
 
 ### 로컬 stdio와 헷갈리지 않기
 

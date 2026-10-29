@@ -59,7 +59,7 @@ PARSE_STATUSES = ('ok', 'failed', 'locked', 'unsupported', 'too_large', 'encrypt
 COPY_CANDIDATES = 5
 LOCKED_SHA256 = '0' * 64
 CHUNK_PAGE_UNITS = 500             # units read per step when chunks are built from stored units
-PROGRESS_PART = 0                  # push_parts row holding a split version's state
+PROGRESS_PART = store.PROGRESS_PART  # push_parts row holding a split version's state (store.IN_PROGRESS_SQL)
 
 
 def _now(now: str | None) -> str:
@@ -206,9 +206,8 @@ def _chunk_version(db, version_id: int, sha256: str, parser_version: str | None)
 
 
 def _in_progress(db, version_id: int) -> bool:
-    return db.execute('SELECT 1 FROM push_parts p JOIN pushes s ON s.id = p.push_id JOIN collector_versions m ON '
-                      'm.collector_id = s.collector_id AND m.local_version_id = p.local_version_id '
-                      'WHERE m.version_id = ? AND p.part = ? LIMIT 1', (version_id, PROGRESS_PART)).fetchone() is not None
+    """The server is still applying this split version (the one query of that: ``store.IN_PROGRESS_SQL``)."""
+    return db.execute(f'SELECT 1 WHERE ? IN ({store.IN_PROGRESS_SQL})', (version_id,)).fetchone() is not None
 
 
 def refresh_chunks(db, document_id: int) -> int:
@@ -364,7 +363,16 @@ def _running_push(db, collector: dict, push_id) -> dict:
         raise sync.SyncError('push_not_running', f'push {push_id} is not running for this collector')
     work = json.loads(row[2] or '{}')
     return {'id': row[0], 'scan_id': row[1], 'model_key': work.get('model_key'), 'roots': work.get('roots', {}),
-            'root_keys': work.get('root_keys', {})}
+            'root_keys': work.get('root_keys', {}), 'refused_keys': set(work.get('refused_keys', ()))}
+
+
+def _note_refused(db, push_id: int, keys: set[str]) -> None:
+    """Add the ``path_key``s (``sync.windows_normcase``) of documents this push had refused to its working
+    state (``pushes.note`` JSON ``refused_keys``): the collector still has those files, so ``forget`` and the
+    sweep at ``end`` leave their server documents as they are (review v3 V3-3)."""
+    work = json.loads(db.execute('SELECT note FROM pushes WHERE id = ?', (push_id,)).fetchone()[0] or '{}')
+    work['refused_keys'] = sorted(set(work.get('refused_keys', ())) | keys)
+    db.execute('UPDATE pushes SET note = ? WHERE id = ?', (json.dumps(work, sort_keys=True), push_id))
 
 
 def _discard_parts(db, push_id: int) -> int:
@@ -616,7 +624,7 @@ def _document_refusal(db, collector: dict, push: dict, item: dict, wanted: list[
 def _documents(db, collector: dict, push: dict, items: list, at: str) -> dict:
     if len(items) > sync.DOCUMENTS_PER_BATCH:
         raise sync.SyncError('bad_batch', f'over {sync.DOCUMENTS_PER_BATCH} documents in one batch')
-    documents, versions, refused, cid = {}, {}, [], collector['id']
+    documents, versions, refused, refused_keys, cid = {}, {}, [], set(), collector['id']
     for number, item in enumerate(items):
         where = f'items[{number}]'
         _need(item, ('local_document_id', 'local_root_id', 'path', 'path_key', 'ext', 'status', 'skip_reason',
@@ -641,6 +649,7 @@ def _documents(db, collector: dict, push: dict, items: list, at: str) -> dict:
         code, doc_id = _document_refusal(db, collector, push, item, wanted)
         if code:
             refused.append({'local_document_id': local_doc, 'code': code})
+            refused_keys.add(sync.windows_normcase(item['path_key']))
             continue
         plan = _match_versions(db, cid, doc_id, wanted)
         if doc_id is None:
@@ -687,29 +696,37 @@ def _documents(db, collector: dict, push: dict, items: list, at: str) -> dict:
             db.execute('DELETE FROM collector_versions WHERE version_id = ?', (version_id,))
             db.execute('UPDATE versions SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL', (at, version_id))
         refresh_chunks(db, doc_id)
+    if refused_keys:
+        _note_refused(db, push['id'], refused_keys)
     store.bump_data_generation(db)
     return {'documents': documents, 'versions': versions, 'refused': refused}
 
 
 def _forget(db, collector: dict, push: dict, items: list, at: str) -> dict:
     """Local document ids the collector no longer has (its store was rebuilt or restored): the server document
-    is unmapped and, unless already deleted, marked deleted (with a ``deleted`` event); its rows stay."""
+    is unmapped and, unless already deleted, marked deleted (with a ``deleted`` event); its rows stay. A
+    document this push refused (``refused_keys``: the file is there under a new local id) is only unmapped and
+    counted as ignored (review v3 V3-3, probe S-D)."""
     if len(items) > sync.EVENTS_PER_BATCH:
         raise sync.SyncError('bad_batch', f'over {sync.EVENTS_PER_BATCH} documents in one batch')
     forgotten = ignored = 0
     for number, item in enumerate(items):
         _need(item, ('local_document_id',), f'items[{number}]')
         local = _int(item['local_document_id'], f'items[{number}].local_document_id', low=1)
-        row = db.execute('SELECT d.id, d.status FROM collector_documents m JOIN documents d ON d.id = m.document_id '
-                         'WHERE m.collector_id = ? AND m.local_document_id = ?', (collector['id'], local)).fetchone()
+        row = db.execute('SELECT d.id, d.status, d.path_key FROM collector_documents m JOIN documents d ON '
+                         'd.id = m.document_id WHERE m.collector_id = ? AND m.local_document_id = ?',
+                         (collector['id'], local)).fetchone()
         if row is None:
             ignored += 1
             continue
-        doc_id, status = row
+        doc_id, status, path_key = row
         db.execute('DELETE FROM collector_versions WHERE collector_id = ? AND version_id IN '
                    '(SELECT id FROM versions WHERE document_id = ?)', (collector['id'], doc_id))
         db.execute('DELETE FROM collector_documents WHERE collector_id = ? AND local_document_id = ?',
                    (collector['id'], local))
+        if sync.windows_normcase(path_key) in push['refused_keys']:
+            ignored += 1
+            continue
         if status != 'deleted':
             db.execute("UPDATE documents SET status = 'deleted', deleted_at = ? WHERE id = ?", (at, doc_id))
             store.add_document_event(db, push['scan_id'], doc_id, None, 'deleted', at)
@@ -843,10 +860,12 @@ def _apply_part(db, push: dict, local: int, version_id: int, fields: dict, progr
                 part: int, last: bool, at: str) -> None:
     """Insert the complete units of one part and the chunks they complete (one short transaction per part).
 
-    A unit that may continue in the next part is stored at once and grows in place (``text || piece``); its
-    pieces also wait in ``push_parts`` so that its hash is checked piece by piece when it ends, and a long one
-    is chunked as it grows (``long_unit_pieces``): no part ever holds a whole long unit in memory (review v2
-    N-2). Checks each unit's ordinal, length (``sync.UNIT_MAX_CHARS``), hash and the version's limits."""
+    A unit that may continue in the next part is not stored yet: its pieces wait in ``push_parts`` (one row per
+    part), and when it ends its hash is checked piece by piece and the unit is inserted once
+    (``_insert_joined_unit``: SQLite ``group_concat`` from 3.44, else ``''.join`` here). A long one is chunked
+    as it grows (``long_unit_pieces``): no part holds a whole long unit in memory, except the join on an older
+    SQLite (review v2 N-2, v3 V3-7). Checks each unit's ordinal, length (``sync.UNIT_MAX_CHARS``), hash and
+    the version's limits."""
     cleanup = _discard_version(push['id'], local, version_id)
     joined = sync.join_pieces(rows)
     stream = ChunkStream(progress['chunks']) if progress['chunks'] is not None else None
@@ -1118,15 +1137,18 @@ def _sweep(db, collector: dict, push: dict, at: str) -> int:
     """After a push that sent every changed document (``end`` with ``complete``): an active document under a
     root of this push that this collector does not map (a file deleted before its store was rebuilt, whose old
     local id another file now has; or a retired collector's file the successor does not have) is the
-    collector's no longer: ``deleted`` with a ``deleted`` event, its rows kept (review v2 N-1, L-e)."""
+    collector's no longer: ``deleted`` with a ``deleted`` event, its rows kept (review v2 N-1, L-e). A document
+    this push refused (``refused_keys``) is not swept: the collector has the file, the server keeps what it had
+    (review v3 V3-3)."""
     roots = sorted(set(push['roots'].values()))
     if not roots:
         return 0
-    rows = db.execute(
-        f"SELECT d.id FROM documents d JOIN source_roots r ON r.id = d.root_id WHERE r.collector_id = ? "
+    rows = [(doc_id,) for doc_id, path_key in db.execute(
+        f"SELECT d.id, d.path_key FROM documents d JOIN source_roots r ON r.id = d.root_id WHERE r.collector_id = ? "
         f"AND d.root_id IN ({','.join('?' * len(roots))}) AND d.status = 'active' AND NOT EXISTS("
         "SELECT 1 FROM collector_documents m WHERE m.document_id = d.id AND m.collector_id = ?) ORDER BY d.id",
         (collector['id'], *roots, collector['id'])).fetchall()
+        if sync.windows_normcase(path_key) not in push['refused_keys']]
     for (doc_id,) in rows:
         db.execute("UPDATE documents SET status = 'deleted', deleted_at = ? WHERE id = ?", (at, doc_id))
         store.add_document_event(db, push['scan_id'], doc_id, None, 'deleted', at)

@@ -372,6 +372,9 @@ DELIVERY_COLUMNS = ('at', 'client', 'tool', 'locator_json', 'chars')
 LOCK_NAME = 'scan.lock'
 INDEX_LOCK_NAME = 'index.lock'
 STALE_LOCK_AGE = timedelta(hours=24)
+LOCK_SETTLE_SECONDS = 0.2       # acquire_lock: after replacing a stale lock, wait and read it back
+LOCK_IO_ATTEMPTS = 20           # Windows refuses for an instant a lock file another process has open
+LOCK_IO_WAIT_SECONDS = 0.01
 DEV_SCHEMA_HINT = ('development schema change: delete {db} and scan again (only before the first real install, '
                    'design M1 §10.1)')
 
@@ -527,64 +530,157 @@ def scan_lock_path(home: Path) -> Path:
     return lock_path(home, LOCK_NAME)
 
 
-def _lock_started(path: Path) -> datetime | None:
-    """Start time written in the lock, or the file time when the content is unreadable."""
+def lock_now() -> datetime:
+    """The clock of the lock files (``started_at``, ``heartbeat_at`` and the stale rule); tests move it."""
+    return datetime.now().astimezone()
+
+
+def new_lock_nonce() -> str:
+    """A value no other run writes into its lock (16 hex characters)."""
+    return os.urandom(8).hex()
+
+
+def _retry_io(action):
+    """``action()``, again after a short wait while Windows refuses it (another process has the lock file open
+    for an instant while it reads or replaces it: ``PermissionError``)."""
+    for attempt in range(LOCK_IO_ATTEMPTS):
+        try:
+            return action()
+        except PermissionError:
+            if attempt == LOCK_IO_ATTEMPTS - 1:
+                raise
+            time.sleep(LOCK_IO_WAIT_SECONDS)
+
+
+def _lock_raw(path: Path) -> bytes | None:
+    """The lock file's bytes; None when it is gone or cannot be read."""
     try:
-        started = datetime.fromisoformat(json.loads(path.read_text(encoding='utf-8'))['started_at'])
-        return started if started.tzinfo else started.astimezone()
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+        return _retry_io(path.read_bytes)
+    except OSError:
+        return None
+
+
+def _lock_info(raw: bytes | None) -> dict:
+    try:
+        info = json.loads(raw.decode('utf-8'))
+    except (AttributeError, UnicodeDecodeError, ValueError):
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def _lock_alive_at(path: Path, info: dict) -> datetime | None:
+    """When the holder last showed it is alive: ``heartbeat_at``, else ``started_at``, else the file time."""
+    for key in ('heartbeat_at', 'started_at'):
+        try:
+            at = datetime.fromisoformat(info[key])
+            return at if at.tzinfo else at.astimezone()
+        except (KeyError, TypeError, ValueError):
+            pass
     try:
         return datetime.fromtimestamp(os.stat(path).st_mtime).astimezone()
     except OSError:
         return None
 
 
-def acquire_lock(home: Path, name: str, at: datetime | None = None, *,
-                 stale_after: timedelta = STALE_LOCK_AGE) -> tuple[Path, str | None]:
-    """Create ``<home>/<name>`` exclusively; ``(path, warning)``. A lock older than ``stale_after`` (24 hours
-    unless the caller says otherwise; ``push`` uses ``push.PUSH_LOCK_STALE``) is removed with a warning; a newer one raises ``Locked`` (``ScanLocked`` for ``scan.lock``). The
-    process id is recorded but never probed (on Windows ``os.kill(pid, 0)`` terminates the
-    process). ``scan`` holds ``scan.lock`` and ``index`` holds ``index.lock`` (design M2 §4.6)."""
+def _replace_lock(path: Path, info: dict, nonce: str) -> None:
+    """Write ``info`` to a file of this run's own and move it over ``path`` in one step (``os.replace``): the
+    lock file is never missing in between, so no other run can create one meanwhile."""
+    temporary = path.with_name(f'{path.name}.{nonce}.tmp')
+    fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY)
+    try:
+        os.write(fd, json.dumps(info).encode())
+    finally:
+        os.close(fd)
+    try:
+        _retry_io(lambda: os.replace(temporary, path))
+    except OSError:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def acquire_lock(home: Path, name: str, at: datetime | None = None, *, stale_after: timedelta = STALE_LOCK_AGE,
+                 nonce: str | None = None) -> tuple[Path, str | None]:
+    """Create ``<home>/<name>`` exclusively; ``(path, warning)``. The lock holds the process id (recorded, never
+    probed: on Windows ``os.kill(pid, 0)`` terminates the process), ``started_at``, ``heartbeat_at`` and the
+    run's ``nonce`` (given, or a new one; review M5 remote v3 V3-5).
+
+    A lock whose holder last showed it is alive (``heartbeat_at``, else ``started_at``, else the file time)
+    more than ``stale_after`` ago (24 hours unless the caller says otherwise; ``push`` uses
+    ``push.PUSH_LOCK_STALE``) is taken over with a warning: replaced in one step, never removed and created
+    again, then read back after ``LOCK_SETTLE_SECONDS``. Of several runs that saw the same stale lock only the
+    one whose nonce it then holds goes on; the others raise like for a lock still alive: ``Locked``
+    (``ScanLocked`` for ``scan.lock``). ``scan`` holds ``scan.lock``, ``index`` holds ``index.lock`` (design
+    M2 §4.6), ``push`` holds ``push.lock`` and keeps it alive with ``touch_lock``."""
     path = lock_path(home, name)
     what = name.removesuffix('.lock')
     error = ScanLocked if name == LOCK_NAME else Locked
-    at = at or datetime.now().astimezone()
-    warning = None
+    at = at or lock_now()
+    nonce = nonce or new_lock_nonce()
+    mine = {'pid': os.getpid(), 'started_at': at.isoformat(timespec='seconds'),
+            'heartbeat_at': at.isoformat(timespec='seconds'), 'nonce': nonce}
     for attempt in (1, 2):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            started = _lock_started(path)
-            if attempt == 1 and started is not None and at - started > stale_after:
-                info = path.read_text(encoding='utf-8', errors='replace')[:200]
-                os.remove(path)
-                hours = stale_after.total_seconds() / 3600
-                warning = f'warning: removed a stale {what} lock older than {hours:g} hours ({info.strip()})'
-                continue
+            pass
+        else:
             try:
-                info = json.loads(path.read_text(encoding='utf-8'))
-                holder = f"pid {info.get('pid')}, since {info.get('started_at')}"
-            except (OSError, ValueError, AttributeError):
-                holder = 'unknown holder'
-            raise error(f'another {what} is running ({holder}); if not, delete {path}') from None
+                os.write(fd, json.dumps(mine).encode())
+            finally:
+                os.close(fd)
+            return path, None
+        raw = _lock_raw(path)
+        if raw is None and attempt == 1 and not path.exists():
+            continue                                    # released meanwhile: create it
+        info = _lock_info(raw)
+        holder = f"pid {info.get('pid')}, since {info.get('started_at')}" if info else 'unknown holder'
+        alive = None if raw is None else _lock_alive_at(path, info)
+        if alive is None or at - alive <= stale_after or _lock_raw(path) != raw:
+            raise error(f'another {what} is running ({holder}); if not, delete {path}')
         try:
-            os.write(fd, json.dumps({'pid': os.getpid(), 'started_at': at.isoformat(timespec='seconds')}).encode())
-        finally:
-            os.close(fd)
-        return path, warning
+            _replace_lock(path, mine, nonce)
+        except OSError:
+            raise error(f'another {what} is taking over the stale lock {path}') from None
+        time.sleep(LOCK_SETTLE_SECONDS)                 # a run that saw the same stale lock replaces it by now
+        if _lock_info(_lock_raw(path)).get('nonce') != nonce:
+            raise error(f'another {what} took over the stale lock {path}')
+        hours = stale_after.total_seconds() / 3600
+        shown = raw.decode('utf-8', errors='replace')[:200].strip()
+        return path, f'warning: removed a stale {what} lock older than {hours:g} hours ({shown})'
     raise error(f'cannot take the {what} lock {path}')
 
 
-def release_lock(path: Path) -> None:
+def touch_lock(path: Path, nonce: str, at: datetime | None = None) -> bool:
+    """Write ``heartbeat_at`` (``at`` or now) into the lock this run holds (``nonce``), so that it never looks
+    stale while the run lives. False when the lock is gone or holds another nonce (another run took it over);
+    ``OSError`` when it cannot be read or written now (the caller tries again later)."""
     try:
-        os.remove(path)
+        info = _lock_info(_retry_io(path.read_bytes))
     except FileNotFoundError:
-        pass
+        return False
+    if info.get('nonce') != nonce:
+        return False
+    _replace_lock(path, {**info, 'heartbeat_at': (at or lock_now()).isoformat(timespec='seconds')}, nonce)
+    return True
 
 
-def acquire_scan_lock(home: Path, at: datetime | None = None) -> tuple[Path, str | None]:
-    return acquire_lock(home, LOCK_NAME, at)
+def release_lock(path: Path, nonce: str | None = None) -> bool:
+    """Remove the lock file: with ``nonce`` only while it holds that nonce (a lock another run took over stays),
+    without one whatever it holds (the earlier behaviour). True when a file was removed."""
+    if nonce is not None and _lock_info(_lock_raw(path)).get('nonce') != nonce:
+        return False
+    try:
+        _retry_io(lambda: os.remove(path))
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def acquire_scan_lock(home: Path, at: datetime | None = None, *, nonce: str | None = None) -> tuple[Path, str | None]:
+    return acquire_lock(home, LOCK_NAME, at, nonce=nonce)
 
 
 release_scan_lock = release_lock
@@ -646,6 +742,18 @@ CHUNK_INSERT_BATCH = 1000
 # Latest active versions only (design M2 §4.1): what ``index`` chunks and ``search`` returns.
 ELIGIBLE_VERSIONS = ("d.status = 'active' AND v.superseded_at IS NULL AND v.parse_status = 'ok' "
                      "AND v.unit_count > 0")
+# A split version the operating server is still applying (``receive``: the ``push_parts`` row of part
+# ``PROGRESS_PART``, which ``receive.PROGRESS_PART`` is, holds its progress): its chunks are built part by part
+# but its units come whole only with its last part, so its chunks are no search candidates until then and
+# ``binding.verify`` counts it ``in_progress`` (review M5 remote v3 V3-2). The query of their (server) version
+# ids, not correlated: ``v.id NOT IN (...)`` is evaluated once per statement (240,000 chunks: about +10 % on a
+# full scan, a correlated ``NOT EXISTS`` about +25 %); one version: ``SELECT 1 WHERE ? IN (...)`` (also
+# ``receive._in_progress``). ``push_parts`` is empty on a collector and usually on the server. The
+# eligibility above stays without it: ``receive.refresh_chunks`` keeps building a version in progress.
+PROGRESS_PART = 0
+IN_PROGRESS_SQL = ('SELECT m.version_id FROM push_parts p JOIN pushes s ON s.id = p.push_id JOIN collector_versions m '
+                   'ON m.collector_id = s.collector_id AND m.local_version_id = p.local_version_id '
+                   f'WHERE p.part = {PROGRESS_PART}')
 
 
 def eligible_versions_sql() -> str:
@@ -657,9 +765,10 @@ def eligible_versions_sql() -> str:
 def latest_chunks_sql() -> str:
     """``FROM`` body for the chunks of eligible versions, aliases ``c`` (chunks), ``v``, ``d``, ending
     in a ``WHERE`` clause: ``f'SELECT c.id FROM {store.latest_chunks_sql()} AND c.chunk_version = ?'``.
-    It does not filter ``chunk_version``; the caller adds that condition."""
+    It does not filter ``chunk_version``; the caller adds that condition. A version in progress
+    (``IN_PROGRESS_SQL``) has none."""
     return (f'chunks c JOIN versions v ON v.id = c.version_id JOIN documents d ON d.id = v.document_id '
-            f'WHERE {ELIGIBLE_VERSIONS}')
+            f'WHERE {ELIGIBLE_VERSIONS} AND v.id NOT IN ({IN_PROGRESS_SQL})')
 
 
 def fts_available(db: sqlite3.Connection) -> bool:

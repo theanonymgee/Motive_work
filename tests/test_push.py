@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import threading
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -842,6 +843,142 @@ def test_the_push_lock_is_released_after_any_failure_and_a_stale_one_is_replaced
     report = col.push(server, collector)
     assert report['exit_code'] == 0 and 'removed a stale push lock older than 6 hours' in report['warning']
     assert report['warning'] in '\n'.join(push.report_lines(report)) and not lock_file.exists() and old
+
+
+def test_a_live_push_keeps_its_lock_and_one_taken_over_stops(pair, monkeypatch):
+    """Review v3 V3-5: a push that runs past the stale age (the lock clock jumps 7 hours inside the run, as a
+    long wait would) keeps its lock alive with heartbeats, so a second run started then exits 3; a push whose
+    lock another run took over stops at its next request (exit 3) and leaves that run's lock alone."""
+    col, server, collector = pair
+    lock_file = col.home/push.PUSH_LOCK
+    offset = [timedelta(0)]
+    real_now = store.lock_now
+    monkeypatch.setattr(store, 'lock_now', lambda: real_now() + offset[0])
+    seen = {}
+
+    def long_push(method, name, body, call):
+        if body is not None and 'slept' not in seen:
+            seen['slept'] = body['kind']
+            offset[0] += timedelta(hours=7)                      # this run waits past the stale age here
+        elif 'slept' in seen and 'second' not in seen:
+            seen['second'] = None
+            seen['second'] = col.push(server, collector)         # a second run starts while the first goes on
+        return call()
+    server.hook = long_push
+    first = col.push(server, collector)
+    server.hook = None
+    assert seen['slept'] == 'begin' and seen['second'] is not None
+    assert seen['second']['exit_code'] == push.EXIT_LOCKED == 3, seen['second']
+    assert 'another push is running' in seen['second']['error'] and seen['second']['batches'] == 0
+    assert first['exit_code'] == 0 and first['converged'] and first['warning'] is None, first
+    assert not lock_file.exists() and [p.name for p in col.home.iterdir() if p.name.endswith('.tmp')] == []
+    mirrored(col, server, collector)
+
+    # another run took the lock over (as a run that wrongly judged it stale would): this one stops
+    (col.src/'takeover.txt').write_text('합성 잠금 인수 시험 문장\n', encoding='utf-8')
+    col.collect()
+    foreign = {'pid': 1, 'started_at': store.now(), 'heartbeat_at': store.now(), 'nonce': 'f' * 16}
+
+    def taken_over(method, name, body, call):
+        if body is not None and body['kind'] == 'begin':
+            lock_file.write_text(json.dumps(foreign), encoding='utf-8')
+            offset[0] += push.PUSH_LOCK_HEARTBEAT                # the next request writes a heartbeat
+        return call()
+    server.hook = taken_over
+    stopped = col.push(server, collector)
+    server.hook = None
+    assert stopped['exit_code'] == push.EXIT_LOCKED and 'another push took over' in stopped['error'], stopped
+    assert json.loads(lock_file.read_text(encoding='utf-8'))['nonce'] == 'f' * 16     # left to its holder
+    lock_file.unlink()
+    final = col.push(server, collector)
+    assert final['exit_code'] == 0 and final['converged']
+    mirrored(col, server, collector)
+
+
+# ---- review v3 V3-6: a version refused at the units step does not stop the run ---------------------------------
+
+LONG_LINE = 'long-line.txt'
+
+
+def write_long_line(col: Collector, chars: int = 400_000) -> None:
+    """One line (one unit) longer than a piece (``sync.UNIT_PIECE_CHARS``): its version goes in two parts."""
+    (col.src/LONG_LINE).write_text(('합성 긴 한 줄 문장. ' * chars)[:chars], encoding='utf-8')
+    col.collect()
+
+
+def server_units_by_local(server: Server, collector: dict) -> dict:
+    return {local: server.db.execute('SELECT ordinal, text_sha256 FROM units WHERE version_id = ? ORDER BY ordinal',
+                                     (remote,)).fetchall()
+            for local, remote in server.db.execute('SELECT local_version_id, version_id FROM collector_versions '
+                                                   'WHERE collector_id = ?', (collector['id'],))}
+
+
+def others_converged(col: Collector, server: Server, collector: dict, refused_path: str) -> None:
+    """Every version but those of ``refused_path`` holds on the server the units it holds here."""
+    held = server_units_by_local(server, collector)
+    local = dict(col.db.execute('SELECT v.id, d.path FROM versions v JOIN documents d ON d.id = v.document_id'))
+    assert set(held) == set(local)
+    for version, path in local.items():
+        mine = col.db.execute('SELECT ordinal, text_sha256 FROM units WHERE version_id = ? ORDER BY ordinal',
+                              (version,)).fetchall()
+        if path == refused_path:
+            assert mine and held[version] == [], path
+        else:
+            assert held[version] == mine, path
+    assert server.count('push_parts') == 0
+
+
+def refused_again(col: Collector, server: Server, collector: dict, path: str, code: str) -> None:
+    """The next run finds that document different on the server (its units are missing there), sends it again
+    and refuses it again: the refusal shows in every run until the file changes, and nothing else goes."""
+    again = col.push(server, collector)
+    assert again['exit_code'] == push.EXIT_FAILED and again['refused'] == [{'path': path, 'code': code}], again
+    assert again['state']['documents_changed'] == 1 and not again['converged'] and again['error'] is None
+    others_converged(col, server, collector, path)
+
+
+def test_a_version_the_server_finds_too_large_is_refused_alone(pair, monkeypatch):
+    """Probe LIE ``lie_small``: a collector that reports a too small ``unit_chars_max`` passes the documents
+    step and gets ``version_too_large`` at the units step (here the server's unit limit is lowered under a
+    400,000-character line, so its second part is refused). That version is refused, the run goes on: the
+    other documents converge and the run ends 1."""
+    col, server, collector = pair
+    write_long_line(col, 700_000)                       # three parts
+    monkeypatch.setattr(sync, 'UNIT_MAX_CHARS', 300_000)
+    real_item = push.document_item
+
+    def lie_small(db, document_id):
+        item, path = real_item(db, document_id)
+        for version in item['versions']:
+            version['unit_chars_max'] = 1 if version['unit_chars_max'] else version['unit_chars_max']
+        return item, path
+    monkeypatch.setattr(push, 'document_item', lie_small)
+    report = col.push(server, collector)
+    long_path = str(col.src/LONG_LINE)
+    assert report['exit_code'] == push.EXIT_FAILED and report['error'] is None, report
+    assert report['refused'] == [{'path': long_path, 'code': 'version_too_large'}]
+    assert f'  refused: {long_path} : version_too_large' in push.report_lines(report)
+    parts = [item['part'] for body in server.bodies if body['kind'] == 'units' for item in body['items']
+             if item['parts'] > 1]
+    assert parts == [1, 2]                              # part 2 refused, nothing more of it sent
+    assert [body['kind'] for body in server.bodies][-1] == 'end'       # the vectors, events and end went on
+    others_converged(col, server, collector, long_path)
+    refused_again(col, server, collector, long_path, 'version_too_large')
+
+
+def test_a_version_of_too_many_parts_is_refused_alone(pair, monkeypatch):
+    """Review v3 V3-6 (2): a version that needs more than ``sync.MAX_PARTS`` parts (here 1) is refused here,
+    before any of its units go; the other documents converge and the run ends 1."""
+    col, server, collector = pair
+    write_long_line(col)
+    monkeypatch.setattr(sync, 'MAX_PARTS', 1)
+    report = col.push(server, collector)
+    long_path = str(col.src/LONG_LINE)
+    assert report['exit_code'] == push.EXIT_FAILED and report['error'] is None, report
+    assert report['refused'] == [{'path': long_path, 'code': push.TOO_MANY_PARTS}]
+    assert all(item['parts'] == 1 for body in server.bodies if body['kind'] == 'units' for item in body['items'])
+    others_converged(col, server, collector, long_path)
+    refused_again(col, server, collector, long_path, push.TOO_MANY_PARTS)
 
 
 # ---- a large version is applied part by part (review M5 remote v1 M-2) ---------------------------------------

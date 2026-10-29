@@ -15,7 +15,10 @@ parser runs; the stored units themselves are the derivation, so the check is tha
 its ``text_sha256``, ordinals run 1..n, the set matches the hash the collector sent
 (``collector_versions.units_sha256``, ``units_sha256_mismatch``), chunks are slices of the joined units and
 the chunk set is ``build_chunks`` of them, and evidence quotes are what their locators point at. The result is
-``ok`` or ``failed`` (nothing is unverifiable without files).
+``ok`` or ``failed`` (nothing else is unverifiable without files), except for a split version the server is still
+applying (``store.IN_PROGRESS_SQL``): its units are not all there until its last part, so it is ``in_progress``,
+unverifiable, not a mismatch (review M5 remote v3 V3-2). ``push_parts`` is empty on a collector: no version there
+is ever ``in_progress``.
 """
 from __future__ import annotations
 
@@ -35,7 +38,8 @@ SCOPE = ('결속 100% = parse_status가 ok인 버전 중 현재 파일의 sha256
          '같음. 파서가 원문을 올바르게 읽었는지는 보이지 않음. 파일이 바뀐 옛 버전은 재검증 불가(stale)로 따로 셈.')
 MAX_FAILURES = 20
 UNVERIFIABLE = ('stale', 'missing', 'locked', 'unstable', 'parser_version_mismatch', 'skipped_not_ok', 'placeholder',
-                'timeout')
+                'timeout', 'in_progress')
+IN_PROGRESS_NOTICE = '{}개 버전을 서버가 아직 적용 중(분할 push) - 검사하지 않음; push가 끝난 뒤 다시 verify'
 # Mismatches a later ``scan --reparse`` of the cited version explains (review M4 v2 N2); a quote whose own
 # hash is wrong, a bad shape or another version is never one of them.
 REPARSE_STALE_CODES = frozenset({'unit_not_found', 'coordinate_out_of_range', 'locator_text_mismatch',
@@ -100,6 +104,9 @@ def verify_version(db, version_id: int, cache: dict, limits: parsers.Limits | No
                                        'path': path, 'sha12': sha256[:12], 'unit_label': '-'})
         else:
             report['result'] = 'skipped_not_ok'
+        return report
+    if db.execute(f'SELECT 1 WHERE ? IN ({store.IN_PROGRESS_SQL})', (version_id,)).fetchone() is not None:
+        report['result'] = 'in_progress'          # its units come whole only with its last part (V3-2)
         return report
     if stored_only:
         return _check_stored(db, version_id, document_id, path, sha256, report)
@@ -339,6 +346,8 @@ def verify(db, root_ids=None, document_ids=None, limits: parsers.Limits | None =
     notice = [f'{len(stale_latest)}개 문서가 마지막 스캔 이후 바뀜 - `workmcp scan`을 먼저 실행'] if stale_latest else []
     if mismatched := versions['unverifiable']['parser_version_mismatch']:
         notice.append(f'{mismatched}개 버전이 다른 파서 버전으로 저장됨 - `workmcp scan --reparse`로 다시 파싱')
+    if in_progress := versions['unverifiable']['in_progress']:
+        notice.append(IN_PROGRESS_NOTICE.format(in_progress))
     if stale_evidence:
         notice.append(REPARSE_STALE_NOTICE.format(stale_evidence))
     return {'scope': SCOPE_STORED if stored_only else SCOPE, 'parser_versions': {ext: parsers.parser_for(ext).version

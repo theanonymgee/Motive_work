@@ -75,8 +75,9 @@ MODULE_IMPORTS = {
     # uses the common list only.
     'knowledge.py': frozenset({'unicodedata'}),
     # M5 (design M5 §9.3): setup writes config/client files from string templates and backs up the store
-    # with ``open`` blocks, so it needs nothing beyond the common list (no ``shutil``, no ``subprocess``).
-    'setup.py': frozenset(),
+    # with sqlite3's backup (no ``shutil``, no ``subprocess``). M6 (design M6 §2.6-9): ``tomllib`` to read the
+    # server key names in Codex's ``config.toml`` (``setup.registered``, read only).
+    'setup.py': frozenset({'tomllib'}),
     # M5 remote (design M5 remote §6.1): the operating server's HTTP adapter receives through the SDK only
     # (auth settings, access token, Host/Origin checks, starlette request/response of the push routes) and
     # makes tokens (secrets, hmac); no uvicorn, socket, ssl or http import. gzip/base64 live in sync.py

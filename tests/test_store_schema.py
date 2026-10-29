@@ -8,6 +8,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -641,6 +643,98 @@ def test_index_lock_is_separate_from_the_scan_lock(tmp_path):
     store.release_lock(index_lock)
     store.release_scan_lock(scan_lock)
     assert not index_lock.exists() and not scan_lock.exists()
+
+
+# ---- review M5 remote v3 V3-5: the lock holds a nonce, a stale one is replaced once, a live one is touched -----
+
+SIX_HOURS = timedelta(hours=6)
+
+
+def lock_home(tmp_path):
+    return paths.ensure_home(paths.validate_home(str(tmp_path/'home'), {}, None))
+
+
+def test_release_with_another_nonce_leaves_the_lock(tmp_path):
+    home = lock_home(tmp_path)
+    lock, warning = store.acquire_lock(home, 'push.lock', nonce='a' * 16)
+    held = json.loads(lock.read_text(encoding='utf-8'))
+    assert warning is None and held['nonce'] == 'a' * 16 and held['pid'] == os.getpid()
+    assert held['heartbeat_at'] == held['started_at']
+    assert store.release_lock(lock, 'b' * 16) is False and lock.exists()      # not this run's lock: stays
+    assert store.release_lock(lock, 'a' * 16) is True and not lock.exists()
+    assert store.release_lock(lock, 'a' * 16) is False                         # releasing twice is harmless
+    other, _ = store.acquire_lock(home, 'push.lock')                            # without a nonce: a new one
+    assert len(json.loads(other.read_text(encoding='utf-8'))['nonce']) == 16
+    assert store.release_lock(other) is True and not other.exists()            # without: the earlier behaviour
+
+
+def test_two_runs_that_see_the_same_stale_lock_take_it_once(tmp_path, monkeypatch):
+    """Both runs judge the lock stale before either replaces it (a barrier right after the judgement): exactly
+    one goes on, the other gets ``Locked`` (no ``FileNotFoundError``, no traceback), and the file holds the
+    winner's nonce. Three rounds."""
+    home = lock_home(tmp_path)
+    real_alive_at = store._lock_alive_at
+    for round_ in range(3):
+        old = datetime.now().astimezone() - timedelta(hours=7)
+        (home/'push.lock').write_text(json.dumps({'pid': 1, 'started_at': old.isoformat(timespec='seconds')}),
+                                      encoding='utf-8')
+        barrier = threading.Barrier(2)
+
+        def judged(path, info):
+            at = real_alive_at(path, info)
+            barrier.wait(timeout=10)
+            return at
+        monkeypatch.setattr(store, '_lock_alive_at', judged)
+        results = {}
+
+        def run(nonce):
+            try:
+                results[nonce] = store.acquire_lock(home, 'push.lock', stale_after=SIX_HOURS, nonce=nonce)
+            except store.Locked as exc:
+                results[nonce] = exc
+            except BaseException as exc:           # any other end is the bug this test is for
+                results[nonce] = ('unexpected', repr(exc))
+        threads = [threading.Thread(target=run, args=(nonce,)) for nonce in (f'{round_}' * 16, 'f' * 16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        won = [nonce for nonce, result in results.items() if isinstance(result, tuple) and len(result) == 2
+               and isinstance(result[0], Path)]
+        lost = [nonce for nonce, result in results.items() if isinstance(result, store.Locked)]
+        assert len(results) == 2 and len(won) == 1 and len(lost) == 1, results
+        assert 'removed a stale push lock older than 6 hours' in results[won[0]][1]
+        assert json.loads((home/'push.lock').read_text(encoding='utf-8'))['nonce'] == won[0]
+        assert store.release_lock(home/'push.lock', lost[0]) is False            # the loser leaves it alone
+        assert store.release_lock(home/'push.lock', won[0]) is True
+        assert sorted(p.name for p in home.iterdir() if p.name.startswith('push.lock')) == []   # no temporary left
+        monkeypatch.setattr(store, '_lock_alive_at', real_alive_at)
+
+
+def test_a_touched_lock_does_not_look_stale(tmp_path):
+    home = lock_home(tmp_path)
+    started = datetime.now().astimezone() - timedelta(hours=7)
+    lock, _ = store.acquire_lock(home, 'push.lock', started, stale_after=SIX_HOURS, nonce='a' * 16)
+    assert store.touch_lock(lock, 'b' * 16) is False                            # another run's nonce: untouched
+    assert json.loads(lock.read_text(encoding='utf-8'))['heartbeat_at'] == started.isoformat(timespec='seconds')
+    assert store.touch_lock(lock, 'a' * 16) is True
+    held = json.loads(lock.read_text(encoding='utf-8'))
+    assert held['started_at'] == started.isoformat(timespec='seconds') != held['heartbeat_at']
+    with pytest.raises(store.Locked, match='another push is running'):
+        store.acquire_lock(home, 'push.lock', stale_after=SIX_HOURS)            # 7 hours old, alive 0 s ago
+    # the same lock untouched is stale after 6 hours (heartbeat_at, else started_at, else the file time)
+    held['heartbeat_at'] = started.isoformat(timespec='seconds')
+    lock.write_text(json.dumps(held), encoding='utf-8')
+    taken, warning = store.acquire_lock(home, 'push.lock', stale_after=SIX_HOURS, nonce='c' * 16)
+    assert 'removed a stale push lock' in warning and store.touch_lock(taken, 'a' * 16) is False
+    lock.write_text('not json', encoding='utf-8')                               # unreadable: the file time
+    with pytest.raises(store.Locked, match='unknown holder'):
+        store.acquire_lock(home, 'push.lock', stale_after=SIX_HOURS)
+    old = (datetime.now() - timedelta(hours=7)).timestamp()
+    os.utime(lock, (old, old))
+    assert 'removed a stale' in store.acquire_lock(home, 'push.lock', stale_after=SIX_HOURS)[1]
+    assert store.release_lock(lock) and not lock.exists()
+    assert store.touch_lock(lock, 'a' * 16) is False                            # gone: not this run's any more
 
 
 @pytest.mark.skipif(not store.fts5_available(), reason='SQLite without FTS5 trigram')
