@@ -53,6 +53,8 @@ EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_LOCKED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT
 PUSH_LOCK = store.PUSH_LOCK_NAME           # one push at a time per data home (store.acquire_lock)
 PUSH_LOCK_STALE = store.PUSH_LOCK_STALE    # a lock left by a killed push stops blocking after this long
 PUSH_LOCK_HEARTBEAT = timedelta(minutes=5)  # a live push writes heartbeat_at this often (never looks stale)
+LOCK_RELEASE_ATTEMPTS = 2                   # removing the lock at the end: again after a short wait, then a warning
+LOCK_RELEASE_WAIT_SECONDS = 1.0
 CERTIFICATE_ERRORS = ('SSLCertVerificationError',)   # by class name: this module does not import ssl
 RETRY_DELAYS = (1, 2, 4, 8, 16)            # seconds before each resend of the same batch
 REQUEST_TIMEOUT_SECONDS = 300
@@ -391,16 +393,28 @@ def execute(home: Path, settings: config.Config, token: str, options: Options, *
         return _locked_run(home, url, token, options, report, begin, transport, sleep, (lock, nonce, taken_at))
     finally:
         # whatever happened after the lock was taken (review v2 L-d); a lock another run took over stays
-        if not store.release_lock(lock, nonce):
-            try:
-                left = store.lock_held(lock, nonce) and not store.release_lock(lock, nonce)   # read again: once more
-            except OSError:
-                left = True                     # unreadable now: it may still be this run's (review M6 v1 M6-4)
-            if left:
-                hours = PUSH_LOCK_STALE.total_seconds() / 3600
-                note = (f'warning: {lock} was not removed (it could not be read just now); if no push runs, '
-                        f'delete it, or the next push exits 3 for up to {hours:g} hours')
-                report['warning'] = '\n  '.join(text for text in (report['warning'], note) if text)
+        _release_push_lock(lock, nonce, report, sleep)
+
+
+def _release_push_lock(lock: Path, nonce: str, report: dict, sleep: Callable[[float], None]) -> None:
+    """Remove this run's lock. When that fails (unreadable now, or another program has the file open so that
+    Windows refuses the delete: review M6 v2 M6-2-1), try again after a short wait, then add a warning to
+    ``report``. Never raises: the caller gets the report of the finished run, never an ``OSError`` traceback."""
+    why = 'it could not be read just now'
+    for attempt in range(LOCK_RELEASE_ATTEMPTS):
+        if attempt:
+            sleep(LOCK_RELEASE_WAIT_SECONDS)
+        try:
+            if store.release_lock(lock, nonce) or not store.lock_held(lock, nonce):
+                return                          # removed, gone, or another run took it over (that one stays)
+        except PermissionError:
+            why = 'another program had it open'
+        except OSError as exc:
+            why = f'{type(exc).__name__}: {exc}'
+    hours = PUSH_LOCK_STALE.total_seconds() / 3600
+    note = (f'warning: {lock} was not removed ({why}); if no push runs, delete it, '
+            f'or the next push exits 3 for up to {hours:g} hours')
+    report['warning'] = '\n  '.join(text for text in (report['warning'], note) if text)
 
 
 def _locked_run(home: Path, url: str, token: str, options: Options, report: dict, begin: float,

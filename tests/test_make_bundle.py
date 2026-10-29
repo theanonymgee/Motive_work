@@ -291,6 +291,74 @@ def test_the_release_number_is_one_value():
     assert project == __version__ == push.CLIENT_VERSION and project != '0.0.1'
 
 
+def test_the_build_lock_pins_the_build_backend_of_pyproject_with_a_hash():
+    """Review M6 v2 M6-9: ``requirements-build.lock.txt`` pins exactly ``[build-system] requires``, each with a hash."""
+    import tomllib
+    requires = tomllib.loads((REPO/'pyproject.toml').read_text(encoding='utf-8'))['build-system']['requires']
+    pins = mb.parse_lock((REPO/mb.BUILD_LOCK).read_text(encoding='utf-8'))
+    assert sorted(f'{pin.name}=={pin.version}' for pin in pins.values()) == sorted(requires) == ['setuptools==84.2.1']
+    assert pins['setuptools'].hashes == {'ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2'}
+
+
+FETCHING_PIP = frozenset({'install', 'download', 'wheel'})
+
+
+def unchecked_fetch(command: list[str]) -> bool:
+    """A pip command that may fetch a package without checking its hash: ``install``/``download``/``wheel`` with
+    neither ``--require-hashes`` nor ``--no-index``, or a ``wheel`` that keeps build isolation (whose build
+    environment pip fills from the index by version only)."""
+    if 'pip' not in command or not FETCHING_PIP & set(command):
+        return False
+    if 'wheel' in command and '--no-build-isolation' not in command:
+        return True
+    return '--require-hashes' not in command and '--no-index' not in command
+
+
+def test_unchecked_fetch_flags_the_old_build_command():
+    old = ['py', '-I', '-m', 'pip', 'wheel', '--no-deps', '--no-input', '-w', 'wheels', 'src']
+    assert unchecked_fetch(old)
+    assert unchecked_fetch(['py', '-m', 'pip', 'install', 'setuptools==84.2.1'])
+    assert unchecked_fetch(['py', '-m', 'pip', 'wheel', '--no-build-isolation', 'src'])
+    assert not unchecked_fetch(['py', '-m', 'pip', '--version'])
+
+
+def test_no_pip_command_of_make_fetches_a_build_dependency_without_a_hash(tmp_path, monkeypatch):
+    """Review M6 v2 M6-9, without network: the commands ``make`` runs (recorded, nothing runs) download the lock with
+    ``--require-hashes``, install the build backend into a fresh venv with ``--require-hashes`` and build there with
+    ``--no-build-isolation --no-index``; and no pip command in the tool's source is an unchecked fetch."""
+    import ast
+    commands = []
+    monkeypatch.setattr(mb, 'run_step', lambda label, command: commands.append(command))
+    source = tmp_path/'src'
+    source.mkdir()
+    (source/mb.BUILD_LOCK).write_text((REPO/mb.BUILD_LOCK).read_text(encoding='utf-8'), encoding='utf-8')
+    mb.pip_download(source/mb.LOCK, tmp_path/'wheels')
+    mb.build_wheel(source, tmp_path/'wheels', tmp_path)
+    assert [command[3:5] for command in commands] == [['pip', 'download'], ['venv', str(tmp_path/'build-env')],
+                                                      ['pip', 'install'], ['pip', 'wheel']]
+    assert not [command for command in commands if unchecked_fetch(command)], commands
+    install, wheel = commands[2], commands[3]
+    assert install[-2:] == ['-r', str(source/mb.BUILD_LOCK)] and '--require-hashes' in install
+    assert install[0] == wheel[0] and 'build-env' in install[0]          # the build runs in that venv, not here
+    assert {'--no-build-isolation', '--no-index', '--no-deps'} <= set(wheel)
+    tree = ast.parse(TOOL.read_text(encoding='utf-8'))
+    lists = [[e.value for e in node.elts if isinstance(e, ast.Constant)] for node in ast.walk(tree)
+             if isinstance(node, ast.List)]
+    pip_lists = [items for items in lists if 'pip' in items and FETCHING_PIP & set(items)]
+    assert len(pip_lists) == 3 and not [items for items in pip_lists if unchecked_fetch(items)], pip_lists
+
+
+@pytest.mark.parametrize('text', [None, '', 'setuptools==84.2.1\n'])
+def test_build_wheel_needs_a_build_lock_with_hashes(tmp_path, monkeypatch, text):
+    commands = []
+    monkeypatch.setattr(mb, 'run_step', lambda label, command: commands.append(command))
+    if text is not None:
+        (tmp_path/mb.BUILD_LOCK).write_text(text, encoding='utf-8')
+    with pytest.raises(mb.Problem, match='missing or has a pin without a hash'):
+        mb.build_wheel(tmp_path, tmp_path/'wheels', tmp_path)
+    assert commands == []
+
+
 # ---- model --------------------------------------------------------------------------------------------------------
 
 def test_model_constants_equal_the_package_manifest():
@@ -361,8 +429,8 @@ def faked(monkeypatch, tmp_path):
         (wheels/'anyio-4.15.1-py3-none-any.whl').write_bytes(b'anyio wheel')
         calls.append('download')
 
-    def build(source, wheels):
-        assert (source/'pyproject.toml').is_file()
+    def build(source, wheels, work):
+        assert (source/'pyproject.toml').is_file() and work.is_dir()
         (wheels/'workmcp-9.9.9-py3-none-any.whl').write_bytes(b'project wheel')
         calls.append('build')
 

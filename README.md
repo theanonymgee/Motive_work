@@ -196,6 +196,9 @@ workmcp setup --home PATH
 
 운영 서버의 **mcp 토큰**을 씁니다(push 토큰은 MCP 경로에서 거부됩니다). 먼저 토큰을 사용자 환경변수 `WORKMCP_MCP_TOKEN`에 넣고("계정의 환경 변수 편집", 관리자 권한 불필요) 새 PowerShell 창을 엽니다. `setup`이 등록 명령(위 "빠른 시작" 5단계와 같은 것)을 출력하면 사용자가 자기 터미널에서 실행합니다.
 
+- Claude Code 줄은 **PowerShell용**입니다. cmd·Git Bash에서는 `$env:WORKMCP_MCP_TOKEN`이 펼쳐지지 않아 엉뚱한 헤더가 등록됩니다.
+- 토큰 변수가 비어 있으면(변수를 넣기 전에 연 창, 이름 오타) 토큰이 빈 헤더(`Bearer` 뒤가 빈 값)가 **오류 없이** 등록되고 나중에 401이 납니다. 등록 전에 `echo $env:WORKMCP_MCP_TOKEN.Length`가 0보다 큰 수를 내는지 확인하세요.
+
 Claude Code는 등록 때 받은 헤더 값(토큰 평문)을 `%USERPROFILE%\.claude.json`에 저장합니다. Claude Code의 동작이므로, 그 파일을 공유·동기화하지 마세요.
 
 설정 템플릿(로컬 stdio, 원격 HTTP, Codex)은 [doc/examples/](doc/examples/)에 있습니다. 연결한 뒤 각 클라이언트에서 `status` 도구를 불러 `role: server`를 확인합니다.

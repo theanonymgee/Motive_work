@@ -8,7 +8,9 @@ company PC. Standard library only; it never imports ``workmcp`` (``tests/test_to
 ``make`` needs the development PC's own platform (Windows x64, Python 3.12, with pip: ``uv venv --seed`` or
 ``python -m ensurepip``). It downloads the wheels pinned in ``requirements.lock.txt`` (``pip download
 --only-binary=:all: --require-hashes``), builds the ``workmcp`` wheel from ``git archive`` of the commit (never from
-the working tree), and writes into ``<out>/workmcp-bundle-<version>-<yyyymmdd>-<commit8>/``:
+the working tree) in a fresh build venv that holds only the build backend pinned with its hash in the commit's
+``requirements-build.lock.txt`` (``--require-hashes``, then ``pip wheel --no-build-isolation --no-index``; review M6
+v2 M6-9), and writes into ``<out>/workmcp-bundle-<version>-<yyyymmdd>-<commit8>/``:
 
     wheels/  requirements.lock.txt  src.zip  verify_bundle.py  INSTALL.txt  SHA256SUMS
 
@@ -47,6 +49,7 @@ SUMS = 'SHA256SUMS'
 INSTALL = 'INSTALL.txt'
 VERIFY_NAME = 'verify_bundle.py'
 LOCK = 'requirements.lock.txt'
+BUILD_LOCK = 'requirements-build.lock.txt'   # the build backend with its hash (review M6 v2 M6-9), from the commit
 SOURCE_ZIP = 'src.zip'
 UNLISTED_OK = frozenset({SUMS})
 CODE_REQUIRED = (INSTALL, LOCK, SOURCE_ZIP, VERIFY_NAME)   # besides the workmcp wheel and one dependency wheel
@@ -314,9 +317,22 @@ def pip_download(lock: Path, wheels: Path) -> None:
                               '--no-input', '--disable-pip-version-check', '-r', str(lock), '-d', str(wheels)])
 
 
-def build_wheel(source: Path, wheels: Path) -> None:
-    run_step('pip wheel', [sys.executable, '-I', '-m', 'pip', 'wheel', '--no-deps', '--no-input',
-                           '--disable-pip-version-check', '-w', str(wheels), str(source)])
+def build_wheel(source: Path, wheels: Path, work: Path) -> None:
+    """The ``workmcp`` wheel from ``source`` (the commit's extraction) without build isolation (review M6 v2 M6-9):
+    a fresh venv under ``work`` gets only the build backend of ``requirements-build.lock.txt``, installed with
+    ``--require-hashes``; the build then runs there with ``--no-build-isolation --no-index``, so pip never fetches a
+    build dependency without checking its hash (build isolation would fetch ``setuptools`` by version only)."""
+    pins = parse_lock((source/BUILD_LOCK).read_text(encoding='utf-8')) if (source/BUILD_LOCK).is_file() else {}
+    if not pins or any(not pin.hashes for pin in pins.values()):
+        raise Problem(f'{BUILD_LOCK} of the commit is missing or has a pin without a hash', EXIT_FAILED)
+    env = work/'build-env'
+    run_step('build venv', [sys.executable, '-I', '-m', 'venv', str(env)])
+    python = str(env/('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))
+    run_step('pip install (build backend)', [python, '-I', '-m', 'pip', 'install', '--only-binary=:all:',
+                                             '--require-hashes', '--no-deps', '--no-input',
+                                             '--disable-pip-version-check', '-r', str(source/BUILD_LOCK)])
+    run_step('pip wheel', [python, '-I', '-m', 'pip', 'wheel', '--no-deps', '--no-build-isolation', '--no-index',
+                           '--no-input', '--disable-pip-version-check', '-w', str(wheels), str(source)])
 
 
 def copy_verified(source: Path, target: Path, size: int, sha256: str) -> None:
@@ -430,7 +446,8 @@ def make(args) -> int:
         print(f'dry run: nothing is downloaded or written. checks passed: out outside the repository, commit {commit[:8]} '
               f'resolved, host Windows AMD64 Python 3.12, pip present.')
         print(f'would write: {folder}  (lock pins {len(pins)}, pip download --only-binary=:all: --require-hashes, '
-              f'pip wheel --no-deps from git archive {commit[:8]}, src.zip, {VERIFY_NAME}, {INSTALL}, {SUMS})')
+              f'pip wheel --no-deps --no-build-isolation from git archive {commit[:8]} in a build venv holding '
+              f'{BUILD_LOCK} (--require-hashes), src.zip, {VERIFY_NAME}, {INSTALL}, {SUMS})')
         if args.model_from:
             print(f'would write: {out/f"workmcp-model-{MODEL_NAME}-{MODEL_REVISION[:8]}"}  (4 files, '
                   f'{sum(s for s, _ in MODEL_FILES.values()):,} bytes, SHA-256 checked while copying)')
@@ -447,7 +464,7 @@ def make(args) -> int:
         shutil.copyfile(source/LOCK, folder/LOCK)
         pip_download(folder/LOCK, wheels)
         absent = check_wheels(wheels, pins)             # the lock's wheels only; the project wheel is not in the lock
-        build_wheel(source, wheels)
+        build_wheel(source, wheels, Path(temp))
     shutil.copyfile(Path(__file__).resolve(), folder/VERIFY_NAME)
     count = len(list(wheels.glob('*.whl')))
     built = datetime.now().strftime('%Y-%m-%d')

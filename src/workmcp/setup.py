@@ -16,7 +16,8 @@ changes and deletes nothing. Every argument and source folder is checked before 
 Boundaries (design M6 §2.1, §2.4, M5 §9.3): this module starts no process (the ``claude mcp add`` / ``codex
 mcp add`` lines are printed for the user to run), never writes the clients' global files (``registered``
 only reads whether ``workmcp`` is a key there), writes only under the data home and, with ``--scope
-project``, the two files under ``--project``, and reads no source file. It never reads, makes or prints a
+project``, the two files under ``--project`` (never inside a source root), and reads no source file; the one
+registry access reads the user variable ``WORKMCP_HOME`` (``user_variable``). It never reads, makes or prints a
 token: only whether ``WORKMCP_PUSH_TOKEN`` is set and whether ``<home>/push.token`` exists. ``download_model``
 is the one caller of ``models.fetch`` outside ``models`` (``tests/test_network_boundary.py`` allows exactly
 this); only ``cli.py`` may import this module, and ``cli`` hands in its ``doctor``/``scan``/``index`` bodies
@@ -178,6 +179,43 @@ def config_template(sources: tuple[str, ...], model: str, push_url: str | None =
     if push_url:
         lines += ['[push]', f'url = {toml_string(push_url)}', '']
     return '\n'.join(lines)
+
+
+def source_entry_paths(raw: str) -> list[str]:
+    """A ``[[sources]]`` entry as absolute paths to compare with: as written, and resolved (junctions, 8.3 names;
+    review M6 v1 M6-16, v2 M6-2-2) unless it is written as ``\\\\server\\share``. Only that form stays unresolved;
+    a mapped network drive letter (``Z:\\...``) is resolved like a local path and so reaches the file server
+    (review M6 v2 M6-2-5), as the doctor step after it does anyway (``check_roots`` resolves the same folder)."""
+    raw = paths._strip_long_prefix(raw)
+    found = [os.path.abspath(raw)]
+    if not paths._is_unc(raw):
+        try:
+            found.append(str(Path(raw).resolve()))
+        except OSError:
+            pass
+    return found
+
+
+def user_variable(name: str) -> tuple[bool, str | None]:
+    """The user environment variable ``name`` as Windows keeps it for new windows and scheduled tasks
+    (``HKCU\\Environment``; review M6 v2 M6-2-3): ``(True, value)``, ``(True, None)`` when it is not set, and
+    ``(False, None)`` where it cannot be known (not Windows, the key unreadable). Reads the local registry only:
+    no write, no network."""
+    if sys.platform != 'win32':
+        return False, None
+    import winreg                                   # Windows only, so inside the function
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_READ) as key:
+            value, kind = winreg.QueryValueEx(key, name)
+    except FileNotFoundError:
+        return True, None
+    except OSError:
+        return False, None
+    if not isinstance(value, str):
+        return True, None
+    if kind == winreg.REG_EXPAND_SZ:
+        value = winreg.ExpandEnvironmentStrings(value)
+    return True, value or None
 
 
 def mcp_url(push_url: str) -> str:
@@ -430,7 +468,9 @@ class _Setup:
     def home_env_lines(self, home: Path) -> list[str]:
         """Review M6 v1 M6-2: ``scan``, ``index``, ``push`` and scheduled tasks find a data home other than the
         default only through ``WORKMCP_HOME``; say how to set it as a user variable (no admin) when it is not
-        set to this home. Sets ``self.home_env_needed``; nothing is written."""
+        set to this home. The value of this process is compared with the user variable Windows gives new windows
+        and scheduled tasks (``user_variable``, read only; review M6 v2 M6-2-3). Sets ``self.home_env_needed``;
+        nothing is written."""
         def same(a: str, b: str) -> bool:
             return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
         try:
@@ -438,16 +478,24 @@ class _Setup:
         except paths.DataPathError:
             default = None
         current = self.env.get(paths.HOME_ENV)
+        known, saved = user_variable(paths.HOME_ENV)     # (False, None) where it cannot be known: not Windows
         if current and same(current, str(home)):
-            return [f'{paths.HOME_ENV}: set to this data home']
-        if not current and default is not None and same(default, str(home)):
+            if not known or (saved and same(saved, str(home))):
+                return [f'{paths.HOME_ENV}: set to this data home']
+            head = (f'{paths.HOME_ENV}: set to this data home in this window only; new windows and scheduled tasks '
+                    f'do not have it (the user variable is {f"set to another folder ({saved})" if saved else "not set"})')
+        elif not current and known and saved and same(saved, str(home)):
+            return [f'{paths.HOME_ENV}: set as a user variable to this data home, but not in this window: '
+                    f'open a new terminal before scan']
+        elif not current and default is not None and same(default, str(home)):
             return []                                   # the default home: found without the variable
+        else:
+            head = (f'{paths.HOME_ENV}: set to another folder ({current}); scan, index and push would use that one'
+                    if current else
+                    f'{paths.HOME_ENV}: this data home is not the default ({default or "unknown"}); scan, index, push '
+                    f'and scheduled tasks find it only through the user environment variable {paths.HOME_ENV}')
         self.home_env_needed = True
         quoted = str(home).replace("'", "''")
-        head = (f'{paths.HOME_ENV}: set to another folder ({current}); scan, index and push would use that one'
-                if current else
-                f'{paths.HOME_ENV}: this data home is not the default ({default or "unknown"}); scan, index, push and '
-                f'scheduled tasks find it only through the user environment variable {paths.HOME_ENV}')
         return [head, '  set it once (no admin) in PowerShell, then open a new terminal; setup does not set it:',
                 f"    [Environment]::SetEnvironmentVariable('{paths.HOME_ENV}', '{quoted}', 'User')",
                 f'  or Windows settings > "Edit environment variables for your account" > New: '
@@ -478,15 +526,16 @@ class _Setup:
                 self.record('clients', 'refused', [f'--project is not an existing folder: {options.project}'],
                             scope='project')
                 raise _Refused(EXIT_USAGE)
-            # review M6 v1 M6-17: the two project files never land in a folder the collector reads
+            # review M6 v1 M6-17, v2 M6-2-2: setup writes no file inside a source root (the user's document
+            # folders are read-only to this tool); an existing entry counts as written and, when local, resolved
             project = Path(options.project).resolve()
             written = existing.sources if existing is not None else ()
             roots = [check.spec.path for check in checks] + [
-                Path(os.path.abspath(paths._strip_long_prefix(entry.raw))) for entry in written]
+                Path(key) for entry in written for key in source_entry_paths(entry.raw)]
             if (root := next((root for root in roots if paths._within(project, root)), None)) is not None:
                 self.record('clients', 'refused', [
-                    f'--project {project} lies inside the source root {root}: the next scan would collect the '
-                    f'.mcp.json and .codex files written there; choose a project folder outside the source roots'],
+                    f'--project {project} lies inside the source root {root}: setup writes no file inside a '
+                    f'source root (your document folders); choose a project folder outside the source roots'],
                     scope='project')
                 raise _Refused(EXIT_USAGE)
         return [check.spec for check in checks], existing
@@ -516,17 +565,8 @@ class _Setup:
             lines += warnings
             missing, written, model_in_file = [], True, model
         else:
-            # an existing entry as written and, when local, resolved like --source (junctions, 8.3 names; review
-            # M6 v1 M6-16); a network entry only as written, so the comparison never touches the network
-            keys = set()
-            for entry in existing.sources:
-                raw = paths._strip_long_prefix(entry.raw)
-                keys.add(os.path.normcase(os.path.abspath(raw)))
-                if not paths._is_unc(raw):
-                    try:
-                        keys.add(os.path.normcase(str(Path(raw).resolve())))
-                    except OSError:
-                        pass
+            # an existing entry as written and, when local, resolved like --source (review M6 v1 M6-16)
+            keys = {os.path.normcase(key) for entry in existing.sources for key in source_entry_paths(entry.raw)}
             missing = [str(spec.path) for spec in specs if spec.key not in keys
                        and os.path.normcase(os.path.abspath(paths._strip_long_prefix(spec.raw))) not in keys]
             add = [line for source in missing for line in ('[[sources]]', f'path = {toml_string(source)}')]
@@ -669,6 +709,10 @@ class _Setup:
         if 'claude' in by_client:
             lines += [f'  # Claude Code (PowerShell): {MCP_TOKEN_SHELL} is expanded when the line runs, so your shell '
                       f'history keeps only the variable name',
+                      f'  #   this line is for PowerShell only: cmd and Git Bash do not expand {MCP_TOKEN_SHELL}',
+                      f'  #   if {MCP_TOKEN_ENV} is empty, only "Bearer " is registered and the server answers 401: '
+                      f'check first that this prints a number above 0:',
+                      f'  echo {MCP_TOKEN_SHELL}.Length',
                       f'  {by_client["claude"]}',
                       r'  #   Claude Code stores the expanded header, the token itself, in %USERPROFILE%\.claude.json']
         if 'codex' in by_client:

@@ -5,6 +5,8 @@ real data home, no real client file: every run gets an injected environment whos
 """
 import hashlib
 import json
+import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -40,6 +42,13 @@ def offline(monkeypatch):
     monkeypatch.setattr(socket, 'create_connection', refuse)
     monkeypatch.setattr(urllib.request, 'urlopen', refuse)
     monkeypatch.setattr(subprocess, 'Popen', refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_user_variables(monkeypatch):
+    """The real user's registry never decides a test: the user variable is "cannot be known" (as off Windows)
+    unless a test says otherwise (review M6 v2 M6-2-3)."""
+    monkeypatch.setattr(setup, 'user_variable', lambda name: (False, None))
 
 
 @pytest.fixture
@@ -294,6 +303,49 @@ def test_the_next_line_leaves_out_a_push_token_that_is_there(user, env, docs):
     assert lines[-1] == 'setup done (exit 0). next: workmcp scan -> workmcp index, then register the clients'
 
 
+def test_workmcp_home_set_in_this_window_only_is_named_so(user, env, docs, monkeypatch):
+    """Review M6 v2 M6-2-3: ``$env:WORKMCP_HOME`` set in this window but not as a user variable: new windows and
+    the scheduled tasks would not have it, so setup says so and how to set it, and ``next:`` keeps the step."""
+    other = user.parent/'elsewhere'
+    process = {**env, 'WORKMCP_HOME': str(other)}
+    for saved, shown in ((None, 'not set'), (str(user/'Motive_work'), f'set to another folder ({user/"Motive_work"})')):
+        monkeypatch.setattr(setup, 'user_variable', lambda name, saved=saved: (True, saved))
+        result, lines = run(other, process, sources=(str(docs),), push_url=URL)
+        text = '\n'.join(home_lines(result))
+        assert ('WORKMCP_HOME: set to this data home in this window only; new windows and scheduled tasks do not '
+                f'have it (the user variable is {shown})') in text, text
+        assert "[Environment]::SetEnvironmentVariable('WORKMCP_HOME'" in text
+        assert lines[-1].startswith('setup done (exit 0). next: set WORKMCP_HOME (above)')
+    monkeypatch.setattr(setup, 'user_variable', lambda name: (True, str(other) + '\\'))       # the same folder
+    result, lines = run(other, process, sources=(str(docs),), push_url=URL)
+    assert home_lines(result)[1:] == ['WORKMCP_HOME: set to this data home'] and 'set WORKMCP_HOME' not in lines[-1]
+    result, lines = run(other, env, sources=(str(docs),), push_url=URL)          # user variable, old window
+    assert home_lines(result)[1:] == ['WORKMCP_HOME: set as a user variable to this data home, but not in this '
+                                      'window: open a new terminal before scan']
+    assert 'set WORKMCP_HOME' not in lines[-1]
+
+
+def test_user_variable_only_reads_the_registry(monkeypatch):
+    """``user_variable`` opens ``HKCU\\Environment`` for reading and never writes it; off Windows it is unknown."""
+    monkeypatch.undo()                                       # the real function (autouse fixture replaced it)
+    source = Path(setup.__file__).read_text(encoding='utf-8')
+    used = set(re.findall(r'winreg\.(\w+)', source))
+    assert used == {'OpenKey', 'HKEY_CURRENT_USER', 'KEY_READ', 'QueryValueEx', 'REG_EXPAND_SZ',
+                    'ExpandEnvironmentStrings'}
+    if sys.platform != 'win32':
+        assert setup.user_variable('WORKMCP_HOME') == (False, None)
+        return
+    assert setup.user_variable('WORKMCP_TEST_NEVER_SET_7F3A') == (True, None)
+    import winreg
+    opened = []
+    real_open = winreg.OpenKey
+    monkeypatch.setattr(winreg, 'OpenKey', lambda *args: opened.append(args) or real_open(*args))
+    monkeypatch.setattr(winreg, 'QueryValueEx', lambda key, name: ('%USERPROFILE%\\X', winreg.REG_EXPAND_SZ))
+    monkeypatch.setattr(winreg, 'ExpandEnvironmentStrings', lambda text: text.replace('%USERPROFILE%', 'C:\\U'))
+    assert setup.user_variable('WORKMCP_HOME') == (True, 'C:\\U\\X')
+    assert opened == [(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_READ)]
+
+
 def test_doctor_names_the_source_of_its_data_home():
     assert cli.home_source(True, {}) == 'from setup --home'
     assert cli.home_source(False, {'WORKMCP_HOME': 'D:\\Motive_work'}) == 'from WORKMCP_HOME'
@@ -529,6 +581,10 @@ def test_collector_role_prints_the_remote_registration_lines(home, env, docs):
     assert 'Edit environment variables for your account' in text and 'keeps only the variable name' in text
     assert '.claude.json' in text and 'Remove-Item' not in text and 'HistorySavePath' not in text
     assert text.index('Edit environment variables') < text.index('claude mcp add')
+    # review M6 v2 M6-2-4: PowerShell only, and an empty variable registers "Bearer " alone (401): check it first
+    assert 'for PowerShell only: cmd and Git Bash do not expand $env:WORKMCP_MCP_TOKEN' in text
+    assert 'only "Bearer " is registered and the server answers 401' in text
+    assert lines.index('  echo $env:WORKMCP_MCP_TOKEN.Length') < lines.index(f'  {commands[0]}')
 
 
 def test_local_role_prints_stdio_lines_with_python_isolated_and_the_home(home, env):
@@ -647,6 +703,38 @@ def test_an_existing_source_written_through_a_junction_is_not_asked_again(home, 
         assert any(f'is written as the folder it resolves to: {docs.resolve()}' in line for line in lines)
     finally:
         junction.rmdir()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows junctions only')
+def test_a_project_folder_inside_a_source_written_through_a_junction_is_refused(home, env, docs, tmp_path):
+    """Review M6 v2 M6-2-2 (probe P2): ``config.toml`` names the source through a junction written by hand, and
+    ``--project`` names a folder inside it by its real path: still inside a source root, exit 4, nothing written.
+    The reason says what holds: setup writes no file in a source root (a scan would ignore .json/.toml anyway)."""
+    import _winapi
+    junction = tmp_path/'jn'
+    _winapi.CreateJunction(str(docs), str(junction))
+    inner = docs/'proj'
+    inner.mkdir()
+    try:
+        home.mkdir()
+        config.config_file(home).write_text(f"[[sources]]\npath = '{junction}'\n\n[index]\nmodel = 'none'\n",
+                                            encoding='utf-8')
+        for project in (inner, junction/'proj'):
+            result, lines = run(home, env, clients=setup.CLIENTS, scope='project', project=str(project))
+            assert result['exit_code'] == 4 and result['steps']['clients']['status'] == 'refused', lines
+            assert any('setup writes no file inside a source root' in line for line in lines)
+            assert not any('next scan would collect' in line for line in lines)
+            assert list(inner.iterdir()) == []
+    finally:
+        junction.rmdir()
+
+
+def test_source_entry_paths_resolve_local_entries_only(tmp_path):
+    """A ``\\\\server\\share`` entry is compared only as written (never resolved); a local one both ways."""
+    unc = '\\\\server.invalid\\share\\docs'
+    assert setup.source_entry_paths(unc) == [os.path.abspath(unc)]
+    local = setup.source_entry_paths(str(tmp_path/'docs'))
+    assert local[0] == os.path.abspath(tmp_path/'docs') and local[1] == str((tmp_path/'docs').resolve())
 
 
 def test_client_commands_and_project_files_are_strings_only(tmp_path):

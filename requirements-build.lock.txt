@@ -1,0 +1,7 @@
+# The build backend of pyproject.toml [build-system] requires, pinned with its hash (review M6 v2 M6-9).
+# tools/make_bundle.py installs it with --require-hashes into a fresh build venv and builds the workmcp wheel there
+# with --no-build-isolation --no-index, so no build dependency is ever fetched unchecked. The hash is the one PyPI
+# publishes for setuptools-84.2.1-py3-none-any.whl (checked 2026-10-29 against a pip download of that file).
+# Change it together with [build-system] requires (tests/test_make_bundle.py keeps the two equal).
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2

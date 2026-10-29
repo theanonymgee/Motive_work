@@ -943,6 +943,70 @@ def test_a_lock_that_could_not_be_removed_is_reported(pair, monkeypatch):
     (col.home/push.PUSH_LOCK).unlink()
 
 
+def _open_the_lock_after_the_run(col, monkeypatch) -> list:
+    """Another program (backup, indexer) opens ``push.lock`` just as the run ends: the handles it holds."""
+    real, handles = push._locked_run, []
+
+    def run_then_open(*args, **kwargs):
+        report = real(*args, **kwargs)
+        handles.append(open(col.home/push.PUSH_LOCK, 'rb'))
+        return report
+
+    monkeypatch.setattr(push, '_locked_run', run_then_open)
+    return handles
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows refuses to delete a file another handle has open')
+def test_a_lock_another_program_holds_open_at_the_end_becomes_a_warning(pair, monkeypatch):
+    """Review M6 v2 M6-2-1: the delete of the lock is refused (``PermissionError``) — the report of the finished
+    run still comes back, with a warning, after one more try; no exception, no traceback."""
+    col, server, collector = pair
+    handles = _open_the_lock_after_the_run(col, monkeypatch)
+    try:
+        report = col.push(server, collector)
+        assert report['exit_code'] == 0 and report['push_id'], report
+        assert 'was not removed (another program had it open)' in report['warning'], report
+        assert any('another program had it open' in line for line in push.report_lines(report))
+        assert col.sleeps[-1] == push.LOCK_RELEASE_WAIT_SECONDS
+        assert (col.home/push.PUSH_LOCK).exists()
+    finally:
+        for handle in handles:
+            handle.close()
+    (col.home/push.PUSH_LOCK).unlink()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows refuses to delete a file another handle has open')
+def test_a_lock_another_program_lets_go_of_within_the_wait_is_removed(pair, monkeypatch):
+    col, server, collector = pair
+    handles = _open_the_lock_after_the_run(col, monkeypatch)
+
+    class Waits(list):
+        def append(self, seconds):                            # the wait: the other program closes its handle
+            super().append(seconds)
+            for handle in handles:
+                handle.close()
+
+    col.sleeps = Waits()
+    report = col.push(server, collector)
+    assert report['exit_code'] == 0 and not report['warning'], report
+    assert col.sleeps[-1] == push.LOCK_RELEASE_WAIT_SECONDS
+    assert not (col.home/push.PUSH_LOCK).exists()
+
+
+def test_a_refused_delete_of_the_lock_never_escapes_the_run(pair, monkeypatch):
+    """The same on every platform: ``release_lock`` raising ``PermissionError`` (or another ``OSError``)."""
+    col, server, collector = pair
+    for error, why in ((PermissionError(13, 'refused'), 'another program had it open'),
+                       (OSError(5, 'I/O error'), 'OSError')):
+        def refuse(path, nonce=None, error=error):
+            raise error
+        monkeypatch.setattr(store, 'release_lock', refuse)
+        report = col.push(server, collector)
+        assert report['exit_code'] == 0 and f'was not removed ({why}' in report['warning'], report
+        monkeypatch.undo()
+        (col.home/push.PUSH_LOCK).unlink()
+
+
 # ---- review v3 V3-6: a version refused at the units step does not stop the run ---------------------------------
 
 LONG_LINE = 'long-line.txt'

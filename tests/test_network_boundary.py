@@ -107,7 +107,10 @@ SETUP_DOTTED = 'workmcp.setup'
 # loaded in ``OnnxEmbedder.__init__`` (their DLLs never load on import, status or lexical search).
 FUNCTION_IMPORTS = {'models.py': frozenset({'urllib.error', 'urllib.request'}),
                     'embedder.py': frozenset({'onnxruntime', 'tokenizers.Tokenizer'}),
-                    'push.py': frozenset({'urllib.error', 'urllib.request'})}   # M5 remote §6.1
+                    'push.py': frozenset({'urllib.error', 'urllib.request'}),   # M5 remote §6.1
+                    # review M6 v2 M6-2-3: setup reads the user variable WORKMCP_HOME from the local registry
+                    # (HKCU\Environment, read only; Windows only, so inside ``user_variable``); not network
+                    'setup.py': frozenset({'winreg'})}
 # Per-module transport of ``<x>.run(...)`` (design M5 remote §6.1): stdio in server.py, Streamable HTTP in
 # remote.py with a loopback literal host and keywords from HTTP_RUN_KEYWORDS; no run call anywhere else.
 ALLOWED_RUN = {'server.py': 'stdio', 'remote.py': 'streamable-http'}

@@ -21,6 +21,7 @@
 - Run the stdio MCP server: `uv run workmcp serve` (or `.venv\Scripts\python.exe -I -m workmcp serve`; `-I` blocks a stray `PYTHONPATH`). Exit 0 stdin closed, 2 data home refused or schema checksum changed, 3 store locked while a migration is needed, 4 settings. Client configs: `doc/examples/` (copy to `.mcp.json` / `.codex/config.toml`, never commit; set `WORKMCP_HOME` outside AppData)
 - Pip alternative (no uv): `python -m venv .venv`, `.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock.txt`, then `.venv\Scripts\python.exe -m pip install --no-deps -e .` (offline, e.g. the company PC: add `--no-build-isolation` after installing the pinned `setuptools` wheel)
 - After changing dependencies: `uv lock`, `uv sync --frozen`, `uv export --format requirements-txt --hashes --no-emit-project -o requirements.lock.txt`
+- Build backend pin: `requirements-build.lock.txt` holds `setuptools` with its hash (used by `tools/make_bundle.py`); change it together with `[build-system] requires` in `pyproject.toml`. Offline bundle: `tools/make_bundle.py make --out <outside the repo>`, check with `verify`.
 - `requirements.lock.txt` includes the dev dependency `pytest` on purpose, so the same tests run as a diagnosis on the dev PC and the company PC; the build backend is pinned (`setuptools==84.2.1` in `pyproject.toml`).
 - Data home: `WORKMCP_HOME`, default `%LOCALAPPDATA%\Motive_work` (refused with exit 2 if inside the repo, a sync folder, UNC or relative).
 
