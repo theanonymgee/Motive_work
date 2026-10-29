@@ -43,3 +43,6 @@ workmcp-model-*/
 # Token files (the push token lives in the data home, outside the repository; this only stops a stray copy)
 push.token
 *.token
+
+# Claude Code local state and agent worktrees
+/.claude/
