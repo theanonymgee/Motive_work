@@ -137,7 +137,7 @@
   - ② 검토 v3 낮음: V3-3(거부 문서는 sweep·forget에서 제외)·V3-5(잠금 nonce·`os.replace` 교체·heartbeat)·V3-2·V3-6·V3-7 수정과 회귀 테스트, V3-1·V3-4는 문서로 닫음.
   - ③ `workmcp setup`(데이터 홈·`config.toml`·모델 download/`--model-from`·토큰 위치 안내, 프로세스 생성 0·전역 클라이언트 파일 쓰기 0·토큰 값 읽기 0, `--dry-run`·`--upgrade` 백업) — `tests/test_setup.py`.
   - ④ 오프라인 묶음 `edf89fc`(휠 49 + 모델 4파일, `SHA256SUMS` 검증, 빌드 백엔드 해시 고정)을 새 빈 폴더에 죽은 프록시로 설치 → `setup`·`doctor`·`scan`(8)·`index`·`push`(문서 8) exit 0, 두 번째 push 전송 0, push 연결은 서버 443뿐 — `doc/validation/2026-10-29_M6-오프라인설치확인_v1.md`.
-  - ⑤ **피터 승인**으로 서버 업데이트 2회(`f70a253`, `307bc94`; 서버 먼저, `setup --upgrade` 백업, 스키마 v5 유지). 첫 업데이트에서 찾은 정지 SIGKILL·시작 86 s는 `88098e0`으로 고침(새 코드 정지 0.78 s, 리스닝 1.07 s, 모델 백그라운드 5.6 s). 합성 수집기 2개 retire, 색인 0, 시험 사실 철회 — `doc/validation/2026-10-29_M6-운영확인_v1.md`.
+  - ⑤ **피터 승인**으로 서버 업데이트 2회(`f70a253`, `307bc94`; 서버 먼저, `setup --upgrade` 백업, 스키마 v5 유지). 첫 업데이트에서 찾은 정지 SIGKILL·시작 86 s는 `88098e0`으로 고침(새 코드 정지 0.78 s, 리스닝 1.07 s, 모델 백그라운드 5.6 s). 합성 수집기 2개 retire, 색인 0, 시험 사실 1 철회, 시험 개체 1은 **피터 결정(2026-10-29)으로 남김**(삭제 명령 없음, 지우면 철회된 사실의 이력이 깨짐; 연결된 사실은 철회됨, 문서 본문 없음) — `doc/validation/2026-10-29_M6-운영확인_v1.md`.
   - ⑥ Codex(`codex mcp add … --bearer-token-env-var`, 전용 토큰)와 Claude Code가 같은 서버 프로세스에 5 s 안에 번갈아 검색 성공, `deliveries` 일치 — 같은 문서 §3.
   - ⑦ 전체 테스트 이 PC **2280 passed**(`a8b3bec`, 네트워크·경로 경계 포함).
   - ⑧ 검토 v1 조건부(중간 2) → v2 통과 → **v3 통과, 미해결 높음·중간 0** — `doc/validation/2026-10-29_M6-검토_v1~v3.md`.
