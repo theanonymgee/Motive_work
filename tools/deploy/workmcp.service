@@ -22,7 +22,8 @@ WorkingDirectory=/home/workmcp/app/Motive_work
 ExecStart=/home/workmcp/app/.venv/bin/python -I -m workmcp serve --http 127.0.0.1:8765
 Restart=on-failure
 RestartSec=5
-# stop within 20 s; a stalled shutdown is killed (no data loss: SQLite writes are per transaction)
+# The server ends open requests and streams 3 s after SIGTERM (remote.STOP_GRACE_SECONDS) and stops in a few
+# seconds; 20 s is only the backstop: a stalled shutdown is killed (no data loss: SQLite writes are per transaction)
 TimeoutStopSec=20
 
 # Memory: above MemoryHigh the kernel reclaims; above MemoryMax the service is killed and restarted,

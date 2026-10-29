@@ -69,7 +69,10 @@ MODULE_IMPORTS = {
     # ``import numpy as np``, ``import onnxruntime as ort``, ``from tokenizers import Tokenizer``.
     'embedder.py': frozenset({'numpy'}),
     'index.py': frozenset({'numpy', 'time'}),  # time: elapsed seconds of the run
-    'search.py': frozenset({'numpy', 'time', 'gc'}),
+    # 2026-10-29 (VPS start/stop, design M5 remote reflection): ``threading`` for the one background model load
+    # of ``Engine.preload_in_background`` (a daemon thread running ``Engine._load``: files and onnxruntime, no
+    # store, no network); server.py, tools.py and remote.py stay without threads (M3_BYPASSES, M5 controls).
+    'search.py': frozenset({'numpy', 'time', 'gc', 'threading'}),
     'store.py': frozenset({'time'}),  # M3: retry the WAL switch when two servers open a new store together
     # M4 (design M4 §10, appendix B): NFC before binding a quote and measuring text; knowledge_query.py
     # uses the common list only.
@@ -644,7 +647,8 @@ MORE_BYPASSES = [
     'server.run_sse_async()',
     'import mcp.server.sse',
     'from mcp.server.streamable_http import StreamableHTTPSessionManager',
-    'import threading',
+    'import _thread',            # 'import threading' is search.py's since 2026-10-29: M3_BYPASSES keep it elsewhere
+    'import _thread as t\nt.start_new_thread(f, ())',
     'import json\nimport socket',
     'def f():\n    import socket',
     'import logging.handlers\nlogging.handlers.SocketHandler("example.invalid", 9020)',
@@ -902,6 +906,13 @@ M3_BYPASSES = [
     ('server.py', 'import logging.handlers'),
     ('tools.py', 'import uuid'),
     ('tools.py', 'import threading'),
+    # 2026-10-29: threading is search.py's (the background model load) and no other module's; no pools there
+    ('snippet.py', 'import threading'),
+    ('receive.py', 'import threading'),
+    ('index.py', 'import threading'),
+    ('search.py', 'import concurrent.futures'),
+    ('search.py', 'import multiprocessing'),
+    ('search.py', 'import socket'),
 ]
 
 

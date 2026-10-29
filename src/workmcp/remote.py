@@ -29,7 +29,13 @@ They run on the push connection (``ServerState.push_db``); tokens are read on th
 Boundaries (``tests/test_network_boundary.py``): the only module that receives over the network, and only
 through the SDK's ``run(transport="streamable-http", host=<loopback literal>)``; no ``uvicorn``, ``socket``,
 ``ssl`` or ``http`` import, no thread, no process. ``signal`` only to turn SIGTERM (and SIGBREAK on Windows)
-into the clean stop SIGINT already is.
+into the clean stop SIGINT already is, and to find the running uvicorn server (``bound_graceful_stop``).
+
+Start and stop (2026-10-29, VPS update): the port opens first; ``[server] model_preload`` loads the model on
+``search.Engine``'s background thread (``on_serve``), and a semantic search meanwhile waits for it at most
+``server.MODEL_WAIT_SECONDS``. A stop (SIGTERM) waits at most ``STOP_GRACE_SECONDS`` for open requests and
+streams (uvicorn's own ``timeout_graceful_shutdown``, which the SDK's ``run`` does not expose), then cancels
+them and ends the sessions.
 """
 from __future__ import annotations
 
@@ -71,6 +77,7 @@ REFUSAL_WINDOW_SECONDS = 300.0
 REFUSALS_LOGGED = 20              # per window; one more line says the rest are not logged
 SERVER_LOG_LEVEL = 'WARNING'      # the SDK hands it to uvicorn: no access log (design §4.1)
 PRELOADED_IDLE_SECONDS = 10**9    # [server] model_preload: loaded at start, never released
+STOP_GRACE_SECONDS = 3            # a stop waits this long for open requests and streams, then cancels them
 # token list rows and the issue/rotate result (the plain token only in the latter, printed once).
 TOKEN_LIST_KEYS = ('id', 'kind', 'name', 'prefix', 'collector', 'created_at', 'revoked_at', 'last_used_at')
 ISSUED_KEYS = ('id', 'kind', 'name', 'prefix', 'collector', 'token')
@@ -409,7 +416,8 @@ class StoreLockedError(Exception):
 def open_state(home: Path, settings: config.Config) -> server.ServerState:
     """The stores (call log, knowledge and push write connections; ``StoreLockedError`` when a migration meets
     a lock, ``RuntimeError`` from ``store`` when the schema checksum changed) and the server state with
-    ``role='server'``. ``[server] model_preload`` loads the model now and never releases it."""
+    ``role='server'``. ``[server] model_preload``: an engine that never releases the model; ``on_serve``
+    starts its load once the server runs."""
     try:
         write_db = store.open_home(home)
     except sqlite3.OperationalError as exc:
@@ -419,7 +427,6 @@ def open_state(home: Path, settings: config.Config) -> server.ServerState:
     engine = None
     if settings.server.model_preload:
         engine = search.Engine(home, replace(settings.search, model_idle_seconds=PRELOADED_IDLE_SECONDS))
-        engine.embedder()   # a failure is recorded once and searches stay lexical (design M2 §3.4)
     state = server.make_state(home, engine=engine, write_db=write_db, know_db=know_db, settings=settings)
     state.role, state.push_db = 'server', push_db
     return state
@@ -432,15 +439,50 @@ def close_state(state: server.ServerState) -> None:
             db.close()
 
 
+def bound_graceful_stop(seconds: float = STOP_GRACE_SECONDS) -> bool:
+    """Make the running uvicorn server wait at most ``seconds`` for open connections when it stops; True if
+    set. uvicorn's default waits without limit, so one open MCP stream or a request still running (a search
+    waiting for the model) held a service stop until systemd killed it. The SDK's ``run`` takes no uvicorn
+    option; during ``serve()`` uvicorn's SIGTERM handler is its server's bound ``handle_exit`` (sse-starlette
+    finds the server the same way), whose ``config.timeout_graceful_shutdown`` is read when the stop begins."""
+    running = getattr(signal.getsignal(signal.SIGTERM), '__self__', None)
+    settings = getattr(running, 'config', None)
+    if settings is None or not hasattr(settings, 'timeout_graceful_shutdown'):
+        return False
+    settings.timeout_graceful_shutdown = seconds
+    return True
+
+
+def on_serve(state: server.ServerState) -> None:
+    """Once the transport runs (the lifespan's start, before uvicorn binds): bound the graceful stop and, with
+    ``[server] model_preload``, start the background model load. stderr lines only (no text, no token)."""
+    if not bound_graceful_stop():
+        print('workmcp: graceful stop not bounded (uvicorn server not found); the service stop timeout applies',
+              file=sys.stderr)
+    preload = state.remote.settings.server.model_preload
+    if preload and state.engine.preload_in_background(lambda: _model_line(state.engine)):
+        print(f'workmcp: model loading in the background (a semantic search waits for it up to '
+              f'{server.MODEL_WAIT_SECONDS:.0f} s)', file=sys.stderr)
+
+
+def _model_line(engine: search.Engine) -> None:
+    """The background load's result on stderr: seconds of the load and of its SHA-256 check, or the failure code."""
+    if engine.load_failure is not None:
+        print(f'workmcp: model not loaded: {engine.load_failure}; searches stay lexical', file=sys.stderr, flush=True)
+        return
+    verify = '' if engine.last_verify_ms is None else f' (SHA-256 check {engine.last_verify_ms / 1000:.1f} s)'
+    print(f'workmcp: model loaded in {(engine.last_load_ms or 0) / 1000:.1f} s{verify}', file=sys.stderr, flush=True)
+
+
 def build_remote(home: Path, state: server.ServerState, settings: config.Config):
-    """``server.build_server`` with ``REMOTE_INSTRUCTIONS``, ``auth_settings`` and a ``TokenVerifier``, plus
-    the custom routes ``push_endpoint`` and ``healthz_endpoint`` under ``routes``."""
+    """``server.build_server`` with ``REMOTE_INSTRUCTIONS``, ``auth_settings``, a ``TokenVerifier`` and
+    ``on_serve``, plus the custom routes ``push_endpoint`` and ``healthz_endpoint`` under ``routes``."""
     context = RemoteContext(settings=settings, guard=TransportSecurityMiddleware(transport_security(settings.server)))
     state.remote = context
     built = server.build_server(home, state=state, instructions=REMOTE_INSTRUCTIONS,
                                 auth=auth_settings(settings.server),
                                 token_verifier=TokenVerifier(state.write_db, context.refusals),
-                                log_level=SERVER_LOG_LEVEL)
+                                log_level=SERVER_LOG_LEVEL, on_start=lambda: on_serve(state))
     paths_ = routes(settings.server)
 
     @built.custom_route(paths_['push'] + '{action:path}', methods=ROUTE_METHODS)

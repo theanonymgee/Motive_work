@@ -16,6 +16,12 @@ Memory (design M2 §6.2 S1, §6.4): vectors are read only in ``VectorCache.load`
 float16 matrix, at most ``max_vectors_in_memory`` rows) and ``VectorCache.stream`` (blocks of
 ``STREAM_BLOCK`` rows); chunk texts are read as lists only in ``_hits`` (at most ``limit`` chunks).
 Other queries iterate their cursor or read in ``fetchmany`` blocks.
+
+Background load (2026-10-29, operating server ``[server] model_preload``): ``Engine.preload_in_background``
+runs the one model load on a daemon thread, so the server listens while the 2.28 GB model is checked
+(SHA-256) and loaded. The thread runs ``Engine._load`` only (files, onnxruntime; no store, no network) and
+never keeps the process alive; while it runs, ``embedder()`` answers None and a search is lexical with
+``MODEL_LOADING_NOTE`` (the server's search tool first waits for the load, at most a bounded time).
 """
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ import gc
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -54,6 +61,7 @@ SHORT_QUERY_NOTICE = '질의가 짧아 어휘 검색을 할 수 없음 — 3자 
 # N1 (design M3 §9.1): chunks changed without FTS5 since the last rebuild, so chunks_fts may name other texts
 FTS_DIRTY_NOTICE = '전문 색인이 어긋나 있어 느린 어휘 검색을 씁니다 — `workmcp index --rebuild-fts`'
 NO_VECTORS_NOTE = 'no_vectors: no stored vectors for this model (run workmcp index with the model)'
+MODEL_LOADING_NOTE = 'model_loading: the model is still loading in the background; this answer is lexical'
 
 # The result shape (design M2 §5.7, the M3 ``search`` tool contract).
 RESULT_KEYS = frozenset({'hits', 'meta', 'notice'})
@@ -88,7 +96,7 @@ LOW_SIGNAL = {'rule': 'R5', 'cosine_top1': 0.49, 'gap': None}
 LOW_SIGNAL_NOTICE = '질의와 가까운 내용이 적습니다(어휘 후보 {lexical}, 코사인 1위 {top1}) — 없는 정보일 수 있음'
 UNAVAILABLE = 'unavailable'     # meta['semantic'] when there is no usable model
 ENGINE_STATUS_KEYS = frozenset({'loaded', 'rows', 'generation', 'data_generation', 'matrix_bytes', 'load_failure',
-                                'idle_seconds', 'loads', 'last_load_ms'})
+                                'idle_seconds', 'loads', 'last_load_ms', 'loading', 'last_verify_ms'})
 NOT_REQUESTED = 'not_requested'  # meta['semantic'] in lexical mode (the model is not even looked at)
 
 LOAD_BLOCK = 4096               # rows per fetchmany while loading the matrix
@@ -744,8 +752,9 @@ class Engine:
     means the manifest model through ``embedder.OnnxEmbedder`` with ``settings.effective_threads()``
     intra-op threads. A load failure is recorded once per process (``model_missing: ...``,
     ``model_unverified(<file>: <status>)``, ``runtime_import_failed:<Class>``,
-    ``runtime_error:<Class>``) and later searches only report it. No thread lock: the MCP stdio
-    server calls tools from one thread and the CLI makes one call.
+    ``runtime_error:<Class>``) and later searches only report it. No thread lock: the MCP servers call
+    tools from one thread and the CLI makes one call; the one other thread is ``preload_in_background``'s
+    load, and while ``loading`` is True nothing else loads or reads the model (``embedder()`` answers None).
     """
 
     def __init__(self, home: Path, settings: SearchSettings = SearchSettings(), *,
@@ -760,6 +769,8 @@ class Engine:
         self.last_used: float | None = None
         self.loads = 0                  # model loads attempted in this process
         self.last_load_ms: float | None = None   # duration of the last load attempt (design M3 §6.3)
+        self.last_verify_ms: float | None = None  # of which the SHA-256 check of the model files
+        self.loading = False            # True while preload_in_background's thread loads the model
 
     def search(self, query: str, *, mode: str = 'hybrid', limit: int = LIMIT_DEFAULT,
                path_prefix: str | None = None, ext: Sequence[str] | None = None, since: str | None = None,
@@ -772,10 +783,12 @@ class Engine:
         try:
             model = self.embedder() if mode != 'lexical' else None
             vectors = self.vectors(db) if model is not None else None
+            note = None
+            if mode != 'lexical' and model is None:   # None without a failure: the background load runs
+                note = self.load_failure or MODEL_LOADING_NOTE
             result = search(db, query, embedder=model, vectors=vectors, settings=self.settings, mode=mode,
                             limit=limit, path_prefix=path_prefix, ext=ext, since=since, until=until,
-                            semantic_note=self.load_failure if mode != 'lexical' else None,
-                            collapse_by_document=collapse_by_document)
+                            semantic_note=note, collapse_by_document=collapse_by_document)
         finally:
             db.close()
         if model is not None:
@@ -783,12 +796,39 @@ class Engine:
         return result
 
     def embedder(self):
-        """The loaded embedder or None (lazy; failure recorded once; updates ``last_used``)."""
+        """The loaded embedder or None (lazy; failure recorded once; updates ``last_used``). None, without
+        waiting, while ``preload_in_background`` loads (``loading`` is read first: once it is False the thread
+        has set ``_embedder`` or ``load_failure``)."""
+        if self.loading:
+            return None
         if self._embedder is not None:
             self.last_used = self.clock()
             return self._embedder
         if self.load_failure is not None:
             return None
+        return self._load()
+
+    def preload_in_background(self, done: Callable[[], None] | None = None) -> bool:
+        """Start the model load on a daemon thread (the operating server's ``[server] model_preload``) and
+        return True; False when a model is loaded, a failure is recorded or a load runs. ``done()`` is called
+        on that thread after the load, whatever its result (``status()`` tells which)."""
+        if self.loading or self._embedder is not None or self.load_failure is not None:
+            return False
+        self.loading = True
+
+        def run() -> None:
+            try:
+                self._load()
+            finally:
+                self.loading = False
+                if done is not None:
+                    done()
+
+        threading.Thread(target=run, name='workmcp-model-load', daemon=True).start()
+        return True
+
+    def _load(self):
+        """One load attempt: the factory, or the manifest model after its SHA-256 check (``last_verify_ms``)."""
         self.loads += 1
         started = time.perf_counter()
         try:
@@ -799,7 +839,10 @@ class Engine:
                 if not status['available']:
                     self.load_failure = f"model_missing: {status['message']}"
                     return None
-                self._embedder = embedders.OnnxEmbedder(models.DEFAULT_MODEL, self.home,
+                verify_started = time.perf_counter()
+                models.require_verified(models.DEFAULT_MODEL, self.home)   # every file's pinned SHA-256
+                self.last_verify_ms = _ms(time.perf_counter() - verify_started)
+                self._embedder = embedders.OnnxEmbedder(models.DEFAULT_MODEL, self.home, verify=False,
                                                         threads=self.settings.effective_threads())
         except Exception as exc:  # noqa: BLE001 - any load failure means lexical search, recorded once
             self.load_failure = load_failure_code(exc)
@@ -830,7 +873,7 @@ class Engine:
 
     def maybe_unload(self, now: float | None = None) -> bool:
         """Release model and matrix when unused for ``settings.model_idle_seconds``; True if released."""
-        if self._embedder is None and self._vectors is None:
+        if self.loading or (self._embedder is None and self._vectors is None):
             return False
         now = self.clock() if now is None else now
         if self.last_used is not None and now - self.last_used < self.settings.model_idle_seconds:
@@ -851,14 +894,16 @@ class Engine:
     def status(self) -> dict:
         """``ENGINE_STATUS_KEYS`` (no text): model loaded, matrix rows and bytes, the index and data
         generations the cache belongs to, seconds since the model was last used (None: never), load
-        attempts and the last one's duration in ms, the recorded load failure."""
+        attempts and the last one's duration in ms (of which the SHA-256 check), the recorded load failure,
+        whether the background load runs."""
         cache = self._vectors
         return {'loaded': self._embedder is not None, 'rows': cache.rows if cache else 0,
                 'generation': cache.generation if cache else None,
                 'data_generation': cache.data_generation if cache else None,
                 'matrix_bytes': int(cache.matrix.nbytes) if cache else 0, 'load_failure': self.load_failure,
                 'idle_seconds': None if self.last_used is None else round(self.clock() - self.last_used, 1),
-                'loads': self.loads, 'last_load_ms': self.last_load_ms}
+                'loads': self.loads, 'last_load_ms': self.last_load_ms, 'loading': self.loading,
+                'last_verify_ms': self.last_verify_ms}
 
 
 # ---- console output -----------------------------------------------------------------------------
