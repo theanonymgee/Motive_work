@@ -80,7 +80,9 @@ SECRET_PATTERNS = {
 # a urlsafe token as `secrets.token_urlsafe(32)` makes it: 43 characters with upper, lower and digits
 TOKEN_SHAPE = re.compile(r'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])')
 BEARER_VALUE = re.compile(r'Bearer\s+(\S+)')
-BEARER_PLACEHOLDER = re.compile(r'^(?:<[^>]+>|\$\{[A-Za-z_]+\}|\$[A-Za-z_]+|%s|invalid-test-value|\.\.\.)')
+# `$(cat <file>)` reads the token from a file at run time (guide step F-1 as run); BEARER_VALUE stops at the
+# space, so the value seen is `$(cat`
+BEARER_PLACEHOLDER = re.compile(r'^(?:<[^>]+>|\$\{[A-Za-z_]+\}|\$[A-Za-z_]+|\$\(cat$|%s|invalid-test-value|\.\.\.)')
 PERSONAL_PATTERNS = {
     'Windows user path with a real name': re.compile(r'(?i)[A-Z]:\\Users\\(?!<USER>|Public\b|Default\b)[^\\\s<]+'),
     'macOS user path': re.compile(r'/Users/[^/\s<]+'),
