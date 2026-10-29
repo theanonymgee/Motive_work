@@ -410,6 +410,43 @@ def test_dry_run_limit_docs_and_max_mb(pair):
     mirrored(col, server, collector)
 
 
+def test_a_dry_run_does_not_claim_a_vector_count_it_cannot_know(pair):
+    """The server derives its chunks from the units it receives, so before the first push of new documents it has
+    nothing missing; the dry run says so instead of printing a 0 that the real run then contradicts."""
+    col, server, collector = pair
+    dry = col.push(server, collector, dry_run=True)
+    state_line = push.report_lines(dry)[1]
+    documents = col.count('documents')
+    assert dry['state']['vectors_missing'] == 0 and dry['state']['documents_changed'] == documents
+    assert f'the vectors of the {documents} changed documents are counted after they are sent' in state_line
+    assert server.requests and {method for method, _ in server.requests} == {'GET'}
+    assert server.bodies == []                                    # state requests only: no write request, no data
+    real = col.push(server, collector)
+    assert real['state']['vectors_missing'] > 0                   # what the dry run could not count
+    assert 'counted after' not in push.report_lines(real)[1]
+    assert push.report_lines(col.push(server, collector, dry_run=True))[0].endswith('up to date (batches 0, bytes '
+                                                                                  f'sent 0, state requests 1)')
+
+
+def test_the_log_names_no_server_push_when_none_ran(pair):
+    col, server, collector = pair
+
+    def done_lines() -> list[str]:
+        text = ''.join(path.read_text(encoding='utf-8') for path in sorted((col.home/'logs').glob('push-*.log')))
+        messages = [line.split(' | ', 1)[1] for line in text.splitlines() if ' | ' in line]
+        return [message for message in messages if message.startswith('done | ')]
+    col.push(server, collector, dry_run=True)
+    col.push(server, collector)
+    col.push(server, collector)                                   # up to date
+    col.push(server, collector, dry_run=True)                     # up to date again
+    dry, real, current, current_dry = done_lines()
+    assert dry.startswith('done | no server push | exit 0 | batches 0 | bytes 0')
+    assert real.startswith('done | push #1 | exit 0 |')
+    assert current.startswith('done | no server push | exit 0 | batches 0 | bytes 0')
+    assert current_dry == current
+    assert 'None' not in ''.join(done_lines())
+
+
 def answer(code: str, status: int | None = None):
     return lambda method, name, body, call: (status or sync.ERROR_HTTP_STATUS[code],
                                              json.dumps(sync.error(code, 'synthetic')).encode())

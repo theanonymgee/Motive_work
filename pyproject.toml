@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "workmcp"
 version = "0.1.0"
-description = "Personal local work-knowledge MCP server (stdio, local-only storage)."
+description = "Personal work-knowledge MCP server: a collector pushes parsed, embedded documents to the operating server, which serves MCP over stdio or HTTPS."
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"

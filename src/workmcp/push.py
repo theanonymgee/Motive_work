@@ -446,7 +446,8 @@ def _locked_run(home: Path, url: str, token: str, options: Options, report: dict
         if db is not None:
             db.close()
         report['elapsed'] = round(time.monotonic() - begin, 3)
-        logger.info(f"done | push #{report['push_id']} | exit {report['exit_code']} | batches {report['batches']} | "
+        which = f"push #{report['push_id']}" if report['push_id'] is not None else 'no server push'
+        logger.info(f"done | {which} | exit {report['exit_code']} | batches {report['batches']} | "
                     f"bytes {report['bytes_sent']}")
         logger.removeHandler(handler)
         handler.close()
@@ -678,9 +679,13 @@ def report_lines(report: dict) -> list[str]:
                 *([f"  {report['warning']}"] if report.get('warning') else [])]
     lines = [f"{head}  started {report['started_at']}" + ('  (dry run: nothing sent)' if report['dry_run'] else '')]
     c, s = report['state'], report['sent']
+    # The server derives its chunks from the units it receives, so a dry run (nothing sent) cannot count the
+    # vectors that the changed documents will need; the real run counts them after the units went out.
+    vectors = (f"vectors missing on server {c['vectors_missing']} (documents it already holds; the vectors of the "
+               f"{c['documents_changed']} changed documents are counted after they are sent)"
+               if report['dry_run'] and c['documents_changed'] else f"vectors missing on server {c['vectors_missing']}")
     lines.append(f"  state: documents changed {c['documents_changed']} (added {c['added']} changed {c['changed']} "
-                 f"deleted {c['deleted']} restored {c['restored']} reparsed {c['reparsed']})  "
-                 f"vectors missing on server {c['vectors_missing']}")
+                 f"deleted {c['deleted']} restored {c['restored']} reparsed {c['reparsed']})  {vectors}")
     if not report['dry_run']:
         lines.append(f"  sent: documents {s['documents']}  versions {s['versions']}  units {s['units']:,} "
                      f"({s['chars']:,} chars)  vectors {s['vectors']} ({s['vector_bytes'] // 1024:,} KB)  "
