@@ -1,5 +1,13 @@
 # 진행·재개 기록
 
+### 2026-10-29 — M6 완료 (회사 PC 수집기 설치형)
+
+- 설계 `doc/planning/2026-10-29_M6-설계_v1.md`(설계자), 실행자 A~K, 검토 v1 조건부 → v2 통과 → v3 통과(높음·중간 0).
+- 코드: 검토 v3 낮음(V3-2·3·5·6·7) 수정, `workmcp setup` 구현, `tools/make_bundle.py`(오프라인 묶음, 빌드 백엔드 해시 고정 `requirements-build.lock.txt`), `tools/scan_history.py`(공개 전 이력 검사), 서버 `serve --http`가 리스닝 먼저·모델 백그라운드 로드·정지 3 s 제한, 버전 0.1.0.
+- 확인: 새 빈 폴더 오프라인 설치→setup→scan→index→push 성공, 두 번째 push 0(`doc/validation/2026-10-29_M6-오프라인설치확인_v1.md`). 서버 업데이트 2회(피터 승인), Codex·Claude Code 동시 검색, 합성 수집기 2개 retire·시험 사실 철회(`doc/validation/2026-10-29_M6-운영확인_v1.md`). 전체 테스트 2280 passed.
+- 공개 준비: MIT, README 재작성(사용자용), 호스트·사용자 이름 치환, 이력 검사(토큰·비밀·회사 자료 0). **저장소 공개 전환은 피터 승인 대기.**
+- 다음(피터): 회사 PC 실제 설치(안내서; 그 PC용 push 토큰을 서버에서 먼저 발급), 프록시 확인, 공개 전환, SSH 키 정리. 남은 낮음은 PLAN §5 M6 "남은 것".
+
 ### 2026-10-29 — M5 완료 (원격 운영 서버 전환)
 
 - VPS 배포(피터 단계별 승인): C — 최신 코드 재배포, VPS 테스트 2108 passed·22 skipped, BGE-M3 SHA-256 4/4, `config.toml`, 토큰 2개(평문은 이 PC 저장소 밖 파일로만, 첫 시도 경로 오류로 버려진 2개는 폐기) → D — systemd 유닛(loopback, `IPAddressDeny` 실효 확인), certbot(webroot, 이메일 없이 약관 동의 — 피터), workshop 80 설정에 ACME include 1줄, 443 새 서버 블록 → E — 백업 타이머 1회 ok → F — 합성 수집기 51문서 push(두 번째 전송 0, 추가 1 증분), `workmcp-remote` 사용자 범위 등록.

@@ -23,7 +23,7 @@
 - After changing dependencies: `uv lock`, `uv sync --frozen`, `uv export --format requirements-txt --hashes --no-emit-project -o requirements.lock.txt`
 - Build backend pin: `requirements-build.lock.txt` holds `setuptools` with its hash (used by `tools/make_bundle.py`); change it together with `[build-system] requires` in `pyproject.toml`. Offline bundle: `tools/make_bundle.py make --out <outside the repo>`, check with `verify`.
 - `requirements.lock.txt` includes the dev dependency `pytest` on purpose, so the same tests run as a diagnosis on the dev PC and the company PC; the build backend is pinned (`setuptools==84.2.1` in `pyproject.toml`).
-- Data home: `WORKMCP_HOME`, default `%USERPROFILE%\Motive_work` (refused with exit 2 if inside the repo, a sync folder, UNC, relative or under AppData). Set `WORKMCP_HOME` whenever the home is not that default, so `scan`, `push`, `doctor` and scheduled tasks find it.
+- Data home: `WORKMCP_HOME`, default `%USERPROFILE%\Motive_work` (every command refuses with exit 2 a home inside the repo, in a sync folder, UNC or relative; a home under AppData is refused only by `setup` unless `--yes`, other commands accept it and `doctor` reports app virtualization). Set `WORKMCP_HOME` whenever the home is not that default, so `scan`, `push`, `doctor` and scheduled tasks find it.
 
 ## Style
 

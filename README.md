@@ -108,7 +108,7 @@ codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-va
 - 수집기: Windows 10/11 x64, Python 3.12(python.org 사용자 단위 설치기로 충분), 디스크 약 3 GB(모델 약 2.3 GB), 색인 중 메모리 약 2 GiB. **관리자 권한은 필요 없습니다.**
 - 운영 서버: Ubuntu 24.04 VPS 한 대(배포 절차는 [doc/guides/](doc/guides/)).
 - BGE-M3 ONNX 모델 파일은 명시적인 다운로드 명령이나 오프라인 묶음으로만 받습니다.
-- 데이터 홈은 `WORKMCP_HOME`(기본 `%USERPROFILE%\Motive_work`)이며, 저장소 안, 동기화 폴더(OneDrive 등), UNC 경로, 상대 경로, AppData 아래는 거부됩니다(Claude·Codex 데스크톱 앱과 함께 쓸 때 AppData 밖에 두는 이유: [doc/examples/README.md](doc/examples/README.md)).
+- 데이터 홈은 `WORKMCP_HOME`(기본 `%USERPROFILE%\Motive_work`)이며, 저장소 안, 동기화 폴더(OneDrive 등), UNC 경로, 상대 경로는 모든 명령이 거부합니다(exit 2). AppData 아래는 `setup`만 `--yes` 없이는 거부하고, 다른 명령은 받아들이며 `doctor`가 앱 가상화 여부를 알립니다(Claude·Codex 데스크톱 앱과 함께 쓸 때 AppData 밖에 두는 이유: [doc/examples/README.md](doc/examples/README.md)).
 
 </details>
 
