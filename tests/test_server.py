@@ -244,6 +244,42 @@ def test_first_semantic_call_reports_model_loaded_now(state, tmp_path):
     assert state.unloads == 1 and again['result']['meta']['engine']['model_loaded_now'] is True
 
 
+def test_search_waits_for_the_background_load_on_the_loop_at_most_the_cap(state, tmp_path, monkeypatch):
+    """2026-10-29: ``await_model`` sleeps on the event loop while the background load runs, at most
+    ``MODEL_WAIT_SECONDS``; then ``handle`` answers lexically with ``MODEL_LOADING_NOTE``. On the operating
+    server a model not loaded yet starts that load (no load in the call); the stdio server does not wait and
+    loads in the call as before (lexical mode never waits)."""
+    import threading
+    indexed(state, tmp_path)
+    release = threading.Event()
+
+    def slow():
+        assert release.wait(30)
+        return embedder.HashEmbedder(64)
+
+    state.engine.embedder_factory = slow
+    monkeypatch.setattr(server, 'MODEL_WAIT_SECONDS', 0.3)
+    assert anyio.run(server.await_model, state, 'hybrid') == 0.0 and not state.engine.loading   # stdio role
+    state.role = 'server'
+    assert anyio.run(server.await_model, state, 'lexical') == 0.0 and not state.engine.loading
+    waited = anyio.run(server.await_model, state, 'semantic')
+    assert 0.3 <= waited < 5 and state.engine.loading and state.engine.loads == 1   # started here, still loading
+    answer = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'semantic'}, ('c', ''),
+                                      model_wait_ms=waited * 1000))
+    meta = answer['result']['meta']
+    assert meta['semantic_note'] == search.MODEL_LOADING_NOTE and meta['mode'] == 'lexical'
+    assert meta['engine'] == {'model_loaded_now': False, 'load_ms': 0}
+    release.set()
+    monkeypatch.setattr(server, 'MODEL_WAIT_SECONDS', 30)
+    waited = anyio.run(server.await_model, state, 'hybrid')
+    assert not state.engine.loading and state.engine.status()['loaded'] and state.engine.loads == 1
+    answer = json.loads(server.handle(state, 'search', {'query': '견적', 'mode': 'hybrid'}, ('c', ''),
+                                      model_wait_ms=waited * 1000))
+    assert answer['result']['meta']['engine']['model_loaded_now'] is (waited > 0)   # the thread may end first
+    assert answer['result']['meta']['semantic'] != search.UNAVAILABLE
+    assert anyio.run(server.await_model, state, 'hybrid') == 0.0                      # loaded: no wait
+
+
 def test_serve_start_reports_app_virtualization_on_stderr(workmcp_home, monkeypatch, capsys):
     monkeypatch.setattr(server.MCPServer, 'run', lambda self, transport: None)
     assert server.main() == 0

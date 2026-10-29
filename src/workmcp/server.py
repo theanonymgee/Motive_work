@@ -1,9 +1,12 @@
 """MCP stdio transport adapter; business behavior lives in ``tools.py`` (design M0 §1.1, M3 §1, §6).
 
 Fifteen tools (the five read tools of M3, six knowledge writers and four knowledge readers of M4), each
-an ``async def`` without ``await`` (the SDK runs a sync tool on a worker
-thread and every request in its own task; an async tool runs to the end on the event loop thread,
-so tool calls never overlap and ``search.Engine`` needs no lock). Every tool returns one string,
+an ``async def`` whose ``handle`` call has no ``await`` (the SDK runs a sync tool on a worker
+thread and every request in its own task; an async tool runs on the event loop thread, so ``handle`` calls
+never overlap and ``search.Engine`` needs no lock). The one ``await``: a semantic or hybrid ``search`` while
+the operating server's background model load runs (``search.Engine.loading``) first waits for it, at most
+``MODEL_WAIT_SECONDS``, sleeping on the loop so other calls go on; then it answers (lexically with
+``search.MODEL_LOADING_NOTE`` if the load still runs). Every tool returns one string,
 the compact JSON envelope (``structured_output=False``: the SDK sends it as one text content as is).
 ``handle`` is the common path: idle release, the tool function, the size budget, the local call
 log (``tool_calls`` + ``deliveries``, no query or body text), a last guard that turns any
@@ -41,6 +44,7 @@ import re
 import sqlite3
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -57,6 +61,8 @@ LOG_FORMAT = '%(asctime)s %(name)s %(levelname)s %(message)s'
 INSTRUCTIONS = ('응답의 delivered_sources가 이번 응답으로 PC를 떠난 원문 조각의 출처 전부다. '
                 '검색 결과 없음 ≠ 회사에 그 정보가 없음.')
 CLIENT_MAX_CHARS = 64
+MODEL_WAIT_SECONDS = 25.0       # a search during the background model load waits this long at most (V-L4 <= 30 s)
+MODEL_WAIT_POLL = 0.1
 UNKNOWN_CLIENT = 'unknown'
 LOG_DELAYED_NOTICE = ('로컬 전달 기록(deliveries)을 대기열에 두었습니다({}건) — 저장소 잠금이 풀리면 씁니다; '
                       '서버가 그 전에 끝나면 잃을 수 있음')
@@ -164,13 +170,17 @@ def unload_if_idle(state: ServerState) -> bool:
     return released
 
 
-def _annotate_engine(envelope: dict, engine: search.Engine, loads_before: int) -> None:
-    """``meta.engine`` on a search result, and a notice when this call loaded the model (design M3 §6.3)."""
+def _annotate_engine(envelope: dict, engine: search.Engine, loads_before: int, model_wait_ms: float = 0.0) -> None:
+    """``meta.engine`` on a search result, and a notice when this call loaded the model (design M3 §6.3) or
+    waited for the background load to finish (``load_ms`` = the wait)."""
     meta = (envelope.get('result') or {}).get('meta') if envelope.get('ok') else None
     if not isinstance(meta, dict):
         return
-    loaded_now = engine.loads > loads_before and engine.status()['loaded']
-    load_ms = getattr(engine, 'last_load_ms', None) if loaded_now else 0
+    loaded = engine.status()['loaded']
+    loaded_now = loaded and (engine.loads > loads_before or model_wait_ms > 0)
+    load_ms = 0
+    if loaded_now:
+        load_ms = getattr(engine, 'last_load_ms', None) if engine.loads > loads_before else round(model_wait_ms, 1)
     meta['engine'] = {'model_loaded_now': loaded_now, 'load_ms': load_ms}
     if loaded_now:
         envelope['notice'].append(MODEL_LOADED_NOTICE.format(load_ms))
@@ -241,12 +251,13 @@ def _settle_knowledge(state: ServerState, tool: str) -> bool:
     return True
 
 
-def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -> str:
+def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str], *, model_wait_ms: float = 0.0) -> str:
     """Run one tool call and return the serialized envelope (never raises for an ordinary error).
 
     A knowledge write is committed or not at all: a transaction a writer left open is rolled back and the
     answer becomes ``internal_error``. A committed write whose answer does not fit the budget answers
-    ``response_too_large`` naming the stored ids (not retryable: repeating it would record it twice)."""
+    ``response_too_large`` naming the stored ids (not retryable: repeating it would record it twice).
+    ``model_wait_ms``: how long ``search_tool`` waited for the background model load (``_annotate_engine``)."""
     began = time.perf_counter()
     call_id = os.urandom(8).hex()
     state.client, state.call_id = client[0], call_id  # the knowledge writers' recorded_by and call id
@@ -258,7 +269,7 @@ def handle(state: ServerState, tool: str, args: dict, client: tuple[str, str]) -
         if tool in tools.WRITE_TOOL_NAMES:
             stored = _written_ids(envelope)
         envelope = tools.fit(envelope, tools.SHRINK[tool], state.budget)
-        _annotate_engine(envelope, state.engine, loads_before)
+        _annotate_engine(envelope, state.engine, loads_before, model_wait_ms)
     except knowledge.KnowledgeError as exc:  # argument names, numbers and labels only, never text
         if exc.code == 'internal_error':     # stored, the answer failed (review M4 v1 L8): traceback to stderr
             LOG.exception('tool %s stored its rows but its answer failed', tool)
@@ -315,11 +326,33 @@ async def _ticker(state: ServerState) -> None:
             LOG.exception('idle release failed')
 
 
-def _lifespan(state: ServerState):
+async def await_model(state: ServerState, mode: str) -> float:
+    """Before a semantic or hybrid search: while the background model load runs, sleep on the event loop
+    (other calls go on) for at most ``MODEL_WAIT_SECONDS``; returns the seconds waited. On the operating
+    server (``role='server'``) a model not loaded yet (no preload, or released after idle) is loaded the same
+    way, so no load holds the event loop (design M5 remote §7.3 limit); the stdio server loads in the call.
+    Calls the idle release first, so a model released now is loaded again here, not in the call."""
+    if mode not in ('hybrid', 'semantic'):
+        return 0.0
+    if state.role == 'server':
+        unload_if_idle(state)
+        state.engine.preload_in_background()
+    if not getattr(state.engine, 'loading', False):
+        return 0.0
+    began = time.monotonic()
+    while state.engine.loading and time.monotonic() - began < MODEL_WAIT_SECONDS:
+        await anyio.sleep(MODEL_WAIT_POLL)
+    return time.monotonic() - began
+
+
+def _lifespan(state: ServerState, on_start: Callable[[], None] | None = None):
     """Once per process (stdio: the one connection; Streamable HTTP: the session manager's run, design M5
-    remote §0.1): the idle-release ticker runs beside the sessions (design M3 §6.2)."""
+    remote §0.1): the idle-release ticker runs beside the sessions (design M3 §6.2). ``on_start`` (the
+    operating server's) runs first, once the transport runs (under uvicorn: before it binds the port)."""
     @contextlib.asynccontextmanager
     async def lifespan(_server):
+        if on_start is not None:
+            on_start()
         async with anyio.create_task_group() as group:
             group.start_soon(_ticker, state)
             try:
@@ -330,14 +363,15 @@ def _lifespan(state: ServerState):
 
 
 def build_server(home: Path, *, engine: search.Engine | None = None, state: ServerState | None = None,
-                 instructions: str = INSTRUCTIONS, auth=None, token_verifier=None, log_level: str = 'INFO') -> MCPServer:
+                 instructions: str = INSTRUCTIONS, auth=None, token_verifier=None, log_level: str = 'INFO',
+                 on_start: Callable[[], None] | None = None) -> MCPServer:
     """The MCP server with the fifteen tools; ``server.workmcp_state`` is its ``ServerState``.
 
     The operating server (``remote.py``, design M5 remote §4.1, §4.2, §4.7) passes its own ``instructions``,
     the SDK's ``auth`` (``AuthSettings``) with a ``token_verifier`` and ``log_level='WARNING'`` (the SDK
-    hands it to uvicorn: no access log); the stdio server passes none of them."""
+    hands it to uvicorn: no access log) and ``on_start`` (``_lifespan``); the stdio server passes none of them."""
     state = state or make_state(home, engine=engine)
-    server = MCPServer('workmcp', version=__version__, instructions=instructions, lifespan=_lifespan(state),
+    server = MCPServer('workmcp', version=__version__, instructions=instructions, lifespan=_lifespan(state, on_start),
                        auth=auth, token_verifier=token_verifier, log_level=log_level)
 
     @server.tool(name='search', structured_output=False)
@@ -350,9 +384,11 @@ def build_server(home: Path, *, engine: search.Engine | None = None, state: Serv
         the hit's chunk spans ({unit, chars, text_sha256}; v, doc, path and sha256 are the hit locator's) and
         carries no text. mode: hybrid|lexical|semantic; since/until filter on when a file version was
         observed, not dates inside documents."""
+        waited = await await_model(state, mode)
         return handle(state, 'search', {'query': query, 'mode': mode, 'limit': limit, 'path_prefix': path_prefix,
                                         'ext': ext, 'since': since, 'until': until,
-                                        'collapse_by_document': collapse_by_document}, client_of(ctx))
+                                        'collapse_by_document': collapse_by_document}, client_of(ctx),
+                      model_wait_ms=waited * 1000)
 
     @server.tool(name='get_snippet', structured_output=False)
     async def get_snippet_tool(chunk_id: StrictInt | None = None, locator: dict[str, Any] | None = None,

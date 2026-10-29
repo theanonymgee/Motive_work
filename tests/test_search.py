@@ -585,10 +585,49 @@ def test_engine_unloads_after_idle(indexed):
     assert set(status) == search.ENGINE_STATUS_KEYS
     assert status == {'loaded': False, 'rows': 0, 'generation': None, 'data_generation': None, 'matrix_bytes': 0,
                       'load_failure': None, 'idle_seconds': 599.0, 'loads': 1,
-                      'last_load_ms': status['last_load_ms']}
+                      'last_load_ms': status['last_load_ms'], 'loading': False, 'last_verify_ms': None}
     assert status['last_load_ms'] >= 0
     assert engine.search('사양서')['meta']['semantic']['vectors'] > 0   # loads again on demand
     assert engine.loads == 2
+
+
+def test_engine_loads_in_the_background_and_searches_lexically_meanwhile(indexed):
+    """2026-10-29 (VPS start): ``preload_in_background`` loads on a daemon thread; meanwhile ``embedder()``
+    answers None at once, a semantic or hybrid search is lexical with ``MODEL_LOADING_NOTE``, the idle release
+    leaves it alone and a second preload does not start; ``done`` runs after the load, then searches are
+    semantic. A failed background load is recorded once like a lazy one."""
+    import threading
+    release, entered, done = threading.Event(), threading.Event(), threading.Event()
+    threads = []
+
+    def slow():
+        threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30)
+        return HashEmbedder(DIMS)
+
+    engine = search.Engine(indexed[0], embedder_factory=slow)
+    assert engine.preload_in_background(done.set) is True
+    assert entered.wait(30) and engine.loading and engine.status()['loading'] is True
+    assert threads[0].daemon and threads[0] is not threading.current_thread()
+    assert engine.embedder() is None and engine.preload_in_background() is False
+    hybrid = engine.search('사양서')
+    assert hybrid['meta']['semantic_note'] == search.MODEL_LOADING_NOTE and hybrid['meta']['mode'] == 'lexical'
+    assert hybrid['meta']['semantic'] == search.UNAVAILABLE and hybrid['hits']          # lexical hits
+    assert engine.search('사양서', mode='lexical')['meta']['semantic_note'] is None
+    assert engine.maybe_unload(10**12) is False and engine.loads == 1
+    release.set()
+    assert done.wait(30) and not engine.loading and engine.status()['loaded']
+    assert engine.search('사양서', mode='semantic')['meta']['semantic']['vectors'] > 0
+    assert engine.loads == 1 and engine.preload_in_background() is False                 # loaded: nothing to do
+
+    def broken():
+        raise RuntimeError('synthetic')
+    failed, finished = search.Engine(indexed[0], embedder_factory=broken), threading.Event()
+    assert failed.preload_in_background(finished.set) and finished.wait(30)
+    assert failed.load_failure == 'runtime_error:RuntimeError' and not failed.loading
+    assert failed.search('사양서')['meta']['semantic_note'] == 'runtime_error:RuntimeError'
+    assert failed.preload_in_background() is False and failed.loads == 1
 
 
 def test_server_threads_default_is_half_the_cpus():

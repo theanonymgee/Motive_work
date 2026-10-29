@@ -32,7 +32,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 import test_network_boundary as nb
 from fixtures import SENTINEL
-from workmcp import binding, cli, config, locator, paths, receive, remote, store, sync
+from workmcp import binding, cli, config, locator, paths, receive, remote, search, store, sync
 
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT_NAME = nb.CLIENT_NAME
@@ -67,6 +67,17 @@ if sys.argv[2] == 'fake':
         return sync.ok({'fake': 'apply', 'kind': body.get('kind'), 'raw_bytes': raw_bytes,
                         'collector': collector['name']})
     receive.apply = apply
+if sys.argv[2] == 'slowmodel':   # the model load takes WORKMCP_TEST_LOAD_SECONDS (a HashEmbedder after a sleep)
+    import os as _os, time as _time
+    from workmcp import embedder as _embedder, search as _search
+    _engine_init = _search.Engine.__init__
+    def _slow_engine(self, *args, **kwargs):
+        _engine_init(self, *args, **kwargs)
+        def slow():
+            _time.sleep(float(_os.environ['WORKMCP_TEST_LOAD_SECONDS']))
+            return _embedder.HashEmbedder(256)
+        self.embedder_factory = slow
+    _search.Engine.__init__ = _slow_engine
 import logging, os, time
 def stop_when_asked(path=sys.argv[3], life=float(sys.argv[4])):
     ends = time.monotonic() + life
@@ -200,12 +211,13 @@ def launch(home: Path, port: int, mode: str, stderr_file: Path) -> subprocess.Po
     return proc
 
 
-def start_server(home: Path, token: str, *, fake: bool = False, port: int | None = None) -> Server:
+def start_server(home: Path, token: str, *, fake: bool = False, port: int | None = None,
+                 mode: str | None = None) -> Server:
     """Start on a free port (three tries when the port is taken meanwhile) and wait until ``healthz`` answers."""
     for attempt in range(3):
         chosen = port or free_port()
         stderr_file = home.parent/f'server-{chosen}-{attempt}.err'
-        proc = launch(home, chosen, 'fake' if fake else 'real', stderr_file)
+        proc = launch(home, chosen, mode or ('fake' if fake else 'real'), stderr_file)
         server = Server(home, chosen, proc, stderr_file)
         deadline = time.monotonic() + READY_SECONDS
         with httpx2.Client(headers={'Authorization': f'Bearer {token}'}, trust_env=False,
@@ -403,7 +415,7 @@ def test_doctor_names_the_role_without_reading_the_token(workmcp_home, capsys, m
     assert 'synthetic-secret-token' not in out
 
 
-def test_open_state_has_three_write_connections_and_the_server_role(tmp_path):
+def test_open_state_has_three_write_connections_and_the_server_role(tmp_path, capsys):
     home = new_home(tmp_path)
     cfg = config.parse_config('[server]\nmodel_preload = true\n[index]\nmodel = "none"\n', Path('config.toml'))
     state = remote.open_state(home, cfg)
@@ -411,8 +423,18 @@ def test_open_state_has_three_write_connections_and_the_server_role(tmp_path):
         assert state.role == 'server' and None not in (state.write_db, state.know_db, state.push_db)
         assert len({id(state.write_db), id(state.know_db), id(state.push_db)}) == 3
         assert state.engine.settings.model_idle_seconds == remote.PRELOADED_IDLE_SECONDS
-        assert state.engine.loads == 1 and state.engine.load_failure.startswith('model_missing')  # tried at start
+        assert state.engine.loads == 0                       # not before the port opens: on_serve starts it
         built = remote.build_remote(home, state, cfg)
+        remote.on_serve(state)                               # outside uvicorn: no server to bound, the load starts
+        for _ in range(300):
+            if not state.engine.loading:
+                break
+            time.sleep(0.1)
+        assert state.engine.loads == 1 and state.engine.load_failure.startswith('model_missing')
+        assert remote.bound_graceful_stop() is False
+        err = capsys.readouterr().err
+        assert 'graceful stop not bounded' in err and 'model loading in the background' in err
+        assert 'model not loaded: model_missing' in err
         assert built.instructions == remote.REMOTE_INSTRUCTIONS
         assert remote.auth_settings(cfg.server).resource_server_url is None
         assert remote.transport_security(cfg.server).allowed_origins == []
@@ -705,6 +727,103 @@ def test_serve_http_exit_codes(tmp_path):
         other.close()
     assert locked.returncode == remote.EXIT_LOCKED and 'cannot open the store' in locked.stderr
     assert 'Traceback' not in locked.stderr
+
+
+# ---- start and stop (2026-10-29, VPS update) -------------------------------------------------------------
+
+def preload_home(tmp_path) -> tuple[Path, dict]:
+    home = new_home(tmp_path)
+    (home/'config.toml').write_text('[server]\nmodel_preload = true\n', encoding='utf-8')
+    return home, issue_tokens(home)
+
+
+def envelope(result) -> dict:
+    return json.loads(result.content[0].text)
+
+
+async def stop_during_a_search(server: Server, token: str) -> dict:
+    """An SDK session (its GET stream open): status and a lexical search while the model loads, then a hybrid
+    search waiting for the model when the stop comes; returns what was seen and the seconds to the exit."""
+    seen = {}
+    with anyio.fail_after(SESSION_SECONDS):
+        async with httpx2.AsyncClient(headers={'Authorization': f'Bearer {token}'}, trust_env=False,
+                                      timeout=REQUEST_SECONDS) as http:
+            try:
+                async with streamable_http_client(f'{server.base}/mcp', http_client=http) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        seen['status'] = envelope(await session.call_tool('status', {}))
+                        began = time.monotonic()
+                        seen['lexical'] = envelope(await session.call_tool('search', {'query': 'synthetic',
+                                                                                      'mode': 'lexical'}))
+                        seen['lexical_seconds'] = time.monotonic() - began
+
+                        async def waiting_search():
+                            try:
+                                seen['hybrid'] = envelope(await session.call_tool('search', {'query': 'synthetic'}))
+                            except Exception as exc:  # noqa: BLE001 - cut by the stop: expected
+                                seen['hybrid_error'] = type(exc).__name__
+
+                        async with anyio.create_task_group() as group:
+                            group.start_soon(waiting_search)
+                            await anyio.sleep(0.5)
+                            server.stop_file.write_text('stop', encoding='utf-8')
+                            seen['stop_at'] = time.monotonic()
+                            while server.proc.poll() is None and time.monotonic() - seen['stop_at'] < STOP_SECONDS:
+                                await anyio.sleep(0.05)
+                            seen['stop_seconds'] = time.monotonic() - seen['stop_at']
+                            group.cancel_scope.cancel()
+            except Exception as exc:  # noqa: BLE001 - the server went away under the open session: expected
+                seen['client_error'] = type(exc).__name__
+    if 'stop_at' not in seen:              # the session failed before the stop: the asserts show what was seen
+        return seen
+    while 'stop_seconds' not in seen and server.proc.poll() is None and time.monotonic() - seen['stop_at'] < STOP_SECONDS:
+        time.sleep(0.05)
+    seen.setdefault('stop_seconds', time.monotonic() - seen['stop_at'])   # an upper bound then
+    return seen
+
+
+def test_serve_listens_before_the_model_and_stops_with_an_open_session(tmp_path, monkeypatch):
+    """The port answers while the background model load runs (``status`` shows ``loading``, lexical search
+    answers at once), and a stop (SIGTERM) with an open session and a search still waiting for the model ends
+    by itself, exit 0, within ``remote.STOP_GRACE_SECONDS`` plus the session teardown: before the launcher's
+    5 s force-exit fallback. Before 2026-10-29 the load ran before the port opened and uvicorn waited for
+    open requests without limit."""
+    monkeypatch.setenv('WORKMCP_TEST_LOAD_SECONDS', '120')      # never finishes during this test
+    home, tokens = preload_home(tmp_path)
+    began = time.monotonic()
+    server = start_server(home, tokens['mcp'], mode='slowmodel')
+    listening = time.monotonic() - began
+    seen = anyio.run(stop_during_a_search, server, tokens['mcp'])
+    code, stderr = server.stop()
+    engine = seen['status']['result']['engine']
+    assert engine['loading'] is True and engine['loaded'] is False and listening < READY_SECONDS
+    assert seen['lexical']['ok'] and seen['lexical_seconds'] < 5
+    assert 'hybrid' not in seen                                   # still waiting for the model at the stop
+    assert code == 0 and STOP_STALL not in stderr, f'exit {code} after {seen.get("stop_seconds")} s:\n{stderr}'
+    assert seen['stop_seconds'] < remote.STOP_GRACE_SECONDS + 2, seen
+    assert 'model loading in the background' in stderr and 'graceful stop not bounded' not in stderr
+    assert tokens['mcp'] not in stderr
+
+
+def test_a_search_during_the_background_load_waits_for_it(tmp_path, monkeypatch):
+    """A hybrid search sent while the model loads waits for the load and answers with the model
+    (``meta.engine.model_loaded_now``, ``load_ms`` = the wait); stderr reports the load."""
+    monkeypatch.setenv('WORKMCP_TEST_LOAD_SECONDS', '2')
+    home, tokens = preload_home(tmp_path)
+    server = start_server(home, tokens['mcp'], mode='slowmodel')
+    try:
+        steps = [{'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                  'params': {'name': 'search', 'arguments': {'query': 'synthetic', 'mode': 'hybrid'}}}]
+        _, _, replies = anyio.run(http_session, f'{server.base}/mcp', tokens['mcp'], steps)
+    finally:
+        code, stderr = server.stop()
+    assert_stopped(code, stderr)
+    body = json.loads(replies[2]['result']['content'][0]['text'])
+    meta = body['result']['meta']
+    assert meta['semantic'] != search.UNAVAILABLE and meta['semantic_note'] != search.MODEL_LOADING_NOTE
+    assert meta['engine']['model_loaded_now'] is True and meta['engine']['load_ms'] > 0
+    assert re.search(r'workmcp: model loaded in \d+\.\d s', stderr), stderr
 
 
 def test_logs_and_records_hold_no_text_or_token(served):
