@@ -18,9 +18,13 @@ keeps equal to ``workmcp.models.MANIFEST``) into ``<out>/workmcp-model-bge-m3-<r
 Nothing is installed, no setting is changed, no token is read. ``--out`` inside the repository is refused.
 
 ``verify`` recomputes every line of ``SHA256SUMS`` (``ok N mismatch M missing K unlisted U``) and fails on any
-mismatch, missing file or file that ``SHA256SUMS`` does not list (``INSTALL.txt`` and ``SHA256SUMS`` itself excepted);
-a listed path may not leave the bundle folder. Exit codes: 0 done, 1 a step failed or verification failed,
-4 arguments or preconditions.
+mismatch, missing file or file that ``SHA256SUMS`` does not list (only ``SHA256SUMS`` itself is excepted;
+``INSTALL.txt`` is listed, review M6 v1 M6-10); a listed path may not leave the bundle folder. A code bundle must list
+``INSTALL.txt``, ``requirements.lock.txt``, ``src.zip``, ``verify_bundle.py``, the ``workmcp`` wheel and at least one
+other wheel, a model bundle its four files; what it does not list counts as missing, so an empty ``SHA256SUMS`` fails.
+The SHA-256 of ``SHA256SUMS`` itself is printed by ``make`` only (never written into the bundle, which could be changed
+together with it): write it down apart from the bundle and compare it with ``certutil`` before running anything from it.
+Exit codes: 0 done, 1 a step failed or verification failed, 4 arguments or preconditions.
 """
 from __future__ import annotations
 
@@ -43,7 +47,9 @@ SUMS = 'SHA256SUMS'
 INSTALL = 'INSTALL.txt'
 VERIFY_NAME = 'verify_bundle.py'
 LOCK = 'requirements.lock.txt'
-UNLISTED_OK = frozenset({SUMS, INSTALL})
+SOURCE_ZIP = 'src.zip'
+UNLISTED_OK = frozenset({SUMS})
+CODE_REQUIRED = (INSTALL, LOCK, SOURCE_ZIP, VERIFY_NAME)   # besides the workmcp wheel and one dependency wheel
 BLOCK = 1 << 20
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 4
 
@@ -121,6 +127,18 @@ class Verification:
         return f'ok {self.ok} mismatch {len(self.mismatch)} missing {len(self.missing)} unlisted {len(self.unlisted)}'
 
 
+def unlisted_required(listed: set[str]) -> list[str]:
+    """What a bundle has to list and ``SHA256SUMS`` does not: a model bundle (it lists a model file) its four files,
+    any other folder the pieces of a code bundle. An empty listing is a code bundle without any of them."""
+    if listed & set(MODEL_FILES):
+        return [name for name in MODEL_FILES if name not in listed]
+    wheels = [name for name in listed if re.fullmatch(r'wheels/[^/]+\.whl', name)]
+    ours = [name for name in wheels if re.fullmatch(r'wheels/workmcp-[^-/]+-[^/]+\.whl', name)]
+    return ([name for name in CODE_REQUIRED if name not in listed]
+            + ([] if ours else ['wheels/workmcp-<version>-py3-none-any.whl'])
+            + ([] if len(wheels) > len(ours) else ['wheels/<a dependency>.whl']))
+
+
 def verify_folder(folder: Path) -> Verification:
     sums = folder/SUMS
     if not sums.is_file():
@@ -136,6 +154,7 @@ def verify_folder(folder: Path) -> Verification:
             result.mismatch.append(name)
         else:
             result.ok += 1
+    result.missing += [f'{name} (required, not listed in {SUMS})' for name in unlisted_required(listed)]
     result.unlisted = [name for name in bundle_files(folder) if name not in listed]
     return result
 
@@ -176,9 +195,31 @@ def wheel_pin(filename: str) -> tuple[str, str]:
     return normalize(parts[0]), parts[1]
 
 
+# the platform a bundle is for (host_problem keeps make on it): environment markers are judged against it
+TARGET_MARKERS = {'sys_platform': 'win32', 'os_name': 'nt', 'platform_system': 'Windows', 'platform_machine': 'AMD64',
+                  'platform_python_implementation': 'CPython', 'implementation_name': 'cpython', 'python_version': '3.12'}
+
+
+def marker_applies(marker: str) -> bool | None:
+    """Whether an environment marker of the lock holds on the target platform: ``name ==|!= 'value'`` terms joined
+    by ``and``/``or`` (no parentheses; the lock has no other form). None when the marker has another form."""
+    any_alternative = False
+    for alternative in re.split(r'\s+or\s+', marker.strip()):
+        holds = True
+        for term in re.split(r'\s+and\s+', alternative):
+            match = re.fullmatch(r"\s*([a-z_]+)\s*(==|!=)\s*(['\"])([^'\"]*)\3\s*", term)
+            if match is None or match.group(1) not in TARGET_MARKERS:
+                return None
+            equal = TARGET_MARKERS[match.group(1)] == match.group(4)
+            holds = holds and (equal if match.group(2) == '==' else not equal)
+        any_alternative = any_alternative or holds
+    return any_alternative
+
+
 def check_wheels(wheels: Path, pins: dict[str, Pin]) -> list[str]:
-    """Every downloaded wheel is a pinned version with a hash from the lock; every pin without an environment
-    marker has its wheel. Returns the names of marker pins that have no wheel here (other platforms)."""
+    """Every downloaded wheel is a pinned version with a hash from the lock; every pin whose environment marker holds
+    on the target platform (or that has none, or one this tool cannot judge) has its wheel (review M6 v1 M6-11).
+    Returns the names of the pins without a wheel here whose marker does not hold (other platforms)."""
     seen = set()
     for path in sorted(wheels.glob('*.whl')):
         name, version = wheel_pin(path.name)
@@ -189,7 +230,7 @@ def check_wheels(wheels: Path, pins: dict[str, Pin]) -> list[str]:
             raise Problem(f'wheel hash not in the lock: {path.name}', EXIT_FAILED)
         seen.add(name)
     missing = [pin.name for pin in pins.values() if pin.name not in seen]
-    required = [name for name in missing if pins[name].marker is None]
+    required = [name for name in missing if pins[name].marker is None or marker_applies(pins[name].marker) is not False]
     if required:
         raise Problem(f'no wheel for: {", ".join(required)}', EXIT_FAILED)
     return missing
@@ -263,7 +304,7 @@ def run_step(label: str, command: list[str]) -> None:
 
 def export_commit(commit: str, folder: Path) -> Path:
     """``git archive`` of the commit as ``<folder>/src.zip`` (LF files stay LF); the wheel is built from its extraction."""
-    archive = folder/'src.zip'
+    archive = folder/SOURCE_ZIP
     git('-c', 'core.autocrlf=false', 'archive', '--format=zip', commit, '-o', str(archive))
     return archive
 
@@ -315,23 +356,31 @@ def build_model(model_from: Path, out: Path) -> Path:
     return target
 
 
-def install_text(version: str, commit: str, built: str, sums_sha256: str, wheels: int) -> str:
+def install_text(version: str, commit: str, built: str, wheels: int) -> str:
+    """``INSTALL.txt``. It is listed in ``SHA256SUMS`` and so never holds the SHA-256 of ``SHA256SUMS`` (review M6 v1
+    M6-10): that value comes from ``make``'s output, written down apart from the bundle."""
+    venv = 'C:\\Users\\<USER>\\workmcp\\.venv'
+    py = f'{venv}\\Scripts\\python.exe'
     return '\n'.join([
         f'workmcp offline bundle {version}  commit {commit}  built {built}  wheels {wheels}',
         '',
         'No admin rights needed. Python 3.12 (python.org per-user installer) is not part of this bundle.',
-        'Run in PowerShell, in this folder. Use a venv OUTSIDE it, e.g. C:\\Users\\<USER>\\workmcp\\.venv',
+        f'Run in PowerShell, in this folder. Use a venv OUTSIDE it, e.g. {venv}',
         '',
-        '1. python -I verify_bundle.py .                      (last line must read: ok N mismatch 0 missing 0 unlisted 0)',
-        f'2. certutil -hashfile SHA256SUMS SHA256               (must equal {sums_sha256})',
-        '3. py -3.12 -m venv C:\\Users\\<USER>\\workmcp\\.venv',
-        '4. C:\\Users\\<USER>\\workmcp\\.venv\\Scripts\\python.exe -I -m pip install --no-index --find-links wheels '
-        '--require-hashes -r requirements.lock.txt',
-        f'5. C:\\Users\\<USER>\\workmcp\\.venv\\Scripts\\python.exe -I -m pip install --no-index --find-links wheels '
-        f'--no-deps workmcp=={version}',
-        '6. C:\\Users\\<USER>\\workmcp\\.venv\\Scripts\\python.exe -I -m pip check',
-        '7. C:\\Users\\<USER>\\workmcp\\.venv\\Scripts\\python.exe -I -m workmcp setup --home C:\\Users\\<USER>\\Motive_work '
+        '1. certutil -hashfile SHA256SUMS SHA256          (must equal the SHA256SUMS value that "make_bundle.py make"',
+        '                                                 printed on the PC that built this bundle and that you wrote',
+        '                                                 down apart from it; this file does not hold it. Different: stop)',
+        '2. py -3.12 -I verify_bundle.py .                (last line must read: ok N mismatch 0 missing 0 unlisted 0)',
+        f'3. py -3.12 -m venv {venv}                       (first install only)',
+        f'4. {py} -I -m pip install --no-index --find-links wheels --require-hashes -r requirements.lock.txt',
+        f'5. {py} -I -m pip install --no-index --find-links wheels --force-reinstall --no-deps workmcp=={version}',
+        '   (--force-reinstall: replaces the workmcp code even when the installed version number is the same)',
+        f'6. {py} -I -m pip check',
+        f'7. {py} -I -m pip show workmcp                   (Version: {version})',
+        f'8. first install: {py} -I -m workmcp setup --home C:\\Users\\<USER>\\Motive_work '
         '--model-from <model bundle folder> --push-url https://<VPS_HOST>/workmcp',
+        f'   update:        {py} -I -m workmcp setup --home <data home> --upgrade, then workmcp push --dry-run',
+        '   (no scan, index or push may run during an update; a data home other than the default needs WORKMCP_HOME)',
         '',
         'Never turn pip hash checking off. src.zip is for the test diagnosis only; do not use its folder as the data home.',
         'Full guide: doc/guides/2026-10-29_회사PC-설치안내서_v1.md (in src.zip).',
@@ -402,15 +451,16 @@ def make(args) -> int:
     shutil.copyfile(Path(__file__).resolve(), folder/VERIFY_NAME)
     count = len(list(wheels.glob('*.whl')))
     built = datetime.now().strftime('%Y-%m-%d')
-    sums_sha256 = write_sums(folder)
-    (folder/INSTALL).write_text(install_text(version, commit[:8], built, sums_sha256, count), encoding='utf-8',
-                                newline='\n')
+    (folder/INSTALL).write_text(install_text(version, commit[:8], built, count), encoding='utf-8', newline='\n')
+    sums_sha256 = write_sums(folder)                    # INSTALL.txt is listed too
     result = verify_folder(folder)
     if not result.clean:
         raise Problem(f'the bundle did not verify: {result.summary()}', EXIT_FAILED)
     print(f'bundle: wheels {count} (lock pins {len(pins)}; no wheel here for marker pins: {", ".join(absent) or "none"}), '
           f'src.zip {megabytes(folder/"src.zip")} -> {folder} {megabytes(folder)}')
-    print(f'{SUMS} sha256 {sums_sha256}  (compare on the company PC with: certutil -hashfile {SUMS} SHA256)')
+    print(f'{SUMS} sha256 {sums_sha256}')
+    print(f'  write this value down now, apart from the bundle (it is not inside it); on the company PC compare it with:'
+          f' certutil -hashfile {SUMS} SHA256, before running anything from the bundle')
     if args.zip:
         target = out/f'{name}.zip'
         zip_folder(folder, target, compress=True)

@@ -56,16 +56,14 @@ Codex가 프로젝트 `.codex/config.toml`의 `mcp_servers`를 읽지 않으면 
 ### Claude Code
 
 1. **프로젝트 범위(이 저장소 폴더에서만):** `mcp-remote.json.example`을 `.mcp.json`으로 복사한다. 이 파일은 로컬 stdio용 `mcp.json.example`과 같은 이름 자리를 쓰므로 둘 중 하나만 둔다. `.mcp.json`은 `.gitignore`로 제외되어 커밋되지 않는다.
-2. **사용자 범위(어느 폴더에서나, 설계 §9.6의 기본):** 피터가 자기 터미널에서 실행한다(에이전트는 토큰을 보지 않는다).
+2. **사용자 범위(어느 폴더에서나, 설계 §9.6의 기본):** 피터가 사용자 환경변수 `WORKMCP_MCP_TOKEN`을 설정한 뒤, 새 PowerShell 창에서 실행한다(에이전트는 토큰을 보지 않는다).
 
-   ```
-   claude mcp add --scope user --transport http workmcp https://<VPS_HOST>/workmcp/mcp --header "Authorization: Bearer <MCP_TOKEN>"
+   ```powershell
+   claude mcp add --scope user --transport http workmcp https://<VPS_HOST>/workmcp/mcp --header "Authorization: Bearer $env:WORKMCP_MCP_TOKEN"
    claude mcp list
    ```
 
-   **[사실]** 이 명령형은 M5 F-1(2026-10-29)에서 실제로 동작했다(`doc/validation/2026-10-29_M5-원격연결확인_v1.md`). `claude`가 PATH에 없는 PC에서는 Claude 앱에 동봉된 `claude.exe`의 전체 경로로 실행한다. 토큰이 입력한 명령줄에 들어가므로 PowerShell 기록에 남는다. 등록이 끝나면 기록을 지우되, 아래 주의를 읽는다.
-
-   > **주의:** `Remove-Item (Get-PSReadLineOption).HistorySavePath`는 그 한 줄이 아니라 **PowerShell 명령 기록 파일 전체**를 지운다(이전에 쓴 명령도 모두 사라짐). 토큰이 남는 것이 싫으면 위 1번의 환경변수 방식(`${WORKMCP_MCP_TOKEN}`)을 쓴다.
+   **[사실]** 이 명령형(헤더 값만 다른 `--header "Authorization: Bearer ..."`)은 M5 F-1(2026-10-29)에서 실제로 동작했다(`doc/validation/2026-10-29_M5-원격연결확인_v1.md`). `claude`가 PATH에 없는 PC에서는 Claude 앱에 동봉된 `claude.exe`의 전체 경로로 실행한다. PowerShell이 실행 때 `$env:WORKMCP_MCP_TOKEN`을 펼치므로 **셸 기록에는 변수 이름만 남는다**(기록 파일을 지울 필요가 없다). 다만 Claude Code는 받은 헤더 값, 즉 **토큰 평문을 `%USERPROFILE%\.claude.json`에 저장한다**(Claude Code의 동작). 그 파일에도 두기 싫으면 위 1번의 프로젝트 `.mcp.json`(`${WORKMCP_MCP_TOKEN}`) 방식을 쓴다.
 3. 확인: `claude mcp list`에서 `workmcp`가 연결 상태인지, Code 탭에서 `status` 도구가 `role: server`를 돌려주는지 본다. 첫 의미 검색은 서버가 모델을 읽느라 수십 초 걸릴 수 있다.
 
 ### Codex

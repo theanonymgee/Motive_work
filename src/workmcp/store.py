@@ -372,7 +372,13 @@ DELIVERY_COLUMNS = ('at', 'client', 'tool', 'locator_json', 'chars')
 LOCK_NAME = 'scan.lock'
 INDEX_LOCK_NAME = 'index.lock'
 STALE_LOCK_AGE = timedelta(hours=24)
-LOCK_SETTLE_SECONDS = 0.2       # acquire_lock: after replacing a stale lock, wait and read it back
+# push.lock (held by ``push``; ``setup --upgrade`` takes it too): here, so that setup needs no import of push
+PUSH_LOCK_NAME = 'push.lock'
+PUSH_LOCK_STALE = timedelta(hours=6)  # a lock left by a killed push stops blocking after this long
+# acquire_lock: after replacing a stale lock, wait and read it back. Two runs that judged the same lock stale both
+# go on only if one of them is held up for longer than this between its last read of the stale lock and its
+# os.replace (no retry in between; review M6 v1 M6-4)
+LOCK_SETTLE_SECONDS = 1.0
 LOCK_IO_ATTEMPTS = 20           # Windows refuses for an instant a lock file another process has open
 LOCK_IO_WAIT_SECONDS = 0.01
 DEV_SCHEMA_HINT = ('development schema change: delete {db} and scan again (only before the first real install, '
@@ -582,22 +588,32 @@ def _lock_alive_at(path: Path, info: dict) -> datetime | None:
         return None
 
 
-def _replace_lock(path: Path, info: dict, nonce: str) -> None:
-    """Write ``info`` to a file of this run's own and move it over ``path`` in one step (``os.replace``): the
-    lock file is never missing in between, so no other run can create one meanwhile."""
+def _lock_temporary(path: Path, info: dict, nonce: str) -> Path:
+    """``info`` written to a file of this run's own next to ``path``, ready to be moved over it."""
     temporary = path.with_name(f'{path.name}.{nonce}.tmp')
     fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY)
     try:
         os.write(fd, json.dumps(info).encode())
     finally:
         os.close(fd)
+    return temporary
+
+
+def _remove_quietly(path: Path) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _replace_lock(path: Path, info: dict, nonce: str) -> None:
+    """Write ``info`` to a file of this run's own and move it over ``path`` in one step (``os.replace``): the
+    lock file is never missing in between, so no other run can create one meanwhile."""
+    temporary = _lock_temporary(path, info, nonce)
     try:
         _retry_io(lambda: os.replace(temporary, path))
     except OSError:
-        try:
-            os.remove(temporary)
-        except OSError:
-            pass
+        _remove_quietly(temporary)
         raise
 
 
@@ -609,11 +625,13 @@ def acquire_lock(home: Path, name: str, at: datetime | None = None, *, stale_aft
 
     A lock whose holder last showed it is alive (``heartbeat_at``, else ``started_at``, else the file time)
     more than ``stale_after`` ago (24 hours unless the caller says otherwise; ``push`` uses
-    ``push.PUSH_LOCK_STALE``) is taken over with a warning: replaced in one step, never removed and created
-    again, then read back after ``LOCK_SETTLE_SECONDS``. Of several runs that saw the same stale lock only the
-    one whose nonce it then holds goes on; the others raise like for a lock still alive: ``Locked``
-    (``ScanLocked`` for ``scan.lock``). ``scan`` holds ``scan.lock``, ``index`` holds ``index.lock`` (design
-    M2 §4.6), ``push`` holds ``push.lock`` and keeps it alive with ``touch_lock``."""
+    ``PUSH_LOCK_STALE``) is taken over with a warning: replaced in one step (one ``os.replace`` right after the
+    last read, without retry), never removed and created again, then read back after ``LOCK_SETTLE_SECONDS``.
+    Of several runs that saw the same stale lock only the one whose nonce it then holds goes on; the others
+    raise like for a lock still alive: ``Locked`` (``ScanLocked`` for ``scan.lock``). The rule fails only for a
+    run held up longer than ``LOCK_SETTLE_SECONDS`` between that read and its replace; ``push`` then notices at
+    its next request (``lock_held``). ``scan`` holds ``scan.lock``, ``index`` holds ``index.lock`` (design M2
+    §4.6), ``push`` holds ``push.lock`` and keeps it alive with ``touch_lock``."""
     path = lock_path(home, name)
     what = name.removesuffix('.lock')
     error = ScanLocked if name == LOCK_NAME else Locked
@@ -638,12 +656,23 @@ def acquire_lock(home: Path, name: str, at: datetime | None = None, *, stale_aft
         info = _lock_info(raw)
         holder = f"pid {info.get('pid')}, since {info.get('started_at')}" if info else 'unknown holder'
         alive = None if raw is None else _lock_alive_at(path, info)
-        if alive is None or at - alive <= stale_after or _lock_raw(path) != raw:
+        if alive is None or at - alive <= stale_after:
             raise error(f'another {what} is running ({holder}); if not, delete {path}')
+        # the replacement is written first, so that only one system call follows the last read of the stale lock
+        # (review M6 v1 M6-4): no retry and no wait between that read and os.replace
         try:
-            _replace_lock(path, mine, nonce)
+            temporary = _lock_temporary(path, mine, nonce)
         except OSError:
             raise error(f'another {what} is taking over the stale lock {path}') from None
+        try:
+            if _lock_raw(path) != raw:
+                raise error(f'another {what} is running ({holder}); if not, delete {path}')
+            try:
+                os.replace(temporary, path)
+            except OSError:                             # Windows: another run has the file open this instant
+                raise error(f'another {what} is taking over the stale lock {path}') from None
+        finally:
+            _remove_quietly(temporary)                  # gone after a replace; left only when refused
         time.sleep(LOCK_SETTLE_SECONDS)                 # a run that saw the same stale lock replaces it by now
         if _lock_info(_lock_raw(path)).get('nonce') != nonce:
             raise error(f'another {what} took over the stale lock {path}')
@@ -653,15 +682,27 @@ def acquire_lock(home: Path, name: str, at: datetime | None = None, *, stale_aft
     raise error(f'cannot take the {what} lock {path}')
 
 
+def _held_info(path: Path, nonce: str) -> dict | None:
+    try:
+        info = _lock_info(_retry_io(path.read_bytes))
+    except FileNotFoundError:
+        return None
+    return info if info.get('nonce') == nonce else None
+
+
+def lock_held(path: Path, nonce: str) -> bool:
+    """Whether the lock still holds this run's ``nonce`` (one read, no write): False when it is gone or holds
+    another nonce (another run took it over); ``OSError`` when it cannot be read now. ``push`` asks this before
+    every request (review M6 v1 M6-4) and writes ``heartbeat_at`` only every few minutes (``touch_lock``)."""
+    return _held_info(path, nonce) is not None
+
+
 def touch_lock(path: Path, nonce: str, at: datetime | None = None) -> bool:
     """Write ``heartbeat_at`` (``at`` or now) into the lock this run holds (``nonce``), so that it never looks
     stale while the run lives. False when the lock is gone or holds another nonce (another run took it over);
     ``OSError`` when it cannot be read or written now (the caller tries again later)."""
-    try:
-        info = _lock_info(_retry_io(path.read_bytes))
-    except FileNotFoundError:
-        return False
-    if info.get('nonce') != nonce:
+    info = _held_info(path, nonce)
+    if info is None:
         return False
     _replace_lock(path, {**info, 'heartbeat_at': (at or lock_now()).isoformat(timespec='seconds')}, nonce)
     return True

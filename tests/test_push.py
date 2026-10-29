@@ -895,6 +895,54 @@ def test_a_live_push_keeps_its_lock_and_one_taken_over_stops(pair, monkeypatch):
     mirrored(col, server, collector)
 
 
+def test_a_push_checks_its_lock_before_every_request_and_writes_it_every_few_minutes(pair, monkeypatch):
+    """Review M6 v1 M6-4: a push whose lock another run took over stops at its very next request even when the
+    heartbeat interval has not passed (one read per request); the lock is written when it is taken and then only
+    every ``PUSH_LOCK_HEARTBEAT`` (tests/test_push.py::test_a_live_push_keeps_its_lock_and_one_taken_over_stops)."""
+    col, server, collector = pair
+    lock_file = col.home/push.PUSH_LOCK
+    writes, reads = [], []
+    real_touch, real_held = store.touch_lock, store.lock_held
+    monkeypatch.setattr(store, 'touch_lock', lambda *a, **k: writes.append(1) or real_touch(*a, **k))
+    monkeypatch.setattr(store, 'lock_held', lambda *a, **k: reads.append(1) or real_held(*a, **k))
+    done = col.push(server, collector)
+    assert done['exit_code'] == 0 and done['converged'] and done['warning'] is None, done
+    requests = done['batches'] + done['state_requests']
+    assert writes == [] and len(reads) == requests          # a short run: the lock written at start is read only
+    writes.clear(), reads.clear()
+
+    (col.src/'takeover-now.txt').write_text('합성 즉시 잠금 인수 시험 문장\n', encoding='utf-8')
+    col.collect()
+    foreign = {'pid': 1, 'started_at': store.now(), 'heartbeat_at': store.now(), 'nonce': 'e' * 16}
+
+    def taken_over(method, name, body, call):
+        if body is not None and body['kind'] == 'begin':
+            lock_file.write_text(json.dumps(foreign), encoding='utf-8')       # no clock jump: within the interval
+        return call()
+    server.hook = taken_over
+    stopped = col.push(server, collector)
+    server.hook = None
+    assert stopped['exit_code'] == push.EXIT_LOCKED and 'another push took over' in stopped['error'], stopped
+    assert stopped['batches'] == 1 and writes == [] and stopped['warning'] is None   # begin went, nothing after
+    assert json.loads(lock_file.read_text(encoding='utf-8'))['nonce'] == 'e' * 16    # left to its holder
+    lock_file.unlink()
+    final = col.push(server, collector)
+    assert final['exit_code'] == 0 and final['converged']
+
+
+def test_a_lock_that_could_not_be_removed_is_reported(pair, monkeypatch):
+    """Review M6 v1 M6-4: when the lock of this run cannot be removed at the end (unreadable at that instant),
+    the report says so instead of leaving the next push to exit 3 without a word."""
+    col, server, collector = pair
+    monkeypatch.setattr(store, 'release_lock', lambda path, nonce=None: False)
+    report = col.push(server, collector)
+    assert report['exit_code'] == 0 and 'was not removed' in report['warning'], report
+    assert any('was not removed' in line for line in push.report_lines(report))
+    assert (col.home/push.PUSH_LOCK).exists()
+    monkeypatch.undo()
+    (col.home/push.PUSH_LOCK).unlink()
+
+
 # ---- review v3 V3-6: a version refused at the units step does not stop the run ---------------------------------
 
 LONG_LINE = 'long-line.txt'

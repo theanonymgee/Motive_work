@@ -70,15 +70,16 @@ py -3.12 -m venv .venv
 회사 네트워크가 저장소·PyPI·모델 다운로드를 막을 때 씁니다. 묶음은 다른 PC에서 `tools/make_bundle.py`로 만듭니다(휠, `requirements.lock.txt` 사본, `SHA256SUMS`, 검증 스크립트, 모델은 별도 폴더). 묶음 폴더 안의 `INSTALL.txt`가 설치 명령 전부입니다. 요지는 다음과 같습니다.
 
 ```powershell
-python -I verify_bundle.py .                      # ok N mismatch 0 missing 0 unlisted 0 이어야 함
+certutil -hashfile SHA256SUMS SHA256              # 묶음을 만든 PC에서 make가 출력한 값(묶음과 따로 적어 온 값)과 같아야 함
+py -3.12 -I verify_bundle.py .                    # ok N mismatch 0 missing 0 unlisted 0 이어야 함
 py -3.12 -m venv "$env:USERPROFILE\workmcp\.venv"
 $py = "$env:USERPROFILE\workmcp\.venv\Scripts\python.exe"
 & $py -I -m pip install --no-index --find-links wheels --require-hashes -r requirements.lock.txt
-& $py -I -m pip install --no-index --find-links wheels --no-deps workmcp==0.0.1
+& $py -I -m pip install --no-index --find-links wheels --force-reinstall --no-deps workmcp==<버전>
 & $py -I -m workmcp setup --home "$env:USERPROFILE\Motive_work" --model-from <모델 묶음 폴더> --push-url https://<VPS_HOST>/workmcp
 ```
 
-해시 검사(`--require-hashes`, `verify_bundle.py`)는 끄지 않습니다.
+해시 검사(`--require-hashes`, `verify_bundle.py`)는 끄지 않습니다. `<버전>`은 묶음 폴더 이름(`workmcp-bundle-<버전>-...`)의 버전입니다. `--force-reinstall --no-deps`는 workmcp 휠만 다시 설치해, 업데이트 때 같은 버전 번호가 이미 설치돼 있어도 코드가 확실히 바뀌게 합니다.
 
 ### setup
 
@@ -93,6 +94,12 @@ workmcp setup --home PATH
 ```
 
 `--dry-run`으로 무엇을 할지 먼저 봅니다. `--push-url`은 https만 받고, MCP 주소는 `<push-url>/mcp`입니다. push 토큰은 서버에서 한 번 발급받아 `<데이터 홈>\push.token`에 한 줄로 적거나 환경변수 `WORKMCP_PUSH_TOKEN`에 둡니다.
+
+`--home`이 기본(`%USERPROFILE%\Motive_work`)이 아니면 이후의 `scan`·`index`·`push`와 작업 스케줄러는 그 홈을 사용자 환경변수 `WORKMCP_HOME`으로만 찾습니다. `setup`이 그 경우 아래 줄을 출력하니 한 번 실행하고 새 PowerShell 창을 엽니다(관리자 권한 불필요; 또는 "계정의 환경 변수 편집"). `doctor`의 `data home:` 줄 끝에 홈의 출처(`from WORKMCP_HOME` / `default, WORKMCP_HOME not set`)가 나옵니다.
+
+```powershell
+[Environment]::SetEnvironmentVariable('WORKMCP_HOME', 'D:\Motive_work', 'User')
+```
 
 ## 사용 (수집기)
 
@@ -123,16 +130,18 @@ $wm = ".venv\Scripts\python.exe"
 
 ## 클라이언트 연결
 
-운영 서버의 **mcp 토큰**을 씁니다(push 토큰은 MCP 경로에서 거부됩니다). `setup`이 아래와 같은 명령을 출력하면 사용자가 자기 터미널에서 실행합니다.
+운영 서버의 **mcp 토큰**을 씁니다(push 토큰은 MCP 경로에서 거부됩니다). 먼저 토큰을 사용자 환경변수 `WORKMCP_MCP_TOKEN`에 넣고("계정의 환경 변수 편집", 관리자 권한 불필요) 새 PowerShell 창을 엽니다. `setup`이 아래와 같은 명령을 출력하면 사용자가 자기 터미널에서 실행합니다.
 
 ```powershell
-# Claude Code (토큰이 입력한 명령줄에 남으므로, 등록 뒤 셸 기록을 정리하세요)
-claude mcp add --transport http --scope user workmcp https://<VPS_HOST>/workmcp/mcp --header "Authorization: Bearer <MCP_TOKEN>"
+# Claude Code: PowerShell이 실행 때 $env:WORKMCP_MCP_TOKEN 을 펼치므로 셸 기록에는 변수 이름만 남습니다
+claude mcp add --transport http --scope user workmcp https://<VPS_HOST>/workmcp/mcp --header "Authorization: Bearer $env:WORKMCP_MCP_TOKEN"
 
-# Codex (토큰은 사용자 환경변수 WORKMCP_MCP_TOKEN 에만 둡니다)
+# Codex: 토큰은 환경변수에만 있고 Codex가 실행 때 읽습니다
 codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-var WORKMCP_MCP_TOKEN
 # 그리고 %USERPROFILE%\.codex\config.toml 의 [mcp_servers.workmcp] 에 startup_timeout_sec = 30, tool_timeout_sec = 120 추가
 ```
+
+Claude Code는 등록 때 받은 헤더 값(토큰 평문)을 `%USERPROFILE%\.claude.json`에 저장합니다. Claude Code의 동작이므로, 그 파일을 공유·동기화하지 마세요.
 
 설정 템플릿(로컬 stdio, 원격 HTTP, Codex)은 [doc/examples/](doc/examples/)에 있습니다. 연결한 뒤 각 클라이언트에서 `status` 도구를 불러 `role: server`를 확인합니다.
 
@@ -141,7 +150,8 @@ codex mcp add workmcp --url https://<VPS_HOST>/workmcp/mcp --bearer-token-env-va
 **서버 먼저, 수집기 나중.** 프로토콜·스키마·청크 버전이 다르면 `push`가 안전하게 거절됩니다(종료 코드 4, "update the server first").
 
 1. 서버: 새 코드 반입 → `pip install --no-deps` → `systemctl stop workmcp` → `workmcp setup --home <홈> --upgrade`(백업·마이그레이션·doctor) → `systemctl start workmcp`. 절차는 [VPS 배포 절차서](doc/guides/2026-10-26_VPS-배포절차서_v1.md).
-2. 수집기: `scan`·`index`·`push`가 돌고 있지 않은지 확인 → `git pull` 또는 새 묶음 → 의존성이 바뀌었으면 `pip install --require-hashes -r requirements.lock.txt` → `pip install --no-deps` → `workmcp setup --home <홈> --upgrade` → `push --dry-run`.
+2. 수집기: `scan`·`index`·`push`가 돌고 있지 않은지 확인 → `git pull` 또는 새 묶음(`certutil` 대조 → `verify_bundle.py`) → 의존성이 바뀌었으면 `pip install --require-hashes -r requirements.lock.txt` → 온라인 `pip install --no-deps .` / 오프라인 `pip install --no-index --find-links wheels --force-reinstall --no-deps workmcp==<버전>` → `pip show workmcp`로 버전 확인 → `workmcp setup --home <홈> --upgrade` → `push --dry-run`.
+   릴리스마다 `pyproject.toml`의 `version`과 `workmcp.__version__`을 함께 올립니다(테스트가 같은 값인지 확인).
 3. 서버를 재시작했으면 MCP 클라이언트 세션을 새로 엽니다(도구 목록은 세션 시작 때 정해집니다).
 
 ## 테스트

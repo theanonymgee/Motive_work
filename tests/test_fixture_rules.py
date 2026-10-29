@@ -68,7 +68,7 @@ REPO = TESTS.parent
 DEPLOY_FILES = sorted((REPO/'tools'/'deploy').glob('*')) + [REPO/'tools'/'vps_survey.sh']
 EXAMPLE_FILES = [p for p in sorted((REPO/'doc'/'examples').glob('*')) if p.is_file()]
 GUIDE_FILES = sorted((REPO/'doc'/'guides').glob('*.md'))
-SHIPPED_FILES = DEPLOY_FILES + EXAMPLE_FILES + GUIDE_FILES
+SHIPPED_FILES = DEPLOY_FILES + EXAMPLE_FILES + GUIDE_FILES + [REPO/'README.md']   # README: design M6 §4.1, M6-14
 
 SECRET_PATTERNS = {
     'private key block': re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----'),
@@ -80,9 +80,9 @@ SECRET_PATTERNS = {
 # a urlsafe token as `secrets.token_urlsafe(32)` makes it: 43 characters with upper, lower and digits
 TOKEN_SHAPE = re.compile(r'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])')
 BEARER_VALUE = re.compile(r'Bearer\s+(\S+)')
-# `$(cat <file>)` reads the token from a file at run time (guide step F-1 as run); BEARER_VALUE stops at the
-# space, so the value seen is `$(cat`
-BEARER_PLACEHOLDER = re.compile(r'^(?:<[^>]+>|\$\{[A-Za-z_]+\}|\$[A-Za-z_]+|\$\(cat$|%s|invalid-test-value|\.\.\.)')
+# placeholders only: `<NAME>`, `${VAR}`, `$VAR` and `$env:VAR` (PowerShell expands a user variable), `%s`; review M6
+# v1 M6-14 took back `$(cat`, which no tracked file uses any more
+BEARER_PLACEHOLDER = re.compile(r'^(?:<[^>]+>|\$\{[A-Za-z_]+\}|\$[A-Za-z_]+|%s|invalid-test-value|\.\.\.)')
 PERSONAL_PATTERNS = {
     'Windows user path with a real name': re.compile(r'(?i)[A-Z]:\\Users\\(?!<USER>|Public\b|Default\b)[^\\\s<]+'),
     'macOS user path': re.compile(r'/Users/[^/\s<]+'),
@@ -242,6 +242,8 @@ def test_secret_checks_catch_known_bad_values():
     assert BEARER_VALUE.search('Authorization: Bearer ' + token).group(1) == token
     assert not BEARER_PLACEHOLDER.match(token)
     assert BEARER_PLACEHOLDER.match('<MCP_TOKEN>') and BEARER_PLACEHOLDER.match('${WORKMCP_MCP_TOKEN}')
+    assert BEARER_PLACEHOLDER.match('$env:WORKMCP_MCP_TOKEN"')
+    assert not BEARER_PLACEHOLDER.match('$(cat')                               # review M6 v1 M6-14: taken back
     assert SECRET_PATTERNS['password-like assignment with a value'].search('password = hunter2hunter2')
     assert not SECRET_PATTERNS['password-like assignment with a value'].search('password: <redacted>')
     assert SECRET_PATTERNS['provider key (sk-/ghp_/hf_/xox/AKIA)'].search('hf_' + 'a' * 34)

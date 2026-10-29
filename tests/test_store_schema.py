@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -709,6 +710,64 @@ def test_two_runs_that_see_the_same_stale_lock_take_it_once(tmp_path, monkeypatc
         assert store.release_lock(home/'push.lock', won[0]) is True
         assert sorted(p.name for p in home.iterdir() if p.name.startswith('push.lock')) == []   # no temporary left
         monkeypatch.setattr(store, '_lock_alive_at', real_alive_at)
+
+
+def test_a_run_held_up_between_its_last_read_and_its_replace_still_leaves_one_holder(tmp_path, monkeypatch):
+    """Review M6 v1 M6-4 (probe LR): both runs judge the lock stale, then one of them is held up for 0.35 s right
+    after its last read of the stale lock (the old settle time 0.2 s + 0.15 s), before its ``os.replace``. Before
+    the fix both went on; now the settle time is longer than such a delay and nothing waits between that read and
+    the replace, so exactly one run holds the lock."""
+    assert store.LOCK_SETTLE_SECONDS >= 1.0
+    home = lock_home(tmp_path)
+    old = datetime.now().astimezone() - timedelta(hours=7)
+    (home/'push.lock').write_text(json.dumps({'pid': 1, 'started_at': old.isoformat(timespec='seconds')}),
+                                  encoding='utf-8')
+    barrier = threading.Barrier(2)
+    real_alive_at, real_raw = store._lock_alive_at, store._lock_raw
+    reads: dict[str, int] = {}
+
+    def judged(path, info):
+        at = real_alive_at(path, info)
+        barrier.wait(timeout=10)
+        return at
+
+    def raw(path):
+        name = threading.current_thread().name
+        reads[name] = reads.get(name, 0) + 1
+        value = real_raw(path)
+        if name == 'late' and reads[name] == 2:      # its last read before the replace
+            time.sleep(0.35)
+        return value
+    monkeypatch.setattr(store, '_lock_alive_at', judged)
+    monkeypatch.setattr(store, '_lock_raw', raw)
+    results = {}
+
+    def run(nonce):
+        try:
+            results[nonce] = store.acquire_lock(home, 'push.lock', stale_after=SIX_HOURS, nonce=nonce)
+        except store.Locked as exc:
+            results[nonce] = exc
+        except BaseException as exc:
+            results[nonce] = ('unexpected', repr(exc))
+    threads = [threading.Thread(target=run, args=('a' * 16,), name='early'),
+               threading.Thread(target=run, args=('b' * 16,), name='late')]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    won = [nonce for nonce, result in results.items() if isinstance(result, tuple) and isinstance(result[0], Path)]
+    assert len(results) == 2 and len(won) == 1, results
+    assert json.loads((home/'push.lock').read_text(encoding='utf-8'))['nonce'] == won[0]
+    assert [p.name for p in home.iterdir() if p.name.endswith('.tmp')] == []
+
+
+def test_lock_held_reads_and_never_writes(tmp_path):
+    home = lock_home(tmp_path)
+    lock, _ = store.acquire_lock(home, 'push.lock', nonce='a' * 16)
+    before = lock.read_bytes(), lock.stat().st_mtime_ns
+    assert store.lock_held(lock, 'a' * 16) is True and store.lock_held(lock, 'b' * 16) is False
+    assert (lock.read_bytes(), lock.stat().st_mtime_ns) == before
+    assert store.release_lock(lock, 'a' * 16) and store.lock_held(lock, 'a' * 16) is False
 
 
 def test_a_touched_lock_does_not_look_stale(tmp_path):

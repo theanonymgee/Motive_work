@@ -531,8 +531,8 @@ def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Seq
     unit, ``units[]`` with the chunk's range in each unit (at most ``UNITS_CAP``; ``snippet.cover``
     computes the ranges, the same function ``get_snippet`` uses).
 
-    A chunk is returned only if it is still eligible now (latest active version, current chunk rules)
-    and, when ``expected`` names a text hash for it, still holds that text (review M2-1: a candidate
+    A chunk is returned only if it is still eligible now (latest active version not in progress on the
+    operating server, current chunk rules; ``store.latest_chunks_sql``, review M6 v1 M6-5) and, when ``expected`` names a text hash for it, still holds that text (review M2-1: a candidate
     from an older mapping, or a chunk id reused since, never becomes a hit).
 
     ``collapse`` (design M3 §2.2): only the first hit of each document; the hits skipped for that are
@@ -544,6 +544,7 @@ def _hits(db: sqlite3.Connection, ranked: Sequence[tuple[int, dict]], terms: Seq
                       'v.sha256, v.observed_at, d.id, d.path, d.ext, c.text_sha256 FROM chunks c '
                       'JOIN versions v ON v.id = c.version_id JOIN documents d ON d.id = v.document_id '
                       f'WHERE c.id IN ({",".join("?" * len(ids))}) AND {store.ELIGIBLE_VERSIONS} '
+                      f'AND v.id NOT IN ({store.IN_PROGRESS_SQL}) '      # the same rule as the candidates (M6-5)
                       'AND c.chunk_version = ?', [*ids, chunks.CHUNK_VERSION]).fetchall()
     by_id = {row[0]: row for row in rows}
     expected = expected or {}

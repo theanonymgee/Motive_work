@@ -82,6 +82,32 @@ def test_a_version_in_progress_is_no_search_candidate_until_its_last_part(cut_af
     assert binding.verify(server.db, stored_only=True)['ok']
 
 
+def test_a_candidate_of_a_version_in_progress_never_becomes_a_hit(cut_after_two_parts):
+    """Review M6 v1 M6-5: the re-check of ``search._hits`` uses the in-progress rule too, so a candidate that came
+    from elsewhere (a vector cache mapping left from before, a reused chunk id with the same text) is no hit while
+    its version is in progress. Here a finished version is marked in progress again by hand (its units are all
+    there, so only the condition can keep it out)."""
+    col, server, collector = cut_after_two_parts[:3]
+    final = col.push(server, collector)
+    assert final['exit_code'] == 0 and final['converged'], final
+    db = server.db
+    (version_id, local), = db.execute(
+        "SELECT m.version_id, m.local_version_id FROM collector_versions m JOIN versions v ON v.id = m.version_id "
+        "JOIN documents d ON d.id = v.document_id WHERE d.path LIKE '%big.txt' AND v.superseded_at IS NULL").fetchall()
+    ranked = [(row[0], {'lexical': 1.0}) for row in db.execute(
+        'SELECT id FROM chunks WHERE version_id = ? AND chunk_version = ? ORDER BY id LIMIT 3',
+        (version_id, chunks.CHUNK_VERSION))]
+    assert ranked and len(search_module._hits(db, ranked, [QUERY])) == len(ranked)     # eligible and complete
+    push_id = db.execute('SELECT MAX(id) FROM pushes').fetchone()[0]
+    db.execute('INSERT INTO push_parts(push_id, local_version_id, part, parts, body_json, received_at) '
+               "VALUES (?, ?, ?, 3, '{}', '2026-10-29T00:00:00+09:00')", (push_id, local, store.PROGRESS_PART))
+    try:
+        assert search_module._hits(db, ranked, [QUERY]) == []
+    finally:
+        db.execute('DELETE FROM push_parts WHERE push_id = ? AND local_version_id = ?', (push_id, local))
+    assert len(search_module._hits(db, ranked, [QUERY])) == len(ranked)
+
+
 def test_verify_stored_finds_no_mismatch_while_a_version_is_in_progress(cut_after_two_parts):
     """Design M6 v1 §1.2: ``verify --stored`` counts a version in progress as unverifiable (``in_progress``),
     not as a mismatch; the CLI line and notice say so."""

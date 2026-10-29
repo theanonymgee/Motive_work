@@ -122,6 +122,9 @@ PACKAGE_IMPORT_BANS = {
     'sync.py': frozenset({'push', 'receive', 'remote', 'collect', 'parsers', 'binding', 'server', 'tools', 'setup',
                           'config'}),
     'remote.py': frozenset({'push', 'collect', 'parsers', 'setup'}),
+    # setup (design M6 §2.6-9): models, paths, config, store, sync only; the push lock constants live in store
+    # (review M6 v1 M6-13), so neither the sender nor the server side is reachable from it
+    'setup.py': frozenset({'push', 'receive', 'remote', 'server', 'tools', 'cli', 'collect', 'parsers', 'binding'}),
 }
 # push.py: destinations come from config only (no URL literal) and no file is opened (the token comes through
 # paths.read_token, the store through store.open_read).
@@ -969,6 +972,10 @@ M5_REMOTE_MORE_CONTROLS = [
     ('sync.py', 'def f():\n    import urllib.request'),
     ('sync.py', 'import socket'),
     ('models.py', 'import gzip'),
+    ('setup.py', 'from . import push'),                                               # review M6 v1 M6-13
+    ('setup.py', 'from .push import PUSH_LOCK'),
+    ('setup.py', 'from . import remote'),
+    ('setup.py', 'from . import receive'),
 ]
 
 

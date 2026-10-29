@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import config, models, paths, push, store, sync
+from . import config, models, paths, store, sync
 
 EXIT_OK, EXIT_FAILED, EXIT_HOME, EXIT_LOCKED, EXIT_USAGE = 0, 1, 2, 3, 4
 MODEL_CHOICES = ('download', 'none')
@@ -43,7 +43,10 @@ CLIENTS = ('claude', 'codex')
 NO_CLIENTS = 'none'          # --clients none: no registration step (design M6 §2.2)
 SERVER_NAME = 'workmcp'      # the MCP server name in both clients
 MCP_TOKEN_ENV = 'WORKMCP_MCP_TOKEN'
-MCP_TOKEN_PLACEHOLDER = '<MCP_TOKEN>'   # printed in place of the token, which setup never sees
+MCP_TOKEN_PLACEHOLDER = '<MCP_TOKEN>'   # the token in documents, which setup never sees
+# the token in the printed Claude Code line: PowerShell expands the user variable when the line runs, so the shell
+# history keeps only the variable's name (review M6 v1 M6-3); Claude Code then stores the expanded header
+MCP_TOKEN_SHELL = f'$env:{MCP_TOKEN_ENV}'
 SERVE_ARGS = ('-I', '-m', 'workmcp', 'serve')
 
 # apply()/plan() result: {'exit_code': int, 'dry_run': bool, 'home': str | None, 'steps': {step: {...}}}.
@@ -190,7 +193,8 @@ def _quoted(text: str) -> str:
 def client_commands(home: Path, python: str, clients: tuple[str, ...], url: str | None = None) -> list[str]:
     """User-scope registration lines, printed and never run. ``url`` None: the local stdio server
     (``python -I -m workmcp serve`` with ``WORKMCP_HOME``); else the remote MCP endpoint (collector role):
-    Claude Code with a ``<MCP_TOKEN>`` placeholder header, Codex with ``--bearer-token-env-var``."""
+    Claude Code with the header ``Bearer $env:WORKMCP_MCP_TOKEN`` (PowerShell expands it; review M6 v1 M6-3),
+    Codex with ``--bearer-token-env-var``. Neither line holds the token."""
     lines = []
     if url is None:
         serve = ' '.join([_quoted(python), *SERVE_ARGS])
@@ -202,7 +206,7 @@ def client_commands(home: Path, python: str, clients: tuple[str, ...], url: str 
         return lines
     if 'claude' in clients:
         lines.append(f'claude mcp add --transport http --scope user {SERVER_NAME} {url} '
-                     f'--header "Authorization: Bearer {MCP_TOKEN_PLACEHOLDER}"')
+                     f'--header "Authorization: Bearer {MCP_TOKEN_SHELL}"')
     if 'codex' in clients:
         lines.append(f'codex mcp add {SERVER_NAME} --url {url} --bearer-token-env-var {MCP_TOKEN_ENV}')
     return lines
@@ -331,6 +335,7 @@ class _Setup:
         self.python = python or sys.executable
         self.commands = commands or {}
         self.home: Path | None = None
+        self.home_env_needed = False            # WORKMCP_HOME does not name this home yet (home_env_lines)
         self.repo = paths.find_repo_root()
         self.steps = {step: {'status': 'skipped', 'changed': False, 'lines': [],
                              'detail': dict.fromkeys(STEP_DETAIL_KEYS[step])} for step in STEPS}
@@ -377,10 +382,13 @@ class _Setup:
         if self.options.upgrade:
             self.log(f'setup {verb} (exit {code})')
             return
-        collector = self.steps['config']['detail']['push_url']
-        following = ('write the push token, then: workmcp scan -> workmcp index -> workmcp push --dry-run -> '
-                     'workmcp push' if collector else 'workmcp scan -> workmcp index, then register the clients')
-        self.log(f'setup {verb} (exit {code}). next: {following}')
+        detail = self.steps['config']['detail']
+        first = [f'set {paths.HOME_ENV} (above)'] if self.home_env_needed else []
+        if detail['push_url'] and detail['push_token'] == 'missing':    # review M6 v1 M6-18: only when missing
+            first.append('write the push token')
+        following = ('workmcp scan -> workmcp index -> workmcp push --dry-run -> workmcp push' if detail['push_url']
+                     else 'workmcp scan -> workmcp index, then register the clients')
+        self.log(f'setup {verb} (exit {code}). next: ' + (f'{", ".join(first)}, then: ' if first else '') + following)
 
     # home ------------------------------------------------------------------------------------------------
     def check_home(self) -> None:
@@ -414,8 +422,36 @@ class _Setup:
             paths.ensure_home(home)
             state, status = ('created' if missing else 'exists'), 'done'
         lines.insert(0, f'data home: {home} (rules ok; {state})')
+        if not self.options.upgrade:
+            lines += self.home_env_lines(home)
         self.record('home', status, lines, changed=missing, path=str(home), created=missing and not self.dry_run,
                     under_appdata=self.steps['home']['detail']['under_appdata'])
+
+    def home_env_lines(self, home: Path) -> list[str]:
+        """Review M6 v1 M6-2: ``scan``, ``index``, ``push`` and scheduled tasks find a data home other than the
+        default only through ``WORKMCP_HOME``; say how to set it as a user variable (no admin) when it is not
+        set to this home. Sets ``self.home_env_needed``; nothing is written."""
+        def same(a: str, b: str) -> bool:
+            return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+        try:
+            default = str(paths.validate_home(None, self.env, self.repo))   # %USERPROFILE%\Motive_work
+        except paths.DataPathError:
+            default = None
+        current = self.env.get(paths.HOME_ENV)
+        if current and same(current, str(home)):
+            return [f'{paths.HOME_ENV}: set to this data home']
+        if not current and default is not None and same(default, str(home)):
+            return []                                   # the default home: found without the variable
+        self.home_env_needed = True
+        quoted = str(home).replace("'", "''")
+        head = (f'{paths.HOME_ENV}: set to another folder ({current}); scan, index and push would use that one'
+                if current else
+                f'{paths.HOME_ENV}: this data home is not the default ({default or "unknown"}); scan, index, push and '
+                f'scheduled tasks find it only through the user environment variable {paths.HOME_ENV}')
+        return [head, '  set it once (no admin) in PowerShell, then open a new terminal; setup does not set it:',
+                f"    [Environment]::SetEnvironmentVariable('{paths.HOME_ENV}', '{quoted}', 'User')",
+                f'  or Windows settings > "Edit environment variables for your account" > New: '
+                f'{paths.HOME_ENV} = {home}']
 
     # inputs, checked before anything is written ----------------------------------------------------------
     def check_inputs(self):
@@ -437,10 +473,22 @@ class _Setup:
             self.record('model', 'refused', [f'--model-from is not an existing folder: {options.model_from}'],
                         name=models.DEFAULT_MODEL, choice='from')
             raise _Refused(EXIT_USAGE)
-        if options.scope == 'project' and options.clients != (NO_CLIENTS,) and not Path(options.project).is_dir():
-            self.record('clients', 'refused', [f'--project is not an existing folder: {options.project}'],
-                        scope='project')
-            raise _Refused(EXIT_USAGE)
+        if options.scope == 'project' and options.clients != (NO_CLIENTS,):
+            if not Path(options.project).is_dir():
+                self.record('clients', 'refused', [f'--project is not an existing folder: {options.project}'],
+                            scope='project')
+                raise _Refused(EXIT_USAGE)
+            # review M6 v1 M6-17: the two project files never land in a folder the collector reads
+            project = Path(options.project).resolve()
+            written = existing.sources if existing is not None else ()
+            roots = [check.spec.path for check in checks] + [
+                Path(os.path.abspath(paths._strip_long_prefix(entry.raw))) for entry in written]
+            if (root := next((root for root in roots if paths._within(project, root)), None)) is not None:
+                self.record('clients', 'refused', [
+                    f'--project {project} lies inside the source root {root}: the next scan would collect the '
+                    f'.mcp.json and .codex files written there; choose a project folder outside the source roots'],
+                    scope='project')
+                raise _Refused(EXIT_USAGE)
         return [check.spec for check in checks], existing
 
     # config ----------------------------------------------------------------------------------------------
@@ -449,6 +497,8 @@ class _Setup:
         file = config.config_file(home)
         model = config.NO_MODEL if options.model == 'none' else models.DEFAULT_MODEL
         warnings = [f'  {warning}' for spec in specs for warning in spec.warnings]
+        warnings += [f'  source {spec.raw} is written as the folder it resolves to: {spec.path}' for spec in specs
+                     if os.path.normcase(os.path.abspath(paths._strip_long_prefix(spec.raw))) != spec.key]
         if existing is None:
             sources = [str(spec.path) for spec in specs]
             text = config_template(tuple(sources), model, options.push_url)
@@ -466,10 +516,19 @@ class _Setup:
             lines += warnings
             missing, written, model_in_file = [], True, model
         else:
-            # abspath, not resolve: an existing network entry is compared without touching the network
-            keys = {os.path.normcase(os.path.abspath(paths._strip_long_prefix(entry.raw)))
-                    for entry in existing.sources}
-            missing = [str(spec.path) for spec in specs if spec.key not in keys]
+            # an existing entry as written and, when local, resolved like --source (junctions, 8.3 names; review
+            # M6 v1 M6-16); a network entry only as written, so the comparison never touches the network
+            keys = set()
+            for entry in existing.sources:
+                raw = paths._strip_long_prefix(entry.raw)
+                keys.add(os.path.normcase(os.path.abspath(raw)))
+                if not paths._is_unc(raw):
+                    try:
+                        keys.add(os.path.normcase(str(Path(raw).resolve())))
+                    except OSError:
+                        pass
+            missing = [str(spec.path) for spec in specs if spec.key not in keys
+                       and os.path.normcase(os.path.abspath(paths._strip_long_prefix(spec.raw))) not in keys]
             add = [line for source in missing for line in ('[[sources]]', f'path = {toml_string(source)}')]
             push_url = existing.push.url
             notes = []
@@ -604,22 +663,21 @@ class _Setup:
             for client in clients:
                 lines.append(f'  {by_client[client]}')
             return lines + ['  # check: claude mcp list / codex mcp list']
+        lines.append(f'  # first set the user environment variable {MCP_TOKEN_ENV} to the mcp token the server printed '
+                     f'once (no admin): Windows settings > "Edit environment variables for your account" > New, '
+                     f'then open a new PowerShell')
         if 'claude' in by_client:
-            lines += [f'  # Claude Code: {MCP_TOKEN_PLACEHOLDER} is the mcp token the server printed once',
+            lines += [f'  # Claude Code (PowerShell): {MCP_TOKEN_SHELL} is expanded when the line runs, so your shell '
+                      f'history keeps only the variable name',
                       f'  {by_client["claude"]}',
-                      '  #   the token lands in your shell history: clear it afterwards, e.g. PowerShell: '
-                      'Remove-Item (Get-PSReadLineOption).HistorySavePath',
-                      f'  #   without the token on a command line: --scope project writes .mcp.json with '
-                      f'"Bearer ${{{MCP_TOKEN_ENV}}}"']
+                      r'  #   Claude Code stores the expanded header, the token itself, in %USERPROFILE%\.claude.json']
         if 'codex' in by_client:
             lines += [f'  # Codex: the token stays in the environment variable {MCP_TOKEN_ENV}, never on the '
                       f'command line',
                       f'  {by_client["codex"]}',
                       rf'  #   then add to [mcp_servers.{SERVER_NAME}] in %USERPROFILE%\.codex\config.toml: '
                       'startup_timeout_sec = 30 / tool_timeout_sec = 120']
-        return lines + [f'  # {MCP_TOKEN_ENV} (user environment, no admin): Windows settings > "Edit environment '
-                        f'variables for your account" > New',
-                        '  # check: claude mcp list / codex mcp list, then call the status tool in each client']
+        return lines + ['  # check: claude mcp list / codex mcp list, then call the status tool in each client']
 
     def project_file(self, path: Path, text: str) -> str:
         """Write ``path`` when missing (or differing with ``--yes``); returns what happened."""
@@ -669,7 +727,7 @@ class _Setup:
         home = self.home
         db_file = paths.db_path(home)
         locks = ((store.LOCK_NAME, store.STALE_LOCK_AGE), (store.INDEX_LOCK_NAME, store.STALE_LOCK_AGE),
-                 (push.PUSH_LOCK, push.PUSH_LOCK_STALE))
+                 (store.PUSH_LOCK_NAME, store.PUSH_LOCK_STALE))
         if not db_file.is_file():
             self.record('upgrade', 'skipped', [f'upgrade: no store yet ({db_file}); nothing to back up or migrate'])
             return

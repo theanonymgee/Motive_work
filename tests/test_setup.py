@@ -8,6 +8,7 @@ import json
 import socket
 import sqlite3
 import subprocess
+import sys
 import tomllib
 import urllib.request
 from pathlib import Path
@@ -228,7 +229,8 @@ def test_apply_twice_creates_everything_once_and_the_second_run_changes_nothing(
     assert f'data home: {home} (rules ok; created)' in lines
     assert any(line.startswith('config: written') and 'push url set' in line for line in lines)
     assert any('push token: missing' in line for line in lines)
-    assert lines[-1].startswith('setup done (exit 0). next: write the push token')
+    assert lines[-1].startswith('setup done (exit 0). next: set WORKMCP_HOME (above), write the push token, then: '
+                                'workmcp scan')
     out = capsys.readouterr().out
     assert 'role: collector' in out and f'[push] url {URL}' in out  # doctor ran on the setup home
 
@@ -244,6 +246,58 @@ def test_apply_twice_creates_everything_once_and_the_second_run_changes_nothing(
     assert any(line.startswith('config: exists, not changed') for line in lines)
     assert not any('add these lines' in line for line in lines)
     assert any('already in place' in line for line in lines)
+
+
+# --- review M6 v1 M6-2 / M6-18: a data home other than the default needs WORKMCP_HOME; the next line --------------
+
+def home_lines(result) -> list[str]:
+    return result['steps']['home']['lines']
+
+
+def test_a_home_other_than_the_default_says_how_to_set_workmcp_home(tmp_path, env, docs, capsys):
+    home = tmp_path/"D drive's Motive_work"           # a quote inside: doubled in the PowerShell string
+    result, lines = run(home, env, sources=(str(docs),), push_url=URL)
+    text = '\n'.join(home_lines(result))
+    assert result['exit_code'] == 0
+    assert f'WORKMCP_HOME: this data home is not the default ({env["USERPROFILE"]}\\Motive_work)' in text
+    quoted = str(home).replace("'", "''")
+    assert f"[Environment]::SetEnvironmentVariable('WORKMCP_HOME', '{quoted}', 'User')" in text
+    assert 'Edit environment variables for your account' in text and 'no admin' in text
+    assert lines[-1] == ('setup done (exit 0). next: set WORKMCP_HOME (above), write the push token, then: '
+                         'workmcp scan -> workmcp index -> workmcp push --dry-run -> workmcp push')
+    assert 'from setup --home' in capsys.readouterr().out          # doctor names where its home came from
+
+
+def test_the_default_home_or_a_matching_variable_needs_no_workmcp_home_line(user, env, docs):
+    default = user/'Motive_work'
+    result, lines = run(default, env, sources=(str(docs),), push_url=URL)
+    assert not any('WORKMCP_HOME' in line for line in home_lines(result)), home_lines(result)
+    assert lines[-1].startswith('setup done (exit 0). next: write the push token, then: workmcp scan')
+    other = user.parent/'elsewhere'
+    result, lines = run(other, {**env, 'WORKMCP_HOME': str(other)}, sources=(str(docs),), push_url=URL)
+    assert home_lines(result)[1:] == ['WORKMCP_HOME: set to this data home']
+    assert 'set WORKMCP_HOME' not in lines[-1]
+    result, lines = run(other, {**env, 'WORKMCP_HOME': str(default)}, sources=(str(docs),), push_url=URL)
+    assert any('set to another folder' in line for line in home_lines(result))
+    assert lines[-1].startswith('setup done (exit 0). next: set WORKMCP_HOME (above), write the push token')
+
+
+def test_the_next_line_leaves_out_a_push_token_that_is_there(user, env, docs):
+    """Review M6 v1 M6-18: ``write the push token`` only while it is missing (the value is never read)."""
+    default = user/'Motive_work'
+    result, lines = run(default, {**env, paths.PUSH_TOKEN_ENV: FAKE + 'present'}, sources=(str(docs),), push_url=URL)
+    assert result['steps']['config']['detail']['push_token'] == 'environment'
+    assert lines[-1] == ('setup done (exit 0). next: workmcp scan -> workmcp index -> workmcp push --dry-run -> '
+                         'workmcp push')
+    local = user.parent/'local-home'                                             # local role (no push url)
+    result, lines = run(local, {**env, 'WORKMCP_HOME': str(local)}, sources=(str(docs),))
+    assert lines[-1] == 'setup done (exit 0). next: workmcp scan -> workmcp index, then register the clients'
+
+
+def test_doctor_names_the_source_of_its_data_home():
+    assert cli.home_source(True, {}) == 'from setup --home'
+    assert cli.home_source(False, {'WORKMCP_HOME': 'D:\\Motive_work'}) == 'from WORKMCP_HOME'
+    assert cli.home_source(False, {}) == 'default, WORKMCP_HOME not set'
 
 
 def test_scan_and_index_run_on_the_setup_home_when_asked(home, env, docs, capsys):
@@ -463,12 +517,18 @@ def test_collector_role_prints_the_remote_registration_lines(home, env, docs):
     result, lines = run(home, env, sources=(str(docs),), push_url=URL + '/', clients=setup.CLIENTS)
     commands = result['steps']['clients']['detail']['commands']
     assert commands == [
-        f'claude mcp add --transport http --scope user workmcp {MCP} --header "Authorization: Bearer <MCP_TOKEN>"',
+        f'claude mcp add --transport http --scope user workmcp {MCP} '
+        '--header "Authorization: Bearer $env:WORKMCP_MCP_TOKEN"',
         f'codex mcp add workmcp --url {MCP} --bearer-token-env-var WORKMCP_MCP_TOKEN']
     assert all(f'  {command}' in lines for command in commands)
     text = '\n'.join(lines)
     assert 'collector role' in text and 'run these yourself' in text and 'startup_timeout_sec = 30' in text
     assert result['steps']['clients']['changed'] is False
+    # review M6 v1 M6-3: the variable comes first, the history keeps its name only, no history file is removed,
+    # and the line says where Claude Code keeps the token
+    assert 'Edit environment variables for your account' in text and 'keeps only the variable name' in text
+    assert '.claude.json' in text and 'Remove-Item' not in text and 'HistorySavePath' not in text
+    assert text.index('Edit environment variables') < text.index('claude mcp add')
 
 
 def test_local_role_prints_stdio_lines_with_python_isolated_and_the_home(home, env):
@@ -549,6 +609,44 @@ def test_project_scope_writes_the_two_files_once_and_respects_local_edits(home, 
     assert result['steps']['clients']['detail']['files'][str(mcp_json)] == 'overwritten'
     assert json.loads(mcp_json.read_text(encoding='utf-8'))['mcpServers']['workmcp'] == claude
     assert not list(project.rglob('*.partial'))
+
+
+def test_a_project_folder_inside_a_source_root_is_refused(home, env, docs, tmp_path):
+    """Review M6 v1 M6-17: ``--scope project`` never writes its files into a folder the collector reads (a new
+    ``--source`` or one already in ``config.toml``); exit 4, nothing written."""
+    inner = docs/'project'
+    inner.mkdir()
+    options = dict(clients=setup.CLIENTS, scope='project', project=str(inner))
+    result, lines = run(home, env, sources=(str(docs),), **options)
+    assert result['exit_code'] == 4 and result['steps']['clients']['status'] == 'refused'
+    assert any('lies inside the source root' in line for line in lines)
+    assert not home.exists() and list(inner.iterdir()) == []
+    assert run(home, env, sources=(str(docs),))[0]['exit_code'] == 0                 # config.toml names docs now
+    result, _ = run(home, env, **options)
+    assert result['exit_code'] == 4 and list(inner.iterdir()) == []
+    outside = tmp_path/'project'
+    outside.mkdir()
+    assert run(home, env, **{**options, 'project': str(outside)})[0]['exit_code'] == 0
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows junctions only')
+def test_an_existing_source_written_through_a_junction_is_not_asked_again(home, env, docs, tmp_path):
+    """Review M6 v1 M6-16: a ``[[sources]]`` entry that names the folder through a junction and a ``--source``
+    that names it directly are the same root: no "add these lines"."""
+    import _winapi
+    junction = tmp_path/'docs-link'
+    _winapi.CreateJunction(str(docs), str(junction))
+    try:
+        assert run(home, env, sources=(str(junction),))[0]['exit_code'] == 0
+        config.config_file(home).write_text(f"[[sources]]\npath = '{junction}'\n\n[index]\nmodel = 'none'\n",
+                                            encoding='utf-8')
+        result, lines = run(home, env, sources=(str(docs),))
+        assert result['exit_code'] == 0 and result['steps']['config']['detail']['missing_sources'] == []
+        assert not any('add these lines' in line for line in lines)
+        result, lines = run(tmp_path/'other-home', env, sources=(str(junction),))
+        assert any(f'is written as the folder it resolves to: {docs.resolve()}' in line for line in lines)
+    finally:
+        junction.rmdir()
 
 
 def test_client_commands_and_project_files_are_strings_only(tmp_path):

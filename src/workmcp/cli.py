@@ -116,7 +116,17 @@ def environment_lines(env, *, prefix: str, isolated: bool) -> list[str]:
     return lines or ['env: clean (no PYTHONPATH, no foreign VIRTUAL_ENV)']
 
 
+def home_source(given: bool, env=None) -> str:
+    """Where the data home of this run comes from (review M6 v1 M6-2): ``setup --home``, ``WORKMCP_HOME``, or the
+    default ``%USERPROFILE%\\Motive_work`` because the variable is not set."""
+    env = os.environ if env is None else env
+    if given:
+        return 'from setup --home'
+    return f'from {paths.HOME_ENV}' if env.get(paths.HOME_ENV) else f'default, {paths.HOME_ENV} not set'
+
+
 def doctor(home=None) -> int:
+    source = home_source(home is not None)
     home, code = _home(home)
     if code:
         return code
@@ -145,7 +155,7 @@ def doctor(home=None) -> int:
         *environment_lines(os.environ, prefix=sys.prefix, isolated=bool(sys.flags.ignore_environment)),
         f'mcp: {importlib.metadata.version("mcp")}',
         f'sqlite: {sqlite3.sqlite_version}, fts5 trigram: {"yes" if fts5 else "no (lexical search falls back to LIKE)"}',
-        f'data home: {home} (rules ok; {"exists" if home.exists() else "not created yet"})',
+        f'data home: {home} (rules ok; {"exists" if home.exists() else "not created yet"}; {source})',
         paths.virtualization_line(home, paths.virtualization_probe(home, os.environ)),
         *filter(None, [paths.appdata_warning(home, os.environ), paths.drive_warning(home, os.environ)]),
         f'store: {db_file} ({f"schema v{schema}" if schema is not None else "not created yet"})',
