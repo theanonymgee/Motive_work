@@ -22,6 +22,96 @@ def test_repo_root_is_found_from_the_package():
     assert paths.find_repo_root() == REPO_ROOT
 
 
+def deny_stat(monkeypatch, *denied: Path):
+    """``os.stat`` raises EACCES for these paths, as for ``/root/.git`` under ``sudo -u workmcp`` (VPS 2026-10-30).
+
+    Python 3.12 ``Path.exists``/``is_file``/``is_dir`` re-raise it. No real permission is changed.
+    """
+    real, keys = os.stat, {os.path.normcase(str(path)) for path in denied}
+
+    def stat(path, *args, **kwargs):
+        if os.path.normcase(os.fspath(path)) in keys:
+            raise PermissionError(13, 'Permission denied (synthetic)', os.fspath(path))
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(os, 'stat', stat)
+
+
+def site_packages_file(tmp_path) -> Path:
+    """A package file as a non-editable install has it: no ``pyproject.toml`` above it."""
+    return tmp_path/'venv'/'lib'/'python3.12'/'site-packages'/'workmcp'/'paths.py'
+
+
+def test_repo_root_skips_an_ancestor_it_cannot_stat(tmp_path, monkeypatch):
+    sub = (tmp_path/'root'/'sub').resolve()
+    sub.mkdir(parents=True)
+    (sub.parent/'.git').mkdir()
+    deny_stat(monkeypatch, sub.parent/'.git')
+    with pytest.raises(PermissionError):
+        (sub.parent/'.git').exists()                     # the 3.12 behaviour the fix guards against
+    assert paths.find_repo_root(site_packages_file(tmp_path), cwd=sub) is None
+
+
+def test_repo_root_finds_a_git_ancestor_of_cwd(tmp_path):
+    work = (tmp_path/'clone'/'a'/'b').resolve()
+    work.mkdir(parents=True)
+    (tmp_path/'clone'/'.git').mkdir()
+    assert paths.find_repo_root(site_packages_file(tmp_path), cwd=work) == (tmp_path/'clone').resolve()
+
+
+def test_repo_root_without_a_cwd_is_none(tmp_path, monkeypatch):
+    def gone():
+        raise FileNotFoundError(2, 'No such file or directory (synthetic: cwd deleted)')
+    monkeypatch.setattr(Path, 'cwd', staticmethod(gone))
+    assert paths.find_repo_root(site_packages_file(tmp_path)) is None
+    assert paths.find_repo_root() == REPO_ROOT          # the pyproject chain needs no cwd
+
+
+def test_pyproject_chain_wins_over_a_denied_cwd_ancestor(tmp_path, monkeypatch):
+    sub = (tmp_path/'root'/'sub').resolve()
+    sub.mkdir(parents=True)
+    deny_stat(monkeypatch, sub.parent/'.git')
+    assert paths.find_repo_root(cwd=sub) == REPO_ROOT
+    assert code_of(str(REPO_ROOT/'data'), repo_root=paths.find_repo_root(cwd=sub)) == 'home_inside_repo'
+
+
+def test_home_under_an_ancestor_that_cannot_be_stated_is_judged_without_it(tmp_path, monkeypatch):
+    locked = (tmp_path/'locked').resolve()
+    locked.mkdir()
+    deny_stat(monkeypatch, locked)
+    assert validate_home(str(locked/'wk'), {}, REPO_ROOT) == locked/'wk'
+    monkeypatch.undo()
+    real = paths._file_attributes
+
+    def attributes(path):                               # exists() passes, the attribute read fails
+        if Path(path) == locked:
+            raise PermissionError(13, 'Permission denied (synthetic)', str(path))
+        return real(path)
+    monkeypatch.setattr(paths, '_file_attributes', attributes)
+    assert validate_home(str(locked/'wk'), {}, REPO_ROOT) == locked/'wk'
+
+
+def test_token_issue_from_a_denied_cwd_with_a_site_packages_install(tmp_path, monkeypatch, capsys):
+    """The VPS case end to end: non-editable install, run from a cwd whose ``.git`` cannot be stat'ed."""
+    sub = (tmp_path/'root'/'sub').resolve()
+    sub.mkdir(parents=True)
+    monkeypatch.setattr(paths.find_repo_root, '__defaults__', (site_packages_file(tmp_path), None))
+    monkeypatch.chdir(sub)
+    deny_stat(monkeypatch, sub.parent/'.git')
+    assert cli.main(['token', 'issue', '--kind', 'mcp', '--name', 'synthetic-client']) == 0
+    out, err = capsys.readouterr()
+    assert err == '' and '(shown once)' in out
+
+
+def test_cli_turns_a_stray_os_error_into_one_stderr_line(monkeypatch, capsys):
+    def doctor(home=None):
+        raise PermissionError(13, 'Permission denied (synthetic)', '/root/.git')
+    monkeypatch.setattr(cli, 'doctor', doctor)
+    assert cli.main(['doctor']) == 1
+    out, err = capsys.readouterr()
+    assert out == '' and 'Traceback' not in err
+    assert err == "workmcp: PermissionError: [Errno 13] Permission denied (synthetic): '/root/.git'\n"
+
+
 def profile_env(tmp_path):
     profile = tmp_path/'profile'
     return profile, {'USERPROFILE': str(profile), 'LOCALAPPDATA': str(profile/'AppData'/'Local'),

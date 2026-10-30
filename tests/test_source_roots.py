@@ -125,6 +125,28 @@ def test_overlapping_roots_are_refused(tmp_path, home):
         'ok', 'source_roots_overlap', 'ok', 'source_roots_overlap' if os.name == 'nt' else 'source_root_missing']
 
 
+def test_a_root_that_cannot_be_checked_is_refused_not_a_traceback(tmp_path, home, monkeypatch, capsys):
+    """VPS 2026-10-30: Python 3.12 ``is_dir`` re-raises EACCES; the root is refused (fail closed)."""
+    from workmcp import cli
+    (tmp_path/'open').mkdir()
+    denied = tmp_path/'denied'
+    real = config._is_dir
+
+    def is_dir(path):
+        if Path(path) == denied:
+            raise PermissionError(13, 'Permission denied (synthetic)', str(path))
+        return real(path)
+    monkeypatch.setattr(config, '_is_dir', is_dir)
+    checks = config.check_roots([config.SourceEntry(str(denied)), config.SourceEntry(str(tmp_path/'open'))],
+                                home, None, env={})
+    assert [c.error.code if c.error else 'ok' for c in checks] == ['source_root_missing', 'ok']
+    assert 'PermissionError' in checks[0].error.message
+    write_config(home, f"[[sources]]\npath = '{denied}'\n")
+    lines = cli._root_lines(home)
+    assert lines == [f'source root {denied}: source_root_missing: cannot check the folder (PermissionError): {denied}']
+    assert capsys.readouterr() == ('', '')
+
+
 def test_every_root_code_is_covered():
     assert set(config.ROOT_CODES) == {
         'source_root_relative', 'source_root_trailing_dot_space', 'source_root_missing', 'source_root_network',

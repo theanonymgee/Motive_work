@@ -368,7 +368,11 @@ def validate_root(raw: str, home: Path, repo_root: Path | None, allow_network: b
     network_hint = 'set allow_network = true for this [[sources]] entry to read it over the network'
     if paths._is_unc(local) and not allow_network:
         raise SourceRootError('source_root_network', f'network path: {raw}; {network_hint}')
-    if not _is_dir(Path(local)):
+    try:
+        is_dir = _is_dir(Path(local))
+    except OSError as exc:  # Python 3.12 is_dir re-raises EACCES: the root is refused, never a traceback
+        raise SourceRootError('source_root_missing', f'cannot check the folder ({type(exc).__name__}): {raw}') from None
+    if not is_dir:
         raise SourceRootError('source_root_missing', f'not an existing folder: {raw}')
     resolved = Path(paths._strip_long_prefix(str(_resolve(Path(local)))))
     warnings = []

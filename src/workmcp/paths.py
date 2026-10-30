@@ -44,13 +44,34 @@ class DataPathError(Exception):
         self.message = message
 
 
+def _probe(path: Path, test) -> bool:
+    """``test(path)``; a path that cannot be stat'ed (``PermissionError``, any ``OSError``) counts as absent.
+
+    Same stance as ``virtualization_probe``. Python 3.12 ``Path.exists``/``is_file`` re-raise EACCES:
+    ``sudo -u workmcp`` run from ``/root`` crashed on ``/root/.git`` (VPS 2026-10-30).
+    """
+    try:
+        return test(path)
+    except OSError:
+        return False
+
+
 def find_repo_root(package_file: str | os.PathLike = __file__, cwd: Path | None = None) -> Path | None:
-    """First ancestor of the package with ``pyproject.toml`` (dev install), else a ``.git`` ancestor of cwd."""
+    """First ancestor of the package with ``pyproject.toml`` (dev install), else a ``.git`` ancestor of cwd.
+
+    An ancestor that cannot be stat'ed is not a repository and the walk goes on; a cwd that is gone
+    or unreadable has no ``.git`` chain. A non-editable install (site-packages) therefore sees the
+    repository only when the command runs inside the clone.
+    """
     for parent in Path(package_file).resolve().parents:
-        if (parent/'pyproject.toml').is_file():
+        if _probe(parent/'pyproject.toml', Path.is_file):
             return parent
-    for parent in [(cwd or Path.cwd()).resolve(), *(cwd or Path.cwd()).resolve().parents]:
-        if (parent/'.git').exists():
+    try:
+        start = (cwd or Path.cwd()).resolve()
+    except OSError:  # cwd deleted (FileNotFoundError) or not readable
+        return None
+    for parent in [start, *start.parents]:
+        if _probe(parent/'.git', Path.exists):
             return parent
     return None
 
@@ -127,8 +148,11 @@ def validate_home(raw: str | None, env: Mapping[str, str], repo_root: Path | Non
         if value and Path(value).is_absolute() and _within(home, Path(value).resolve()):
             raise DataPathError('home_sync_env', f'{home} is inside %{name}% ({value}); {FIX_HINT}')
     for folder in [home, *home.parents]:
-        if folder.exists():
-            attributes = _file_attributes(folder)
+        if _probe(folder, Path.exists):
+            try:
+                attributes = _file_attributes(folder)
+            except OSError:  # cannot be stat'ed: no attributes to judge (same stance as _probe)
+                continue
             if attributes is not None and attributes & RECALL_ATTRIBUTES:
                 raise DataPathError('home_sync_attr', f'{folder} carries cloud-sync attributes; {FIX_HINT}')
     return home

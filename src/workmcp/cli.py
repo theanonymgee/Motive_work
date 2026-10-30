@@ -803,6 +803,16 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.command != 'serve':  # serve's stdout is the JSON-RPC channel: left untouched
         _tolerant(sys.stdout)
+    try:
+        return _dispatch(args)
+    except OSError as exc:
+        # Last resort for a file-system error no command maps to its own exit code (e.g. PermissionError
+        # on the VPS, 2026-10-30): one line on stderr, never stdout (serve's JSON-RPC channel).
+        print(f'workmcp: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return 1
+
+
+def _dispatch(args) -> int:
     if args.command == 'doctor':
         return doctor()
     if args.command == 'scan':
