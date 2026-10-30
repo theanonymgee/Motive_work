@@ -5,7 +5,8 @@
 - 서버: 회사 PC 수집기 `work-pc`용 push 토큰 7 발급(피터가 이 PC Git Bash에서 실행, 평문은 저장소 밖 파일로만). 첫 시도는 `sudo -u workmcp`가 `/root`를 현재 폴더로 넘겨 `find_repo_root`가 `/root/.git`에서 `PermissionError`로 죽음(발급 없음) → `cd /tmp` 뒤 성공.
 - 설치 따라 하기 문서를 피터의 구글 드라이브에 올림(명령만, 토큰 없음).
 - 수정(설계자 진단 → 실행자 Opus): stat할 수 없는 조상은 저장소 아님(`paths._probe`), 홈 동기화 속성 검사도 같은 태도, 수집 폴더 검사 권한 오류는 `source_root_missing`, `cli.main`의 `OSError`는 stderr 한 줄·종료 1. 테스트 8 추가, 전체 2288 passed. M0 설계 규칙 6·VPS 절차서 한 줄 보강.
-- 남은 것: 서버 업데이트(피터 승인 뒤), 피터의 회사 PC 설치.
+- 서버 업데이트(피터 승인, 커밋 `7dda610`): 해시 일치, `pip check` 이상 없음, `setup --upgrade` exit 0(스키마 v5 그대로), 정지 13.2 s(열린 스트림 2개 취소 뒤 약 10 s 더 걸림, SIGKILL 없음 — 지난번 776 ms보다 느림, 관찰), 리스닝 1.8 s, `model loaded in 35.1 s (SHA-256 check 31.5 s)`(차가운 캐시). `/root`에서 `sudo -u workmcp ... token list` exit 0(수정 확인), 원격 `status` 정상.
+- 남은 것: 피터의 회사 PC 설치.
 
 ### 2026-10-29 — M6 완료 (회사 PC 수집기 설치형)
 
